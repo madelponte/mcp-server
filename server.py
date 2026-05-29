@@ -45,28 +45,6 @@ def build_server() -> FastMCP:
 mcp = build_server()
 
 
-if __name__ == "__main__":
-    transport = server_settings.transport.lower()
-    if transport not in ("streamable-http", "sse", "stdio"):
-        raise SystemExit(
-            f"Unsupported MCP_TRANSPORT={transport!r}. "
-            "Use 'streamable-http', 'sse', or 'stdio'."
-        )
-    log = logging.getLogger(__name__)
-    log.info(
-        "Starting MCP server (transport=%s, host=%s, port=%s)",
-        transport,
-        server_settings.host,
-        server_settings.port,
-    )
-
-    if transport == "stdio":
-        # No network surface — bearer auth doesn't apply.
-        mcp.run(transport="stdio")
-    else:
-        run_http(transport)
-
-
 def run_http(transport: str) -> None:
     """Serve an HTTP transport, optionally gated by a bearer token.
 
@@ -99,3 +77,25 @@ def run_http(transport: str) -> None:
         port=server_settings.port,
         log_level=server_settings.log_level.lower(),
     )
+
+
+if __name__ == "__main__":
+    transport = server_settings.transport.lower()
+    if transport not in ("streamable-http", "sse", "stdio"):
+        raise SystemExit(
+            f"Unsupported MCP_TRANSPORT={transport!r}. "
+            "Use 'streamable-http', 'sse', or 'stdio'."
+        )
+    log = logging.getLogger(__name__)
+    log.info(
+        "Starting MCP server (transport=%s, host=%s, port=%s)",
+        transport,
+        server_settings.host,
+        server_settings.port,
+    )
+
+    if transport == "stdio":
+        # No network surface — bearer auth doesn't apply.
+        mcp.run(transport="stdio")
+    else:
+        run_http(transport)
