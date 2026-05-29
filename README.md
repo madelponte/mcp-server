@@ -37,6 +37,26 @@ set:
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
 `WOLFRAM_`, `YOUTUBE_`.
 
+### Authentication
+
+Set `MCP_AUTH_TOKEN` to require a bearer token on every HTTP request. Clients
+must then send an `Authorization: Bearer <token>` header; anything else gets a
+`401`. Leaving it blank disables auth and leaves the server open to anyone who
+can reach it (the server logs a warning at startup in that case). The token is
+ignored for the `stdio` transport, which has no network surface.
+
+Generate a strong token, e.g.:
+
+```bash
+openssl rand -hex 32
+```
+
+and put it in your `.env`:
+
+```
+MCP_AUTH_TOKEN=<your-generated-token>
+```
+
 > Open WebUI per-user valves and UI-only behaviors that don't apply to MCP were
 > dropped: status/progress events, citation events, the Wolfram HTML result
 > "card" (it now returns plain text), and the stock tool's `verbose_status` /
@@ -87,5 +107,8 @@ clients that spawn the process directly rather than connecting over HTTP).
 
 For an HTTP client, point it at `http://<host>:8000/mcp` (streamable-http). For
 example, a Claude Desktop / generic client config using a stdio bridge or native
-streamable-http support would reference that URL. For stdio mode, configure the
-client to launch `python server.py` with the environment variables set.
+streamable-http support would reference that URL. If `MCP_AUTH_TOKEN` is set,
+configure the client to send an `Authorization: Bearer <token>` header (most MCP
+clients expose a "headers" or "auth token" field for HTTP servers). For stdio
+mode, configure the client to launch `python server.py` with the environment
+variables set.

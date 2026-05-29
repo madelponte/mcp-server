@@ -31,6 +31,15 @@ class ServerSettings(BaseSettings):
         description="MCP transport: 'streamable-http', 'sse', or 'stdio'.",
     )
     log_level: str = Field("INFO", description="Python logging level.")
+    auth_token: str = Field(
+        "",
+        description=(
+            "Shared bearer token required on every HTTP request "
+            "(Authorization: Bearer <token>). Blank disables auth — the server "
+            "is then open to anyone who can reach it. Ignored for the 'stdio' "
+            "transport, which has no network surface."
+        ),
+    )
 
 
 class WebSearchSettings(BaseSettings):
