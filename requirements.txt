@@ -1,0 +1,21 @@
+# MCP server framework (FastMCP + streamable-http transport)
+mcp>=1.9.0
+
+# Config / settings
+pydantic>=2.7
+pydantic-settings>=2.2
+
+# Shared HTTP / async
+httpx>=0.27
+anyio>=4.4
+
+# Agentic Web Search
+beautifulsoup4>=4.12
+lxml>=5.2
+
+# Stock Data
+requests>=2.31
+yfinance>=0.2.40
+
+# YouTube Transcript
+youtube-transcript-api>=1.0.0
