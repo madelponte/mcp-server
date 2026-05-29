@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # lxml needs libxml2/libxslt; build tools help with any wheels that compile.
 RUN apt-get update \
