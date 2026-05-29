@@ -1,0 +1,47 @@
+services:
+  mcp-server:
+    build: .
+    container_name: openwebui-tools-mcp
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    depends_on:
+      - searxng
+      - flaresolverr
+      - tika
+
+  # ---------------------------------------------------------------------------
+  # Supporting services for the Agentic Web Search tool.
+  # The web_search defaults point at these hostnames (searxng / flaresolverr /
+  # tika). Remove any you don't need and adjust the WEB_SEARCH_* vars in .env.
+  # ---------------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    container_name: openwebui-tools-searxng
+    restart: unless-stopped
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-change-me-please}
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    # Not published to the host by default — only the MCP server needs it.
+    expose:
+      - "8080"
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: openwebui-tools-flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+    expose:
+      - "8191"
+
+  tika:
+    image: apache/tika:latest
+    container_name: openwebui-tools-tika
+    restart: unless-stopped
+    expose:
+      - "9998"
