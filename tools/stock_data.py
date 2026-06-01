@@ -322,6 +322,84 @@ def _finnhub_recommendations(symbol: str) -> Optional[dict]:
     return {"provider": "finnhub", "symbol": symbol, "recommendations": rows}
 
 
+# SEC Form 4 transaction codes -> human-readable label.
+_INSIDER_TX_CODES = {
+    "P": "Open market purchase",
+    "S": "Open market sale",
+    "A": "Grant/award",
+    "M": "Option exercise",
+    "X": "Option exercise",
+    "G": "Gift",
+    "F": "Tax withholding",
+    "C": "Conversion of derivative",
+    "D": "Disposition to issuer",
+    "W": "Acquisition/disposition by will",
+}
+
+
+def _finnhub_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
+    token = _finnhub_require_key()
+    from datetime import date, timedelta
+    today = date.today()
+    from_date = (today - timedelta(weeks=weeks)).isoformat()
+    to_date = today.isoformat()
+    data = _http_get_json(
+        "https://finnhub.io/api/v1/stock/insider-transactions",
+        {"symbol": symbol, "from": from_date, "to": to_date, "token": token},
+    )
+    rows = (data or {}).get("data")
+    if not rows:
+        return None
+
+    transactions = []
+    shares_bought = shares_sold = 0
+    buy_count = sell_count = 0
+    for row in rows:
+        change = _safe_int(row.get("change")) or 0
+        if change > 0:
+            direction = "buy"
+            buy_count += 1
+            shares_bought += change
+        elif change < 0:
+            direction = "sell"
+            sell_count += 1
+            shares_sold += -change
+        else:
+            direction = "neutral"
+        code = row.get("transactionCode")
+        transactions.append({
+            "name": row.get("name"),
+            "transaction_date": row.get("transactionDate"),
+            "filing_date": row.get("filingDate"),
+            "direction": direction,
+            "transaction_code": code,
+            "transaction_type": _INSIDER_TX_CODES.get(code, "Other"),
+            "share_change": change,
+            "shares_held_after": _safe_int(row.get("share")),
+            "price": _safe_float(row.get("transactionPrice")),
+        })
+
+    # Most recent transactions first.
+    transactions.sort(key=lambda t: t.get("transaction_date") or "", reverse=True)
+
+    return {
+        "provider": "finnhub",
+        "symbol": symbol,
+        "from_date": from_date,
+        "to_date": to_date,
+        "lookback_weeks": weeks,
+        "summary": {
+            "total_transactions": len(transactions),
+            "buy_transactions": buy_count,
+            "sell_transactions": sell_count,
+            "shares_bought": shares_bought,
+            "shares_sold": shares_sold,
+            "net_shares": shares_bought - shares_sold,
+        },
+        "transactions": transactions,
+    }
+
+
 # ===================================================================
 #                       PROVIDER: YFINANCE
 # ===================================================================
@@ -571,6 +649,77 @@ def _yfinance_recommendations(symbol: str) -> Optional[dict]:
             "strong_sell": _safe_int(row.get("strongSell")),
         })
     return {"provider": "yfinance", "symbol": symbol, "recommendations": rows}
+
+
+def _yfinance_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
+    ticker = _yfinance_ticker(symbol)
+    try:
+        df = ticker.insider_transactions
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+
+    from datetime import date, timedelta
+    today = date.today()
+    cutoff = today - timedelta(weeks=weeks)
+    from_date = cutoff.isoformat()
+    to_date = today.isoformat()
+
+    transactions = []
+    shares_bought = shares_sold = 0
+    buy_count = sell_count = 0
+    for _, row in df.iterrows():
+        start = row.get("Start Date")
+        tx_date = start.strftime("%Y-%m-%d") if hasattr(start, "strftime") else (str(start) if start is not None else None)
+        # Filter to the requested lookback window when a date is available.
+        if tx_date and tx_date < from_date:
+            continue
+
+        text = str(row.get("Text") or row.get("Transaction") or "").lower()
+        shares = _safe_int(row.get("Shares")) or 0
+        if "sale" in text or "sell" in text:
+            direction = "sell"
+            sell_count += 1
+            shares_sold += shares
+        elif "purchase" in text or "buy" in text:
+            direction = "buy"
+            buy_count += 1
+            shares_bought += shares
+        else:
+            direction = "neutral"
+
+        transactions.append({
+            "name": row.get("Insider"),
+            "position": row.get("Position"),
+            "transaction_date": tx_date,
+            "direction": direction,
+            "transaction_type": row.get("Transaction") or row.get("Text"),
+            "shares": shares,
+            "value": _safe_float(row.get("Value")),
+        })
+
+    if not transactions:
+        return None
+
+    transactions.sort(key=lambda t: t.get("transaction_date") or "", reverse=True)
+
+    return {
+        "provider": "yfinance",
+        "symbol": symbol,
+        "from_date": from_date,
+        "to_date": to_date,
+        "lookback_weeks": weeks,
+        "summary": {
+            "total_transactions": len(transactions),
+            "buy_transactions": buy_count,
+            "sell_transactions": sell_count,
+            "shares_bought": shares_bought,
+            "shares_sold": shares_sold,
+            "net_shares": shares_bought - shares_sold,
+        },
+        "transactions": transactions,
+    }
 
 
 # ===================================================================
@@ -975,6 +1124,47 @@ def register(mcp: FastMCP) -> None:
             return json.dumps({
                 "symbol": symbol,
                 "error": "Could not retrieve recommendations.",
+                "provider_errors": errors,
+            })
+        return json.dumps(result, default=str)
+
+    @mcp.tool()
+    async def get_insider_transactions(symbol: str) -> str:
+        """
+        Get recent insider buying and selling activity for a stock — transactions filed
+        by company insiders (officers, directors, and major shareholders) over the last
+        N weeks (configured by STOCK_INSIDER_LOOKBACK_WEEKS). Returns a buy/sell summary
+        and the individual transactions (insider name, date, share change, and price).
+
+        :param symbol: The stock ticker symbol (e.g. "AAPL").
+        :return: A JSON string with insider transaction data and a buy/sell summary.
+        """
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            return json.dumps({"error": "Symbol is required."})
+
+        weeks = cfg.insider_lookback_weeks
+        result: Optional[dict] = None
+        errors: list[str] = []
+        provider = _resolve_provider(cfg.default_provider)
+        try:
+            if provider == "finnhub":
+                result = await anyio.to_thread.run_sync(_finnhub_insider_transactions, symbol, weeks)
+            else:
+                result = await anyio.to_thread.run_sync(_yfinance_insider_transactions, symbol, weeks)
+        except Exception as e:
+            errors.append(f"{provider}: {type(e).__name__}: {e}")
+
+        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
+            try:
+                result = await anyio.to_thread.run_sync(_yfinance_insider_transactions, symbol, weeks)
+            except Exception as e:
+                errors.append(f"yfinance: {type(e).__name__}: {e}")
+
+        if not result:
+            return json.dumps({
+                "symbol": symbol,
+                "error": "Could not retrieve insider transactions.",
                 "provider_errors": errors,
             })
         return json.dumps(result, default=str)

@@ -110,6 +110,9 @@ class StockSettings(BaseSettings):
     cache_ttl_seconds: int = Field(60, description="Cache responses this long (0 disables).")
     max_news_items: int = Field(5, description="Max news articles per query.")
     max_financial_periods: int = Field(4, description="Max historical financial periods returned.")
+    insider_lookback_weeks: int = Field(
+        12, description="How many weeks of insider buying/selling to return."
+    )
 
 
 class WolframSettings(BaseSettings):
