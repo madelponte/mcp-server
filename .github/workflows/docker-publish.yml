@@ -1,8 +1,10 @@
 name: Build and Publish Docker image
 
-# Build the image on every push to main and on version tags, then publish it to
-# the GitHub Container Registry (ghcr.io). Pull requests build only (no push) so
-# we still catch broken Dockerfiles without publishing.
+# Publishing rules:
+#   - push to main          -> publish :latest (and :main)
+#   - push a v* tag         -> publish versioned images (:1.2.3, :1.2, :1)
+#   - PR to main (same repo)-> build AND publish a downloadable :pr-N image
+#   - PR to main (from fork)-> build only, no publish (fork tokens are read-only)
 on:
   push:
     branches:
@@ -23,6 +25,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Publish on pushes (main / tags) and on PRs that originate from a branch
+      # in this repo. PRs from forks build only: their GITHUB_TOKEN is read-only
+      # and they must not be able to publish images.
+      PUBLISH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
     steps:
       - name: Checkout repository
@@ -34,9 +41,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Skip login on pull requests — they only build, they don't publish.
       - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -61,7 +67,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ env.PUBLISH }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
