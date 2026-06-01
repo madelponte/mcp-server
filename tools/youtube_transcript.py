@@ -110,6 +110,7 @@ def register(mcp: FastMCP) -> None:
           - Asks you to summarize, transcribe, or "tell me what this video says"
           - Wants to quote, search, or translate spoken content from a video
           - References a specific YouTube video by URL or 11-char video ID
+          - You need to get information about a Youtube video that came up in a search
 
         DO NOT use this for:
           - Generic web pages (use a web fetch/search tool instead)
@@ -119,8 +120,7 @@ def register(mcp: FastMCP) -> None:
         Notes:
           - The transcript may be auto-generated and contain mis-transcriptions;
             treat exact wording with mild skepticism but the substance is reliable.
-          - If the transcript is long, prefer summarizing or extracting the parts
-            relevant to the question rather than dumping it back verbatim.
+
 
         :param url: A YouTube URL (youtube.com/watch, youtu.be, /shorts/, /embed/,
                     /live/) or a bare 11-character video ID.
