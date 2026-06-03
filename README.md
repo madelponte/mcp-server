@@ -9,7 +9,7 @@ Bundled tools:
 | Tool group | MCP tools exposed |
 |------------|-------------------|
 | **Agentic Web Search** | `search_web`, `fetch_page` |
-| **Stock Data** | `get_stock_quote`, `get_company_profile`, `get_financials`, `get_earnings`, `get_company_news`, `get_analyst_recommendations`, `search_symbol` |
+| **Stock Data** | `get_stock_quote`, `get_company_profile`, `get_financials`, `get_earnings`, `get_company_news`, `search_symbol` |
 | **Wolfram Alpha** | `query_wolfram_alpha` |
 | **YouTube Transcript** | `get_youtube_transcript` |
 
