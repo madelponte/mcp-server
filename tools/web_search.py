@@ -3,8 +3,9 @@ Agentic Web Search MCP tool.
 
 Exposes `search_web` and `fetch_page`, backed by a self-hosted SearXNG instance
 with an optional FlareSolverr fallback for Cloudflare-protected pages, Reddit
-JSON handling, and Apache Tika PDF extraction. Translated from the Open WebUI
-tool; status/citation event emitters were removed.
+JSON handling, and Apache Tika document extraction (PDF, Office, OpenDocument,
+RTF, EPUB). Translated from the Open WebUI tool; status/citation event emitters
+were removed.
 """
 
 import asyncio
@@ -284,20 +285,67 @@ def _structured_from_html(html: str, url: str) -> dict:
     }
 
 
-def _pdf_to_text(data: bytes, tika_url: str) -> str:
-    """Extract text from a PDF byte stream via Apache Tika."""
+# Document types Apache Tika can extract that are NOT served as text/html.
+# Tika auto-detects the format from the bytes, so we route any of these to it
+# rather than treating the response as HTML/text.
+TIKA_DOCUMENT_CTYPES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument",  # docx/xlsx/pptx (prefix match)
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument",  # odt/ods/odp (prefix match)
+    "application/rtf",
+    "text/rtf",
+    "application/epub+zip",
+)
+
+TIKA_DOCUMENT_EXTENSIONS = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
+    ".rtf",
+    ".epub",
+)
+
+
+def _is_tika_document(ctype: str, url: str) -> bool:
+    """True if the response looks like a binary document Tika should extract."""
+    ctype = (ctype or "").lower()
+    if any(ctype.startswith(c) for c in TIKA_DOCUMENT_CTYPES):
+        return True
+    # Fallback on the URL path when the server sends a generic content-type
+    # (e.g. application/octet-stream) but the extension is telling.
+    path = (urlparse(url).path or "").lower()
+    return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
+
+
+def _tika_extract(data: bytes, tika_url: str) -> str:
+    """Extract plain text from a document byte stream via Apache Tika.
+
+    No Content-Type is sent: Tika auto-detects the format from the bytes, so
+    this handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx), OpenDocument, RTF,
+    EPUB, etc. with one path.
+    """
     try:
         resp = httpx.put(
             f"{tika_url.rstrip('/')}/tika",
             content=data,
-            headers={"Content-Type": "application/pdf", "Accept": "text/plain"},
+            headers={"Accept": "text/plain"},
             timeout=30.0,
         )
         resp.raise_for_status()
         text = resp.text.strip()
-        return text if text else "[PDF contained no extractable text]"
+        return text if text else "[Document contained no extractable text]"
     except Exception as e:
-        return f"[PDF extraction failed: {e}]"
+        return f"[Document extraction failed: {e}]"
 
 
 # ---------------------------------------------------------------------------
@@ -576,7 +624,7 @@ async def _enrich_result(url: Optional[str]) -> Optional[dict]:
         return {"error": str(e)}
 
     ctype = (fetched.get("content_type") or "").lower()
-    if "pdf" in ctype:
+    if _is_tika_document(ctype, url):
         return {"title": None, "description": None, "headings": [], "toc": None}
     text = fetched.get("text")
     if not text:
@@ -657,7 +705,9 @@ def register(mcp: FastMCP) -> None:
 
         Choose the mode that fits your need:
         - "text":       plain readable text of the page. Best for reading an
-                        article or extracting facts. Also used automatically for PDFs.
+                        article or extracting facts. Also used automatically for
+                        document links (PDF, Word, Excel, PowerPoint, OpenDocument,
+                        RTF, EPUB), which are extracted via Apache Tika.
         - "structured": metadata only — title, description, heading outline,
                         and JSON-LD structured data (schema.org Recipe, HowTo,
                         Article, etc.).
@@ -667,7 +717,8 @@ def register(mcp: FastMCP) -> None:
         pass the heading text as `section` to get back ONLY that section instead
         of the whole page. Matching is case-insensitive and tolerant of whitespace;
         substring matches are accepted as a fallback. `section` only applies to
-        HTML pages — it is ignored for PDFs and JSON responses (e.g. Reddit).
+        HTML pages — it is ignored for document links (PDF, Office, etc.) and
+        JSON responses (e.g. Reddit).
 
         :param url: Absolute URL to fetch (http/https).
         :param mode: "text" or "structured".
@@ -705,25 +756,27 @@ def register(mcp: FastMCP) -> None:
         ctype = (fetched.get("content_type") or "").lower()
         via = fetched.get("via")
 
-        # PDF handling: always plain text, regardless of requested mode
-        if "pdf" in ctype or fetch_url.lower().endswith(".pdf"):
+        # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
+        # routed to Apache Tika and returned as plain text, regardless of the
+        # requested mode.
+        if _is_tika_document(ctype, fetch_url):
             body = fetched.get("bytes")
             if not body and fetched.get("text"):
                 body = fetched["text"].encode("utf-8", errors="replace")
             if not body:
                 return json.dumps(
-                    {"error": "PDF returned no content", "url": fetch_url, "status": status}
+                    {"error": "Document returned no content", "url": fetch_url, "status": status}
                 )
-            extracted = await asyncio.to_thread(_pdf_to_text, body, cfg.tika_url)
+            extracted = await asyncio.to_thread(_tika_extract, body, cfg.tika_url)
             extracted = _trim(extracted, cfg.max_page_chars)
             return json.dumps(
                 {
                     "url": fetch_url,
                     "original_url": url,
                     "status": status,
-                    "content_type": ctype or "application/pdf",
+                    "content_type": ctype or "application/octet-stream",
                     "via": via,
-                    "format": "pdf_text",
+                    "format": "document_text",
                     "content": extracted,
                 },
                 ensure_ascii=False,
