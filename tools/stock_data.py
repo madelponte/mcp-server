@@ -1,7 +1,7 @@
 """
 Stock Data MCP tool.
 
-Quotes, fundamentals, financials, earnings, news, and analyst recommendations.
+Quotes, fundamentals, financials, earnings, and news.
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
 WebUI tool; per-user valves and status emitters were removed.
@@ -300,26 +300,6 @@ def _finnhub_news(symbol: str) -> Optional[dict]:
         "count": len(articles),
         "articles": articles,
     }
-
-
-def _finnhub_recommendations(symbol: str) -> Optional[dict]:
-    token = _finnhub_require_key()
-    data = _http_get_json(
-        "https://finnhub.io/api/v1/stock/recommendation", {"symbol": symbol, "token": token}
-    )
-    if not data:
-        return None
-    rows = []
-    for row in data[:6]:
-        rows.append({
-            "period": row.get("period"),
-            "strong_buy": row.get("strongBuy"),
-            "buy": row.get("buy"),
-            "hold": row.get("hold"),
-            "sell": row.get("sell"),
-            "strong_sell": row.get("strongSell"),
-        })
-    return {"provider": "finnhub", "symbol": symbol, "recommendations": rows}
 
 
 # SEC Form 4 transaction codes -> human-readable label.
@@ -627,28 +607,6 @@ def _yfinance_news(symbol: str) -> Optional[dict]:
             })
 
     return {"provider": "yfinance", "symbol": symbol, "count": len(articles), "articles": articles}
-
-
-def _yfinance_recommendations(symbol: str) -> Optional[dict]:
-    ticker = _yfinance_ticker(symbol)
-    try:
-        df = ticker.recommendations
-    except Exception:
-        return None
-    if df is None or df.empty:
-        return None
-
-    rows = []
-    for _, row in df.head(6).iterrows():
-        rows.append({
-            "period": row.get("period"),
-            "strong_buy": _safe_int(row.get("strongBuy")),
-            "buy": _safe_int(row.get("buy")),
-            "hold": _safe_int(row.get("hold")),
-            "sell": _safe_int(row.get("sell")),
-            "strong_sell": _safe_int(row.get("strongSell")),
-        })
-    return {"provider": "yfinance", "symbol": symbol, "recommendations": rows}
 
 
 def _yfinance_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
@@ -1086,44 +1044,6 @@ def register(mcp: FastMCP) -> None:
             return json.dumps({
                 "symbol": symbol,
                 "error": "Could not retrieve news.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_analyst_recommendations(symbol: str) -> str:
-        """
-        Get the latest analyst recommendation trends for a stock —
-        counts of strong buy / buy / hold / sell / strong sell ratings over recent months.
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :return: A JSON string with analyst recommendation data.
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        result: Optional[dict] = None
-        errors: list[str] = []
-        provider = _resolve_provider(cfg.default_provider)
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_recommendations, symbol)
-            else:
-                result = await anyio.to_thread.run_sync(_yfinance_recommendations, symbol)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_recommendations, symbol)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve recommendations.",
                 "provider_errors": errors,
             })
         return json.dumps(result, default=str)
