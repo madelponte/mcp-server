@@ -432,11 +432,18 @@ async def _resilient_fetch(
                 )
         raise
 
+    # Office/OpenDocument content-types contain the substring "xml" (e.g.
+    # application/vnd.openxmlformats-officedocument...), so the loose checks
+    # below would mis-classify them as text and corrupt the bytes via UTF-8
+    # decode. Documents we hand to Tika must stay binary.
     is_textlike = (
-        ctype.startswith("text/")
-        or "json" in ctype
-        or "xml" in ctype
-        or "html" in ctype
+        not _is_tika_document(ctype, url)
+        and (
+            ctype.startswith("text/")
+            or "json" in ctype
+            or "xml" in ctype
+            or "html" in ctype
+        )
     )
 
     if not is_textlike:
