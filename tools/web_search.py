@@ -327,19 +327,33 @@ def _is_tika_document(ctype: str, url: str) -> bool:
     return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
 
 
-def _tika_extract(data: bytes, tika_url: str) -> str:
+def _tika_extract(
+    data: bytes,
+    tika_url: str,
+    *,
+    timeout: float = 90.0,
+    ocr_strategy: str = "no_ocr",
+) -> str:
     """Extract plain text from a document byte stream via Apache Tika.
 
     No Content-Type is sent: Tika auto-detects the format from the bytes, so
     this handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx), OpenDocument, RTF,
     EPUB, etc. with one path.
+
+    `ocr_strategy` maps to Tika's X-Tika-PDFOcrStrategy header. The default
+    "no_ocr" extracts only embedded text, which is fast and avoids OCR of
+    image-heavy PDFs blowing past the timeout. Set it to "auto" or
+    "ocr_and_text_extraction" if you actually need scanned-image OCR.
     """
+    headers = {"Accept": "text/plain"}
+    if ocr_strategy:
+        headers["X-Tika-PDFOcrStrategy"] = ocr_strategy
     try:
         resp = httpx.put(
             f"{tika_url.rstrip('/')}/tika",
             content=data,
-            headers={"Accept": "text/plain"},
-            timeout=30.0,
+            headers=headers,
+            timeout=timeout,
         )
         resp.raise_for_status()
         text = resp.text.strip()
@@ -774,7 +788,13 @@ def register(mcp: FastMCP) -> None:
                 return json.dumps(
                     {"error": "Document returned no content", "url": fetch_url, "status": status}
                 )
-            extracted = await asyncio.to_thread(_tika_extract, body, cfg.tika_url)
+            extracted = await asyncio.to_thread(
+                _tika_extract,
+                body,
+                cfg.tika_url,
+                timeout=cfg.tika_timeout_seconds,
+                ocr_strategy=cfg.tika_ocr_strategy,
+            )
             extracted = _trim(extracted, cfg.max_page_chars)
             return json.dumps(
                 {

@@ -73,7 +73,18 @@ class WebSearchSettings(BaseSettings):
 
     tika_url: str = Field(
         "http://tika:9998",
-        description="Base URL of an Apache Tika server used for PDF text extraction.",
+        description="Base URL of an Apache Tika server used for document text extraction.",
+    )
+    tika_timeout_seconds: float = Field(
+        90.0, description="Timeout for a single Tika extraction request, in seconds."
+    )
+    tika_ocr_strategy: str = Field(
+        "no_ocr",
+        description=(
+            "Tika PDF OCR strategy (X-Tika-PDFOcrStrategy): 'no_ocr' extracts only "
+            "embedded text and is fast; 'auto'/'ocr_and_text_extraction'/'ocr_only' "
+            "enable OCR of images but are much slower."
+        ),
     )
 
     http_timeout_seconds: float = Field(25.0, description="HTTP timeout for fetches, in seconds.")
