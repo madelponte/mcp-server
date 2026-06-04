@@ -130,10 +130,20 @@ class StockSettings(BaseSettings):
 
     request_timeout: int = Field(15, description="HTTP request timeout in seconds.")
     cache_ttl_seconds: int = Field(60, description="Cache responses this long (0 disables).")
-    max_news_items: int = Field(5, description="Max news articles per query.")
-    max_financial_periods: int = Field(4, description="Max historical financial periods returned.")
-    insider_lookback_weeks: int = Field(
-        12, description="How many weeks of insider buying/selling to return."
+
+    # The following are MAXIMUMS, not fixed amounts. `get_company_data` lets the
+    # model request a smaller range per call; anything above these caps is
+    # clamped down so an oversized response can't overwhelm the model's context
+    # window. When the model doesn't specify, the cap is used (the prior behavior).
+    max_news_items: int = Field(5, description="Maximum news articles returned per query.")
+    max_financial_periods: int = Field(
+        4, description="Maximum historical financial periods (income/balance/cashflow) returned."
+    )
+    max_earnings_periods: int = Field(
+        8, description="Maximum historical earnings periods returned."
+    )
+    max_insider_lookback_weeks: int = Field(
+        12, description="Maximum weeks of insider buying/selling to look back on."
     )
 
 
