@@ -99,15 +99,13 @@ def _trim(text: str, limit: int) -> str:
     return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]"
 
 
-def _clamp_count(requested: Optional[int], maximum: int, *, minimum: int) -> int:
+def _clamp_count(requested: Optional[int], maximum: int) -> int:
     """Resolve a model-requested count against its configured maximum.
 
     ``None`` (the model didn't ask) yields ``maximum``, preserving the old
-    fixed-amount behavior. Otherwise the value is clamped to ``[minimum,
-    maximum]`` so the model can dial the amount down but never request more than
-    the cap — the guard that keeps an oversized response from overwhelming its
-    context window. ``minimum`` is 1 for the result count and 0 for enrichment
-    (0 meaningfully disables it).
+    fixed-amount behavior. Otherwise the value is clamped to ``[1, maximum]`` so
+    the model can dial the amount down but never request more than the cap — the
+    guard that keeps an oversized response from overwhelming its context window.
     """
     if requested is None:
         return maximum
@@ -115,8 +113,8 @@ def _clamp_count(requested: Optional[int], maximum: int, *, minimum: int) -> int
         requested = int(requested)
     except (TypeError, ValueError):
         return maximum
-    if requested < minimum:
-        return minimum
+    if requested < 1:
+        return 1
     return min(requested, maximum)
 
 
@@ -217,98 +215,6 @@ def _plain_text_from_html(html: str) -> str:
     text = root.get_text("\n", strip=True)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
-
-
-def _norm_heading(s: str) -> str:
-    """Normalize a heading for fuzzy comparison."""
-    s = (s or "").lower().strip()
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip("¶#§*•·.:;-—–_ ")
-    return s
-
-
-def _find_section(soup: BeautifulSoup, section: str) -> Optional[dict]:
-    """Locate a heading matching `section` and return text up to the next equal/higher heading."""
-    if not section:
-        return None
-
-    target = _norm_heading(section)
-    if not target:
-        return None
-
-    for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
-        t.decompose()
-
-    headings = soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-    if not headings:
-        return None
-
-    matched = None
-    for h in headings:
-        if _norm_heading(h.get_text(" ", strip=True)) == target:
-            matched = h
-            break
-    if matched is None:
-        for h in headings:
-            ht = _norm_heading(h.get_text(" ", strip=True))
-            if target in ht or ht in target:
-                if ht and len(ht) >= 3:
-                    matched = h
-                    break
-    if matched is None:
-        return None
-
-    matched_level = int(matched.name[1])
-    matched_text = " ".join(matched.get_text(" ", strip=True).split())
-
-    pieces: list[str] = []
-    next_heading_text: Optional[str] = None
-
-    for el in matched.find_all_next():
-        if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            try:
-                lvl = int(el.name[1])
-            except ValueError:
-                lvl = 99
-            if lvl <= matched_level:
-                next_heading_text = " ".join(el.get_text(" ", strip=True).split())
-                break
-            sub = " ".join(el.get_text(" ", strip=True).split())
-            if sub:
-                pieces.append(f"\n## {sub}\n")
-            continue
-        if el.name in ("p", "li", "pre", "code", "blockquote", "td", "th", "dd", "dt", "figcaption"):
-            txt = el.get_text(" ", strip=True)
-            if txt:
-                pieces.append(txt)
-
-    if not pieces:
-        collected: list[str] = []
-        for el in matched.find_all_next(string=False):
-            if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-                try:
-                    lvl = int(el.name[1])
-                except ValueError:
-                    lvl = 99
-                if lvl <= matched_level:
-                    if next_heading_text is None:
-                        next_heading_text = " ".join(el.get_text(" ", strip=True).split())
-                    break
-            txt = el.get_text(" ", strip=True) if hasattr(el, "get_text") else ""
-            if txt and txt not in collected:
-                collected.append(txt)
-        body_text = "\n\n".join(collected)
-    else:
-        body_text = "\n\n".join(pieces)
-
-    body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
-
-    return {
-        "matched_heading": matched_text,
-        "level": matched_level,
-        "text": body_text,
-        "next_heading": next_heading_text,
-    }
 
 
 def _structured_from_html(html: str, url: str) -> dict:
@@ -574,7 +480,7 @@ async def _searxng_query(
     verify_ssl: bool,
     user_agent: str,
 ) -> list[dict]:
-    """Run a SearXNG JSON query and return [{url, title, snippet, engine}]."""
+    """Run a SearXNG JSON query and return [{url, title, snippet}]."""
     params = {"q": query, "format": "json", "safesearch": str(safe_search)}
     if categories:
         params["categories"] = categories
@@ -603,7 +509,6 @@ async def _searxng_query(
                 "url": r.get("url"),
                 "title": r.get("title"),
                 "snippet": (r.get("content") or "").strip(),
-                "engine": r.get("engine"),
             }
         )
     return out
@@ -674,7 +579,7 @@ async def _cached_resilient_fetch(url: str) -> dict:
     Caching the raw fetch (rather than the formatted tool output) means a
     re-fetch of the same URL — common in agent loops, and shared between
     fetch_page and search_web enrichment — skips the network round-trip, while
-    each caller still formats the cached result for its own mode/section needs.
+    each caller still formats the cached result for its own mode needs.
     Only successful fetches are cached; a failure propagates and is not stored.
     """
     cached = _page_cache.get(url)
@@ -693,7 +598,7 @@ async def _cached_resilient_fetch(url: str) -> dict:
 
 
 async def _enrich_result(url: Optional[str]) -> Optional[dict]:
-    """Fetch a URL just enough to extract structured metadata."""
+    """Fetch a URL just enough to extract its page title and description."""
     if not url:
         return None
     try:
@@ -703,11 +608,12 @@ async def _enrich_result(url: Optional[str]) -> Optional[dict]:
 
     ctype = (fetched.get("content_type") or "").lower()
     if _is_tika_document(ctype, url):
-        return {"title": None, "description": None, "headings": [], "toc": None}
+        return {"title": None, "description": None}
     text = fetched.get("text")
     if not text:
         return None
-    return _structured_from_html(text, url)
+    soup = BeautifulSoup(text, "lxml")
+    return {"title": _page_title(soup), "description": _page_description(soup)}
 
 
 def register(mcp: FastMCP) -> None:
@@ -717,7 +623,6 @@ def register(mcp: FastMCP) -> None:
         time_range: str | None = None,
         category: str | None = None,
         num_results: int | None = None,
-        enrich_results: int | None = None,
     ) -> str:
         """
         Search the web and return a ranked list of results.
@@ -727,10 +632,9 @@ def register(mcp: FastMCP) -> None:
         (a few keywords) — do NOT just echo the user's whole prompt. If the
         first search isn't useful, you may call this again with a refined query.
 
-        Each result includes: url, title, snippet, and (for the top results)
-        page metadata such as a description and a heading-based outline /
-        JSON-LD table of contents, so you can decide which links are worth
-        fetching in full.
+        Each result includes: url, title, snippet, and the target page's own
+        page_title and page_description, so you can decide which links are worth
+        reading in full. To actually read a link, pass its url to fetch_page.
 
         :param query: A concise search query (keywords, not a full sentence).
         :param time_range: Optional recency filter. One of "day", "week",
@@ -745,12 +649,6 @@ def register(mcp: FastMCP) -> None:
         :param num_results: How many search results to return. Request fewer for
             a focused lookup, or omit to use the server default. Value is capped by
             the server.
-        :param enrich_results: How many of the top results to fetch page
-            metadata (description + heading/JSON-LD table-of-contents outline)
-            for. Each outline costs context, so request only as many as you
-            need: pass a small number for a quick scan, 0 to skip enrichment
-            and get just url/title/snippet, or omit to use the server default.
-            Value is capped by the server.
         :return: JSON string of results.
         """
         query = (query or "").strip()
@@ -781,7 +679,7 @@ def register(mcp: FastMCP) -> None:
             results = await _searxng_query(
                 base_url=cfg.searxng_url,
                 query=query,
-                num_results=_clamp_count(num_results, cfg.max_num_results, minimum=1),
+                num_results=_clamp_count(num_results, cfg.max_num_results),
                 categories=resolved_categories,
                 language=cfg.searxng_language,
                 time_range=resolved_time_range,
@@ -802,25 +700,21 @@ def register(mcp: FastMCP) -> None:
             if r.get("snippet"):
                 r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
 
-        enrich_n = min(
-            _clamp_count(enrich_results, cfg.max_enrich_results, minimum=0), len(results)
-        )
-        if enrich_n > 0:
-            tasks = [_enrich_result(r.get("url")) for r in results[:enrich_n]]
-            enriched = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, data in enumerate(enriched):
-                if isinstance(data, Exception):
-                    results[i]["page_meta_error"] = str(data)
-                    continue
-                if not data:
-                    continue
-                headings = (data.get("headings") or [])[: cfg.max_enrich_headings]
-                results[i]["page_title"] = data.get("title")
-                results[i]["page_description"] = data.get("description")
-                if headings:
-                    results[i]["page_headings"] = headings
-                if data.get("toc"):
-                    results[i]["page_toc"] = data["toc"][:20]
+        # Fetch each result's page just enough to attach its own title and
+        # description, so the model can judge relevance before reading in full.
+        tasks = [_enrich_result(r.get("url")) for r in results]
+        enriched = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, data in enumerate(enriched):
+            if isinstance(data, Exception):
+                results[i]["page_meta_error"] = str(data)
+                continue
+            if not data:
+                continue
+            if data.get("error"):
+                results[i]["page_meta_error"] = data["error"]
+                continue
+            results[i]["page_title"] = data.get("title")
+            results[i]["page_description"] = data.get("description")
 
         return json.dumps(
             {"query": query, **applied, "results": results},
@@ -829,7 +723,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     @mcp.tool()
-    async def fetch_page(url: str, mode: str = "text", section: str | None = None) -> str:
+    async def fetch_page(url: str, mode: str = "text") -> str:
         """
         Fetch the contents of a web page (or a URL returned by search_web).
 
@@ -842,17 +736,8 @@ def register(mcp: FastMCP) -> None:
                         and JSON-LD structured data (schema.org Recipe, HowTo,
                         Article, etc.).
 
-        OPTIONAL: if you already know which section you care about (for example
-        because search_web returned a page_headings outline that listed it),
-        pass the heading text as `section` to get back ONLY that section instead
-        of the whole page. Matching is case-insensitive and tolerant of whitespace;
-        substring matches are accepted as a fallback. `section` only applies to
-        HTML pages — it is ignored for document links (PDF, Office, etc.) and
-        JSON responses (e.g. Reddit).
-
         :param url: Absolute URL to fetch (http/https).
         :param mode: "text" or "structured".
-        :param section: Optional heading text to extract just that section.
         :return: JSON string with the result.
         """
         if not url or not isinstance(url, str):
@@ -864,8 +749,6 @@ def register(mcp: FastMCP) -> None:
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
             raise ToolError(f"Invalid mode '{mode}'. Use 'text' or 'structured'.")
-
-        section = (section or "").strip() or None
 
         fetch_url = _normalize_reddit_url(url)
         reddit_rewritten = fetch_url != url
@@ -961,41 +844,6 @@ def register(mcp: FastMCP) -> None:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
         soup_title = _page_title(full_soup)
-
-        if section:
-            section_data = _find_section(full_soup, section)
-            if section_data is None:
-                available = [
-                    h.get_text(" ", strip=True)
-                    for h in full_soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-                ]
-                available = [a for a in (a.strip() for a in available) if a][: cfg.max_enrich_headings]
-                available_str = "; ".join(available) if available else "(none found)"
-                raise ToolError(
-                    f"Section '{section}' not found on {fetch_url}. "
-                    f"Available headings: {available_str}. "
-                    "Retry with one of those headings, or omit `section` to fetch "
-                    "the whole page."
-                )
-
-            section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
-            section_body = _trim(section_body, cfg.max_page_chars)
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "section",
-                    "title": soup_title,
-                    "matched_heading": section_data["matched_heading"],
-                    "level": section_data["level"],
-                    "next_heading": section_data["next_heading"],
-                    "content": section_body,
-                },
-                ensure_ascii=False,
-            )
 
         try:
             plain = _plain_text_from_html(text)

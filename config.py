@@ -53,20 +53,12 @@ class WebSearchSettings(BaseSettings):
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
     )
-    # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
-    # the model request fewer results / less enrichment per call; anything above
-    # these caps is clamped down so an oversized response (or a pile of
-    # table-of-contents outlines) can't overwhelm the model's context window.
-    # When the model doesn't specify, the cap is used (the prior behavior).
+    # This is a MAXIMUM, not a fixed amount. `search_web` lets the model request
+    # fewer results per call; anything above this cap is clamped down so an
+    # oversized response can't overwhelm the model's context window. When the
+    # model doesn't specify, the cap is used (the prior behavior).
     max_num_results: int = Field(
         5, description="Maximum number of search results to return."
-    )
-    max_enrich_results: int = Field(
-        3,
-        description=(
-            "Maximum number of top results to fetch structured metadata "
-            "(description + table-of-contents outline) for (0 disables)."
-        ),
     )
     searxng_categories: str = Field("general", description="Comma-separated SearXNG categories.")
     searxng_language: str = Field("en", description="SearXNG language code (e.g. 'en', 'all').")
@@ -113,7 +105,9 @@ class WebSearchSettings(BaseSettings):
     )
 
     max_page_chars: int = Field(25000, description="Max characters of page content before truncation.")
-    max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
+    max_enrich_headings: int = Field(
+        25, description="Max headings in a fetch_page 'structured' result outline."
+    )
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
 
 

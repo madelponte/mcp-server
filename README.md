@@ -56,8 +56,8 @@ disk and only successful results are cached.
 For each, `*_CACHE_TTL_SECONDS=0` disables caching, and `*_CACHE_MAX_ENTRIES`
 bounds memory by evicting the oldest entry once full (`0` = unbounded). The page
 cache deliberately stores the raw fetch, not the formatted output, so a repeat
-fetch of the same URL skips the network even when a different `mode`/`section`
-is requested. Transcripts get a long TTL because they essentially never change.
+fetch of the same URL skips the network even when a different `mode` is
+requested. Transcripts get a long TTL because they essentially never change.
 
 ## Configuration
 
