@@ -53,10 +53,20 @@ class WebSearchSettings(BaseSettings):
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
     )
-    num_results: int = Field(5, description="Number of search results to return.")
-    enrich_top_n: int = Field(
+    # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
+    # the model request fewer results / less enrichment per call; anything above
+    # these caps is clamped down so an oversized response (or a pile of
+    # table-of-contents outlines) can't overwhelm the model's context window.
+    # When the model doesn't specify, the cap is used (the prior behavior).
+    max_num_results: int = Field(
+        5, description="Maximum number of search results to return."
+    )
+    max_enrich_results: int = Field(
         3,
-        description="Fetch structured metadata for this many top results (0 disables).",
+        description=(
+            "Maximum number of top results to fetch structured metadata "
+            "(description + table-of-contents outline) for (0 disables)."
+        ),
     )
     searxng_categories: str = Field("general", description="Comma-separated SearXNG categories.")
     searxng_language: str = Field("en", description="SearXNG language code (e.g. 'en', 'all').")

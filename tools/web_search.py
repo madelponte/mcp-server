@@ -99,6 +99,27 @@ def _trim(text: str, limit: int) -> str:
     return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]"
 
 
+def _clamp_count(requested: Optional[int], maximum: int, *, minimum: int) -> int:
+    """Resolve a model-requested count against its configured maximum.
+
+    ``None`` (the model didn't ask) yields ``maximum``, preserving the old
+    fixed-amount behavior. Otherwise the value is clamped to ``[minimum,
+    maximum]`` so the model can dial the amount down but never request more than
+    the cap — the guard that keeps an oversized response from overwhelming its
+    context window. ``minimum`` is 1 for the result count and 0 for enrichment
+    (0 meaningfully disables it).
+    """
+    if requested is None:
+        return maximum
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        return maximum
+    if requested < minimum:
+        return minimum
+    return min(requested, maximum)
+
+
 # ---------------------------------------------------------------------------
 # Content extraction
 # ---------------------------------------------------------------------------
@@ -695,6 +716,8 @@ def register(mcp: FastMCP) -> None:
         query: str,
         time_range: str | None = None,
         category: str | None = None,
+        num_results: int | None = None,
+        enrich_results: int | None = None,
     ) -> str:
         """
         Search the web and return a ranked list of results.
@@ -719,6 +742,15 @@ def register(mcp: FastMCP) -> None:
             "images", "music", "files", or "map". Use "news" for current-events
             reporting. Comma-separate to combine categories. Defaults to the
             server's configured value.
+        :param num_results: How many search results to return. Request fewer for
+            a focused lookup, or omit to use the server default. Value is capped by
+            the server.
+        :param enrich_results: How many of the top results to fetch page
+            metadata (description + heading/JSON-LD table-of-contents outline)
+            for. Each outline costs context, so request only as many as you
+            need: pass a small number for a quick scan, 0 to skip enrichment
+            and get just url/title/snippet, or omit to use the server default.
+            Value is capped by the server.
         :return: JSON string of results.
         """
         query = (query or "").strip()
@@ -749,7 +781,7 @@ def register(mcp: FastMCP) -> None:
             results = await _searxng_query(
                 base_url=cfg.searxng_url,
                 query=query,
-                num_results=max(1, cfg.num_results),
+                num_results=_clamp_count(num_results, cfg.max_num_results, minimum=1),
                 categories=resolved_categories,
                 language=cfg.searxng_language,
                 time_range=resolved_time_range,
@@ -770,7 +802,9 @@ def register(mcp: FastMCP) -> None:
             if r.get("snippet"):
                 r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
 
-        enrich_n = min(max(0, cfg.enrich_top_n), len(results))
+        enrich_n = min(
+            _clamp_count(enrich_results, cfg.max_enrich_results, minimum=0), len(results)
+        )
         if enrich_n > 0:
             tasks = [_enrich_result(r.get("url")) for r in results[:enrich_n]]
             enriched = await asyncio.gather(*tasks, return_exceptions=True)
