@@ -33,10 +33,10 @@ from .cache import TTLCache
 SEARXNG_TIME_RANGES = {"", "day", "week", "month", "year"}
 _TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
 
-# Process-wide cache of fetched pages, keyed by URL. Shared by fetch_page and
-# search_web's result enrichment so a repeated fetch within a task skips the
-# network round-trip. Fetch settings all come from static config, so the URL
-# alone is a sufficient key. See the README "Caching" section.
+# Process-wide cache of fetched pages, keyed by URL, so a repeated fetch_page
+# call for the same URL within a task skips the network round-trip. Fetch
+# settings all come from static config, so the URL alone is a sufficient key.
+# See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
 # ---------------------------------------------------------------------------
@@ -480,7 +480,13 @@ async def _searxng_query(
     verify_ssl: bool,
     user_agent: str,
 ) -> list[dict]:
-    """Run a SearXNG JSON query and return [{url, title, snippet}]."""
+    """Run a SearXNG JSON query and return [{url, title, snippet, ...}].
+
+    ``published_date`` and ``score`` are included when SearXNG supplies them
+    (date is engine-dependent; score is its merged relevance ranking). They come
+    free in the search response — no per-result page fetch — and give the model
+    enough to judge relevance and recency on their own.
+    """
     params = {"q": query, "format": "json", "safesearch": str(safe_search)}
     if categories:
         params["categories"] = categories
@@ -504,13 +510,17 @@ async def _searxng_query(
     items = data.get("results") or []
     out: list[dict] = []
     for r in items[:num_results]:
-        out.append(
-            {
-                "url": r.get("url"),
-                "title": r.get("title"),
-                "snippet": (r.get("content") or "").strip(),
-            }
-        )
+        item = {
+            "url": r.get("url"),
+            "title": r.get("title"),
+            "snippet": (r.get("content") or "").strip(),
+        }
+        # Engine-dependent extras, surfaced only when present.
+        if r.get("publishedDate"):
+            item["published_date"] = r["publishedDate"]
+        if r.get("score") is not None:
+            item["score"] = r["score"]
+        out.append(item)
     return out
 
 
@@ -577,10 +587,10 @@ async def _cached_resilient_fetch(url: str) -> dict:
     """``_resilient_fetch`` with a process-wide TTL cache keyed by URL.
 
     Caching the raw fetch (rather than the formatted tool output) means a
-    re-fetch of the same URL — common in agent loops, and shared between
-    fetch_page and search_web enrichment — skips the network round-trip, while
-    each caller still formats the cached result for its own mode needs.
-    Only successful fetches are cached; a failure propagates and is not stored.
+    re-fetch of the same URL — common in agent loops — skips the network
+    round-trip, while each caller still formats the cached result for its own
+    mode needs. Only successful fetches are cached; a failure propagates and is
+    not stored.
     """
     cached = _page_cache.get(url)
     if cached is not None:
@@ -595,25 +605,6 @@ async def _cached_resilient_fetch(url: str) -> dict:
     )
     _page_cache.set(url, fetched)
     return fetched
-
-
-async def _enrich_result(url: Optional[str]) -> Optional[dict]:
-    """Fetch a URL just enough to extract its page title and description."""
-    if not url:
-        return None
-    try:
-        fetched = await _cached_resilient_fetch(url)
-    except Exception as e:
-        return {"error": str(e)}
-
-    ctype = (fetched.get("content_type") or "").lower()
-    if _is_tika_document(ctype, url):
-        return {"title": None, "description": None}
-    text = fetched.get("text")
-    if not text:
-        return None
-    soup = BeautifulSoup(text, "lxml")
-    return {"title": _page_title(soup), "description": _page_description(soup)}
 
 
 def register(mcp: FastMCP) -> None:
@@ -632,9 +623,10 @@ def register(mcp: FastMCP) -> None:
         (a few keywords) — do NOT just echo the user's whole prompt. If the
         first search isn't useful, you may call this again with a refined query.
 
-        Each result includes: url, title, snippet, and the target page's own
-        page_title and page_description, so you can decide which links are worth
-        reading in full. To actually read a link, pass its url to fetch_page.
+        Each result includes: url, title, snippet, and — if it exists —
+        a published_date and a relevance score, so you can judge
+        which links are worth reading in full. To actually read a link, pass its
+        url to fetch_page.
 
         :param query: A concise search query (keywords, not a full sentence).
         :param time_range: Optional recency filter. One of "day", "week",
@@ -644,8 +636,7 @@ def register(mcp: FastMCP) -> None:
         :param category: Optional SearXNG category to search in, e.g. "general"
             (default), "news", "science", "it", "social media", "videos",
             "images", "music", "files", or "map". Use "news" for current-events
-            reporting. Comma-separate to combine categories. Defaults to the
-            server's configured value.
+            reporting. Comma-separate to combine categories. Defaults to general.
         :param num_results: How many search results to return. Request fewer for
             a focused lookup, or omit to use the server default. Value is capped by
             the server.
@@ -699,22 +690,6 @@ def register(mcp: FastMCP) -> None:
         for r in results:
             if r.get("snippet"):
                 r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
-
-        # Fetch each result's page just enough to attach its own title and
-        # description, so the model can judge relevance before reading in full.
-        tasks = [_enrich_result(r.get("url")) for r in results]
-        enriched = await asyncio.gather(*tasks, return_exceptions=True)
-        for i, data in enumerate(enriched):
-            if isinstance(data, Exception):
-                results[i]["page_meta_error"] = str(data)
-                continue
-            if not data:
-                continue
-            if data.get("error"):
-                results[i]["page_meta_error"] = data["error"]
-                continue
-            results[i]["page_title"] = data.get("title")
-            results[i]["page_description"] = data.get("description")
 
         return json.dumps(
             {"query": query, **applied, "results": results},

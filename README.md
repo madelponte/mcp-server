@@ -49,7 +49,7 @@ disk and only successful results are cached.
 
 | Tool | What's cached | Default TTL | Env prefix |
 |------|---------------|-------------|------------|
-| `fetch_page` (and `search_web` enrichment) | the fetched page, keyed by URL | 5 min (`300s`) | `WEB_SEARCH_CACHE_*` |
+| `fetch_page` | the fetched page, keyed by URL | 5 min (`300s`) | `WEB_SEARCH_CACHE_*` |
 | `get_youtube_transcript` | the finished transcript, keyed by video id + languages | 24 h (`86400s`) | `YOUTUBE_CACHE_*` |
 | Stock Data tools | each upstream API response | 60 s | `STOCK_CACHE_TTL_SECONDS` |
 
