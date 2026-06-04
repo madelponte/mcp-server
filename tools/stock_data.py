@@ -8,15 +8,20 @@ WebUI tool; per-user valves and status emitters were removed.
 """
 
 import json
-import time
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 import anyio
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from config import stock_settings as cfg
+from .cache import TTLCache
+
+# Error convention: every genuine failure raises ToolError, which FastMCP turns
+# into a result with `isError: true`, so a model can't mistake the failure for
+# market data. See the README "Error handling" section.
 
 # -------------------------- Helpers --------------------------
 
@@ -67,33 +72,25 @@ def _format_large_number(n: Optional[float]) -> Optional[str]:
     return f"{n:.2f}"
 
 
+def _retrieval_error(what: str, symbol: str, errors: list[str]) -> str:
+    """Build a ToolError message for a failed data retrieval, keeping the
+    per-provider error detail (otherwise lost when we raise instead of return)."""
+    msg = f"Could not retrieve {what} for {symbol}."
+    if errors:
+        msg += " Provider errors: " + "; ".join(errors)
+    return msg
+
+
 # -------------------------- Cache + HTTP --------------------------
 
-_cache: dict[str, tuple[float, Any]] = {}
-
-
-def _cache_get(key: str) -> Optional[Any]:
-    if cfg.cache_ttl_seconds <= 0:
-        return None
-    entry = _cache.get(key)
-    if not entry:
-        return None
-    ts, value = entry
-    if time.time() - ts > cfg.cache_ttl_seconds:
-        _cache.pop(key, None)
-        return None
-    return value
-
-
-def _cache_set(key: str, value: Any) -> None:
-    if cfg.cache_ttl_seconds <= 0:
-        return
-    _cache[key] = (time.time(), value)
+# Unbounded (max_entries=0) to preserve the original behavior; quote/profile
+# responses are small and the TTL is short.
+_cache = TTLCache(cfg.cache_ttl_seconds)
 
 
 def _http_get_json(url: str, params: Optional[dict] = None) -> Any:
     cache_key = f"GET::{url}::{json.dumps(params or {}, sort_keys=True)}"
-    cached = _cache_get(cache_key)
+    cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     resp = requests.get(
@@ -104,7 +101,7 @@ def _http_get_json(url: str, params: Optional[dict] = None) -> Any:
     )
     resp.raise_for_status()
     data = resp.json()
-    _cache_set(cache_key, data)
+    _cache.set(cache_key, data)
     return data
 
 
@@ -848,7 +845,7 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
 
         provider = _resolve_provider(cfg.default_provider)
         result: Optional[dict] = None
@@ -872,11 +869,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve quote.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("quote", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -890,7 +883,7 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
 
         provider = _resolve_provider(cfg.default_provider)
         result: Optional[dict] = None
@@ -913,11 +906,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve profile.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("profile", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -937,11 +926,11 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
         if statement not in ("income", "balance", "cashflow"):
-            return json.dumps({"error": "statement must be one of: income, balance, cashflow"})
+            raise ToolError("statement must be one of: income, balance, cashflow")
         if period not in ("annual", "quarterly"):
-            return json.dumps({"error": "period must be 'annual' or 'quarterly'"})
+            raise ToolError("period must be 'annual' or 'quarterly'")
 
         provider = _resolve_provider(cfg.financials_provider, for_financials=True)
         result: Optional[dict] = None
@@ -964,11 +953,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve financials.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("financials", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -982,7 +967,7 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
 
         result: Optional[dict] = None
         errors: list[str] = []
@@ -1004,11 +989,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve earnings.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("earnings", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -1021,7 +1002,7 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
 
         result: Optional[dict] = None
         errors: list[str] = []
@@ -1041,11 +1022,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve news.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("news", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -1061,7 +1038,7 @@ def register(mcp: FastMCP) -> None:
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
 
         weeks = cfg.insider_lookback_weeks
         result: Optional[dict] = None
@@ -1082,11 +1059,7 @@ def register(mcp: FastMCP) -> None:
                 errors.append(f"yfinance: {type(e).__name__}: {e}")
 
         if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve insider transactions.",
-                "provider_errors": errors,
-            })
+            raise ToolError(_retrieval_error("insider transactions", symbol, errors))
         return json.dumps(result, default=str)
 
     @mcp.tool()
@@ -1101,13 +1074,12 @@ def register(mcp: FastMCP) -> None:
         """
         query = (query or "").strip()
         if not query:
-            return json.dumps({"error": "Query is required."})
+            raise ToolError("Query is required.")
 
         if not cfg.finnhub_api_key:
-            return json.dumps({
-                "error": "Symbol search requires a Finnhub API key (STOCK_FINNHUB_API_KEY).",
-                "query": query,
-            })
+            raise ToolError(
+                "Symbol search requires a Finnhub API key (STOCK_FINNHUB_API_KEY)."
+            )
 
         try:
             data = await anyio.to_thread.run_sync(
@@ -1115,13 +1087,14 @@ def register(mcp: FastMCP) -> None:
                 "https://finnhub.io/api/v1/search",
                 {"q": query, "token": cfg.finnhub_api_key},
             )
-            results = []
-            for item in (data.get("result") or [])[:10]:
-                results.append({
-                    "symbol": item.get("symbol"),
-                    "description": item.get("description"),
-                    "type": item.get("type"),
-                })
-            return json.dumps({"query": query, "count": len(results), "results": results})
         except Exception as e:
-            return json.dumps({"error": f"Search failed: {type(e).__name__}: {e}", "query": query})
+            raise ToolError(f"Symbol search failed for {query!r}: {type(e).__name__}: {e}")
+
+        results = []
+        for item in (data.get("result") or [])[:10]:
+            results.append({
+                "symbol": item.get("symbol"),
+                "description": item.get("description"),
+                "type": item.get("type"),
+            })
+        return json.dumps({"query": query, "count": len(results), "results": results})
