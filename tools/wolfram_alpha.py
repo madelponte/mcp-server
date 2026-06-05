@@ -11,12 +11,19 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from config import wolfram_settings as cfg
+from .cache import TTLCache
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`. This keeps failures from being mistaken
 # for normal output by a model. See the README "Error handling" section.
 
 BASE_URL = "https://www.wolframalpha.com/api/v1/llm-api"
+
+# A Wolfram result for a given (input, assumption, units, maxchars) is
+# effectively deterministic, and agent loops re-ask the same computation
+# surprisingly often, so we cache the finished response. See the README
+# "Caching" section.
+_result_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
 
 def register(mcp: FastMCP) -> None:
@@ -72,6 +79,15 @@ def register(mcp: FastMCP) -> None:
         if assumption:
             params["assumption"] = assumption
 
+        # Key on everything that affects the result (but never the AppID). A
+        # null byte separates fields so values can't collide across boundaries.
+        cache_key = "\x00".join(
+            (clean_query, assumption or "", cfg.default_units, str(cfg.max_chars))
+        )
+        cached = _result_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
                 response = await client.get(
@@ -116,4 +132,5 @@ def register(mcp: FastMCP) -> None:
         if not body.strip():
             raise ToolError("Wolfram Alpha returned an empty response.")
 
+        _result_cache.set(cache_key, body)
         return body

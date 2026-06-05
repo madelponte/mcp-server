@@ -74,7 +74,8 @@ returned nothing; if every requested section fails, the call raises an error so
 a failure is never mistaken for data.
 
 `search_symbol(query)` — Look up a ticker by company name or partial symbol
-(e.g. `"apple"` → `AAPL`). Requires a Finnhub API key.
+(e.g. `"apple"` → `AAPL`). Uses Finnhub when a key is configured, otherwise
+falls back to a keyless Yahoo Finance lookup.
 
 > **Note:** earlier versions exposed `get_stock_quote`, `get_company_profile`,
 > `get_financials`, `get_earnings`, and `get_company_news` as separate tools.
@@ -116,7 +117,7 @@ See [.env.example](https://github.com/madelponte/mcp-server/blob/main/.env.examp
 for the full list with defaults. Key things to set:
 
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
-- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (`search_symbol` requires it; everything else falls back to keyless yfinance).
+- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves `search_symbol` and quote/profile coverage; everything falls back to keyless yfinance).
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,

@@ -178,6 +178,19 @@ class WolframSettings(BaseSettings):
         30.0, description="HTTP timeout for the Wolfram Alpha request, in seconds."
     )
 
+    cache_ttl_seconds: int = Field(
+        3600,
+        description=(
+            "Cache results this many seconds so an agent loop that re-asks the same "
+            "computation skips the network round-trip. Wolfram results for a given "
+            "(input, assumption, units) are effectively deterministic, so a long TTL "
+            "is safe (0 disables the cache)."
+        ),
+    )
+    cache_max_entries: int = Field(
+        256, description="Max number of cached results before the oldest is evicted (0 = unbounded)."
+    )
+
 
 class YouTubeSettings(BaseSettings):
     """Valves for the YouTube Transcript tool."""
