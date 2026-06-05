@@ -68,6 +68,13 @@ class WebSearchSettings(BaseSettings):
             "(description + table-of-contents outline) for (0 disables)."
         ),
     )
+    default_enrich_results: int = Field(
+        2,
+        description=(
+            "Number of top results to enrich when the model doesn't specify "
+            "(clamped to max_enrich_results; 0 disables enrichment by default)."
+        ),
+    )
     searxng_categories: str = Field("general", description="Comma-separated SearXNG categories.")
     searxng_language: str = Field("en", description="SearXNG language code (e.g. 'en', 'all').")
     searxng_time_range: str = Field("", description="'', 'day', 'week', 'month', or 'year'.")

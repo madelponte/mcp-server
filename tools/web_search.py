@@ -99,18 +99,26 @@ def _trim(text: str, limit: int) -> str:
     return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]"
 
 
-def _clamp_count(requested: Optional[int], maximum: int, *, minimum: int) -> int:
+def _clamp_count(
+    requested: Optional[int],
+    maximum: int,
+    *,
+    minimum: int,
+    default: Optional[int] = None,
+) -> int:
     """Resolve a model-requested count against its configured maximum.
 
-    ``None`` (the model didn't ask) yields ``maximum``, preserving the old
-    fixed-amount behavior. Otherwise the value is clamped to ``[minimum,
-    maximum]`` so the model can dial the amount down but never request more than
-    the cap — the guard that keeps an oversized response from overwhelming its
-    context window. ``minimum`` is 1 for the result count and 0 for enrichment
-    (0 meaningfully disables it).
+    ``None`` (the model didn't ask) yields ``default`` when one is configured,
+    otherwise ``maximum`` (the old fixed-amount behavior). Either way the result
+    is clamped to ``[minimum, maximum]`` so the model can dial the amount down
+    but never request more than the cap — the guard that keeps an oversized
+    response from overwhelming its context window. ``minimum`` is 1 for the
+    result count and 0 for enrichment (0 meaningfully disables it).
     """
     if requested is None:
-        return maximum
+        if default is None:
+            return maximum
+        requested = default
     try:
         requested = int(requested)
     except (TypeError, ValueError):
@@ -598,14 +606,19 @@ async def _searxng_query(
     items = data.get("results") or []
     out: list[dict] = []
     for r in items[:num_results]:
-        out.append(
-            {
-                "url": r.get("url"),
-                "title": r.get("title"),
-                "snippet": (r.get("content") or "").strip(),
-                "engine": r.get("engine"),
-            }
-        )
+        item = {
+            "url": r.get("url"),
+            "title": r.get("title"),
+            "snippet": (r.get("content") or "").strip(),
+            "engine": r.get("engine"),
+        }
+        # News/dated sources populate a publish date; general-web engines omit
+        # it. SearXNG exposes it inconsistently as either "publishedDate" or
+        # "pubdate" depending on the engine, so surface whichever is present.
+        published = r.get("publishedDate") or r.get("pubdate")
+        if published:
+            item["published_date"] = published
+        out.append(item)
     return out
 
 
@@ -727,10 +740,10 @@ def register(mcp: FastMCP) -> None:
         (a few keywords) — do NOT just echo the user's whole prompt. If the
         first search isn't useful, you may call this again with a refined query.
 
-        Each result includes: url, title, snippet, and (for the top results)
-        page metadata such as a description and a heading-based outline /
-        JSON-LD table of contents, so you can decide which links are worth
-        fetching in full.
+        Each result includes: url, title, snippet, an optional published_date
+        (when the source provides one), and (for the top results) page metadata
+        such as a description and a heading-based outline / JSON-LD table of
+        contents, so you can decide which links are worth fetching in full.
 
         :param query: A concise search query (keywords, not a full sentence).
         :param time_range: Optional recency filter. One of "day", "week",
@@ -803,7 +816,13 @@ def register(mcp: FastMCP) -> None:
                 r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
 
         enrich_n = min(
-            _clamp_count(enrich_results, cfg.max_enrich_results, minimum=0), len(results)
+            _clamp_count(
+                enrich_results,
+                cfg.max_enrich_results,
+                minimum=0,
+                default=cfg.default_enrich_results,
+            ),
+            len(results),
         )
         if enrich_n > 0:
             tasks = [_enrich_result(r.get("url")) for r in results[:enrich_n]]
