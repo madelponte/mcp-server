@@ -1,7 +1,7 @@
 # openwebui-tools MCP server
 
-A single [MCP](https://modelcontextprotocol.io) server that bundles four tool
-groups originally written for Open WebUI, so they can be used from any
+A single [MCP](https://modelcontextprotocol.io) server that bundles five tool
+groups (four originally written for Open WebUI), so they can be used from any
 MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
 support, etc.).
 
@@ -17,6 +17,7 @@ network at `http://<host>:8000/mcp`.
 | **Stock Data**         | `get_company_data`, `search_symbol`   |
 | **Wolfram Alpha**      | `query_wolfram_alpha`                 |
 | **YouTube Transcript** | `get_youtube_transcript`              |
+| **Place Search**       | `find_nearby_places`                  |
 
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
@@ -104,6 +105,29 @@ transcript. Transcripts are cached (they almost never change), and optional
 Webshare / generic proxy settings are supported for networks where YouTube
 blocks the server's IP.
 
+### Place Search
+
+`find_nearby_places(category, near=None, latitude=None, longitude=None, radius_m=None, limit=None)`
+— Find points of interest near a location via OpenStreetMap
+[Overpass](https://overpass-api.de/). Specify the location either as `near` (a
+place name, geocoded for you via [Nominatim](https://nominatim.org/) — so "vegan
+restaurants in Portland" is a single call) or as explicit `latitude`/`longitude`
+(which win if both are given). `category` is plain language, not OSM tags:
+`restaurant`, `coffee`, `pharmacy`, `atm`, `hotel`, `museum`, `gas station`, etc.
+A food category can be prefixed with a diet — `vegan`, `vegetarian`, `halal`,
+`kosher`, or `gluten free` (`"vegan restaurant"`, or just `"vegan"`). An
+unrecognized category falls back to matching place names, so brands like
+`"Starbucks"` work too. Results are sorted nearest-first and include distance
+plus useful tags (cuisine, address, phone, website, opening hours) when
+available. An empty `results` list means nothing matched in range (not an error).
+
+It uses the public OpenStreetMap APIs by default and honors Nominatim's
+[usage policy](https://operations.osmfoundation.org/policies/nominatim/): a
+descriptive `GEO_USER_AGENT` (set this!) and a ~1 req/sec throttle on the public
+API. To self-host, point `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` at your own
+instances and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`. Results are cached
+(place data changes slowly), which also eases the rate limits.
+
 ## Configuration
 
 Every Open WebUI "valve" became an environment variable. Copy the example file
@@ -120,8 +144,10 @@ for the full list with defaults. Key things to set:
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves `search_symbol` and quote/profile coverage; everything falls back to keyless yfinance).
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 
+- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
+
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
-`WOLFRAM_`, `YOUTUBE_`.
+`WOLFRAM_`, `YOUTUBE_`, `GEO_`.
 
 ### Authentication
 
