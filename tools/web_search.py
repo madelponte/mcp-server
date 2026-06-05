@@ -625,8 +625,8 @@ def register(mcp: FastMCP) -> None:
 
         Each result includes: url, title, snippet, and — if it exists —
         a published_date and a relevance score, so you can judge
-        which links are worth reading in full. To actually read a link, pass its
-        url to fetch_page.
+        which links are worth reading in full. To actually read the full contents 
+        of a link, pass its url to fetch_page.
 
         :param query: A concise search query (keywords, not a full sentence).
         :param time_range: Optional recency filter. One of "day", "week",
