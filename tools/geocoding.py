@@ -1,18 +1,15 @@
 """
-Geocoding & Place Search MCP tool (OpenStreetMap).
+Place Search MCP tool (OpenStreetMap).
 
-Exposes two tools:
+Exposes a single tool, ``find_nearby_places(category, near=None, latitude=None,
+longitude=None, radius_m=None, limit=None)``, which finds nearby points of
+interest (restaurants, cafes, pharmacies, ATMs, …) via **Overpass**. ``near``
+accepts a place name that is geocoded internally via **Nominatim**, so a query
+like "vegan restaurants in Portland" needs only one tool call; alternatively the
+caller passes explicit ``latitude``/``longitude``.
 
-- ``geocode_location(query, limit=None)`` — turn a place name or address into
-  latitude/longitude coordinates (plus metadata) via OpenStreetMap **Nominatim**.
-- ``find_nearby_places(category, near=None, latitude=None, longitude=None,
-  radius_m=None, limit=None)`` — find nearby points of interest (restaurants,
-  cafes, pharmacies, ATMs, …) via **Overpass**. ``near`` accepts a place name
-  that is geocoded internally, so a query like "vegan restaurants in Portland"
-  needs only one tool call.
-
-By default both tools use the public OpenStreetMap APIs. Set ``GEO_NOMINATIM_URL``
-/ ``GEO_OVERPASS_URL`` to self-host. Nominatim's usage policy (a descriptive
+By default it uses the public OpenStreetMap APIs. Set ``GEO_NOMINATIM_URL`` /
+``GEO_OVERPASS_URL`` to self-host. Nominatim's usage policy (a descriptive
 User-Agent and a 1 req/sec cap on the public API) is honored — see config.py.
 """
 
@@ -367,38 +364,6 @@ async def _overpass(query_ql: str) -> list[dict]:
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
-    async def geocode_location(query: str, limit: int | None = None) -> str:
-        """
-        Convert a place name or address into geographic coordinates (latitude /
-        longitude) using OpenStreetMap. Use this to answer "where is X?", to get
-        coordinates for a city/landmark/address, or to disambiguate a place
-        before doing something with its location.
-
-        Tips for good results:
-        - A specific query is more accurate: include city/state/country when a
-          name is ambiguous ("Springfield, Illinois" not just "Springfield").
-        - Works for cities, neighborhoods, streets, full addresses, landmarks,
-          and points of interest by name.
-
-        To find businesses or amenities NEAR a place (e.g. "coffee shops in
-        Berlin"), use `find_nearby_places` instead — it can take a place name
-        directly and does the geocoding for you.
-
-        :param query: A place name or address (e.g. "Eiffel Tower",
-            "1600 Amphitheatre Parkway, Mountain View", "Kyoto, Japan").
-        :param limit: Max number of matches to return (server-capped). Omit for
-            the default. Multiple matches usually mean the name is ambiguous.
-        :return: JSON with a `results` list; each entry has name, latitude,
-            longitude, category, type, and an address breakdown. An empty list
-            means no match was found.
-        """
-        n = _clamp(limit, cfg.default_results, cfg.max_results)
-        results = await _geocode(query, n)
-        return json.dumps(
-            {"query": query.strip(), "count": len(results), "results": results}
-        )
-
-    @mcp.tool()
     async def find_nearby_places(
         category: str,
         near: str | None = None,
@@ -408,39 +373,29 @@ def register(mcp: FastMCP) -> None:
         limit: int | None = None,
     ) -> str:
         """
-        Find points of interest (restaurants, shops, services, attractions, …)
-        near a location, using OpenStreetMap. This answers requests like "vegan
-        restaurants in Portland", "pharmacies near me", or "museums close to
-        these coordinates".
+        Find points of interest near a location via OpenStreetMap — e.g. "vegan
+        restaurants in Portland", "pharmacies near me", "museums near here".
 
-        Specify the location in ONE of two ways:
-        - `near`: a place name or address — it is geocoded for you, so a single
-          call handles "<category> in <place>". This is usually the easiest.
-        - `latitude` + `longitude`: explicit coordinates (e.g. from a previous
-          `geocode_location` call or the user's GPS). These take precedence if
-          both `near` and coordinates are given.
+        Give the location ONE of two ways:
+        - `near`: a place name or address (geocoded for you).
+        - `latitude` + `longitude`: explicit coordinates (used if both are given).
 
-        The `category` is plain language, not OSM tags. Recognized examples:
-        restaurant, fast food, cafe/coffee, bar, bakery, supermarket/grocery,
-        pharmacy, hospital, clinic, dentist, atm, bank, fuel/gas station, ev
-        charging, parking, hotel, museum, park, gym, library, cinema, train
-        station, airport, and many more. You can prefix a food category with a
-        diet — "vegan", "vegetarian", "halal", "kosher", or "gluten free" (e.g.
-        "vegan restaurant", or just "vegan"). An unrecognized category is matched
-        against place names, so brand names like "Starbucks" also work.
+        `category` is plain language, not OSM tags: restaurant, coffee, bar,
+        supermarket, pharmacy, hospital, atm, bank, gas station, hotel, museum,
+        park, gym, and many more. Prefix a food category with a diet — vegan,
+        vegetarian, halal, kosher, or gluten free ("vegan restaurant", or just
+        "vegan"). An unknown category matches place names, so brands like
+        "Starbucks" work too.
 
-        :param category: What to look for, in plain language (see examples above).
-        :param near: A place name/address to search around (geocoded for you).
-        :param latitude: Latitude of the search center (use with longitude).
-        :param longitude: Longitude of the search center (use with latitude).
-        :param radius_m: Search radius in meters (server-capped). Omit for the
-            default. Use a larger radius for a whole city, smaller for "near me".
-        :param limit: Max number of places to return (server-capped). Results are
-            sorted nearest-first.
-        :return: JSON with the resolved `center`, the `radius_m` used, and a
-            `results` list (each with name, coordinates, distance_m, category,
-            and useful tags like cuisine/address/phone/website/opening_hours when
-            available). An empty list means nothing matched in range.
+        :param category: What to look for, in plain language.
+        :param near: Place name/address to search around (geocoded for you).
+        :param latitude: Search-center latitude (use with longitude).
+        :param longitude: Search-center longitude (use with latitude).
+        :param radius_m: Search radius in meters (server-capped); omit for default.
+        :param limit: Max places to return (server-capped); sorted nearest-first.
+        :return: JSON with the resolved `center`, `radius_m`, and a nearest-first
+            `results` list (name, coordinates, distance_m, category, and
+            cuisine/address/phone/website/opening_hours when available).
         """
         if not (category or "").strip():
             raise ToolError("Empty category. Say what to look for, e.g. 'pharmacy'.")

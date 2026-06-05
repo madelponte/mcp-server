@@ -287,15 +287,9 @@ class GeocodingSettings(BaseSettings):
         ),
     )
 
-    # The following are MAXIMUMS, not fixed amounts. The tools let the model
+    # The following are MAXIMUMS, not fixed amounts. The tool lets the model
     # request fewer per call; anything larger is clamped so an oversized response
     # can't overwhelm the model's context window. Omitting the value uses the cap.
-    max_results: int = Field(
-        10, description="Maximum geocoding matches returned per query."
-    )
-    default_results: int = Field(
-        5, description="Geocoding matches returned when the model doesn't specify."
-    )
     max_nearby_results: int = Field(
         20, description="Maximum nearby places returned per query."
     )

@@ -17,7 +17,7 @@ network at `http://<host>:8000/mcp`.
 | **Stock Data**         | `get_company_data`, `search_symbol`   |
 | **Wolfram Alpha**      | `query_wolfram_alpha`                 |
 | **YouTube Transcript** | `get_youtube_transcript`              |
-| **Geocoding & Places** | `geocode_location`, `find_nearby_places` |
+| **Place Search**       | `find_nearby_places`                  |
 
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
@@ -105,28 +105,23 @@ transcript. Transcripts are cached (they almost never change), and optional
 Webshare / generic proxy settings are supported for networks where YouTube
 blocks the server's IP.
 
-### Geocoding & Places
-
-`geocode_location(query, limit=None)` — Turn a place name or address into
-latitude/longitude coordinates (plus category, type, and an address breakdown)
-via OpenStreetMap [Nominatim](https://nominatim.org/). Good for "where is X?",
-getting coordinates for a city/landmark/address, or disambiguating a place.
-Returns an empty `results` list when nothing matches (not an error).
+### Place Search
 
 `find_nearby_places(category, near=None, latitude=None, longitude=None, radius_m=None, limit=None)`
-— Find points of interest near a location via [Overpass](https://overpass-api.de/).
-Specify the location either as `near` (a place name, geocoded for you — so
-"vegan restaurants in Portland" is a single call) or as explicit
-`latitude`/`longitude` (which win if both are given). `category` is plain
-language, not OSM tags: `restaurant`, `coffee`, `pharmacy`, `atm`, `hotel`,
-`museum`, `gas station`, etc. A food category can be prefixed with a diet —
-`vegan`, `vegetarian`, `halal`, `kosher`, or `gluten free` (`"vegan restaurant"`,
-or just `"vegan"`). An unrecognized category falls back to matching place names,
-so brands like `"Starbucks"` work too. Results are sorted nearest-first and
-include distance plus useful tags (cuisine, address, phone, website, opening
-hours) when available.
+— Find points of interest near a location via OpenStreetMap
+[Overpass](https://overpass-api.de/). Specify the location either as `near` (a
+place name, geocoded for you via [Nominatim](https://nominatim.org/) — so "vegan
+restaurants in Portland" is a single call) or as explicit `latitude`/`longitude`
+(which win if both are given). `category` is plain language, not OSM tags:
+`restaurant`, `coffee`, `pharmacy`, `atm`, `hotel`, `museum`, `gas station`, etc.
+A food category can be prefixed with a diet — `vegan`, `vegetarian`, `halal`,
+`kosher`, or `gluten free` (`"vegan restaurant"`, or just `"vegan"`). An
+unrecognized category falls back to matching place names, so brands like
+`"Starbucks"` work too. Results are sorted nearest-first and include distance
+plus useful tags (cuisine, address, phone, website, opening hours) when
+available. An empty `results` list means nothing matched in range (not an error).
 
-Both tools use the public OpenStreetMap APIs by default and honor Nominatim's
+It uses the public OpenStreetMap APIs by default and honors Nominatim's
 [usage policy](https://operations.osmfoundation.org/policies/nominatim/): a
 descriptive `GEO_USER_AGENT` (set this!) and a ~1 req/sec throttle on the public
 API. To self-host, point `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` at your own
