@@ -6,7 +6,8 @@ Exposes two tools:
 - ``get_company_data(symbol, sections=[...])`` — a single entry point for
   per-company data. The caller chooses which sections to fetch:
   ``quote``, ``profile``, ``financials``, ``earnings``, ``news``, ``insiders``.
-- ``search_symbol(query)`` — look up a ticker by company name (Finnhub only).
+- ``search_symbol(query)`` — look up a ticker by company name (Finnhub when
+  keyed, keyless yfinance fallback otherwise).
 
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
@@ -402,6 +403,20 @@ def _finnhub_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
     }
 
 
+def _finnhub_search(query: str, limit: int) -> list[dict]:
+    """Look up tickers by company name via Finnhub's symbol search."""
+    token = _finnhub_require_key()
+    data = _http_get_json("https://finnhub.io/api/v1/search", {"q": query, "token": token})
+    results = []
+    for item in (data.get("result") or [])[:limit]:
+        results.append({
+            "symbol": item.get("symbol"),
+            "description": item.get("description"),
+            "type": item.get("type"),
+        })
+    return results
+
+
 # ===================================================================
 #                       PROVIDER: YFINANCE
 # ===================================================================
@@ -700,6 +715,29 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
         },
         "transactions": transactions,
     }
+
+
+def _yfinance_search(query: str, limit: int) -> list[dict]:
+    """Look up tickers by company name via Yahoo's keyless search endpoint.
+
+    Backs the no-key fallback for ``search_symbol``. Returns the same
+    ``{symbol, description, type}`` shape as ``_finnhub_search`` so the tool's
+    output is provider-independent.
+    """
+    import yfinance as yf
+
+    quotes = yf.Search(query, max_results=limit).quotes or []
+    results = []
+    for q in quotes:
+        symbol = q.get("symbol")
+        if not symbol:
+            continue
+        results.append({
+            "symbol": symbol,
+            "description": q.get("longname") or q.get("shortname"),
+            "type": q.get("quoteType"),
+        })
+    return results
 
 
 # ===================================================================
@@ -1111,7 +1149,10 @@ def register(mcp: FastMCP) -> None:
         """
         Search for a stock ticker symbol by company name or partial symbol.
         Useful when the user names a company but you don't know its ticker.
-        Requires a Finnhub API key (STOCK_FINNHUB_API_KEY).
+
+        Uses Finnhub when a key (STOCK_FINNHUB_API_KEY) is configured, and
+        otherwise falls back to a keyless Yahoo Finance lookup, so the tool
+        stays useful in a no-key deployment.
 
         :param query: The company name or partial ticker to search for (e.g. "apple").
         :return: A JSON string with matching tickers and company names.
@@ -1120,25 +1161,39 @@ def register(mcp: FastMCP) -> None:
         if not query:
             raise ToolError("Query is required.")
 
-        if not cfg.finnhub_api_key:
-            raise ToolError(
-                "Symbol search requires a Finnhub API key (STOCK_FINNHUB_API_KEY)."
-            )
+        # Mirror the section dispatch: Finnhub is primary when keyed, with a
+        # yfinance fallback if it errors or returns nothing; with no key we go
+        # straight to the keyless yfinance lookup.
+        limit = 10
+        errors: list[str] = []
+        results: list[dict] = []
+        provider: Optional[str] = None
 
-        try:
-            data = await anyio.to_thread.run_sync(
-                _http_get_json,
-                "https://finnhub.io/api/v1/search",
-                {"q": query, "token": cfg.finnhub_api_key},
-            )
-        except Exception as e:
-            raise ToolError(f"Symbol search failed for {query!r}: {type(e).__name__}: {e}")
+        if cfg.finnhub_api_key:
+            try:
+                results = await anyio.to_thread.run_sync(_finnhub_search, query, limit)
+                provider = "finnhub"
+            except Exception as e:
+                errors.append(f"finnhub: {type(e).__name__}: {e}")
 
-        results = []
-        for item in (data.get("result") or [])[:10]:
-            results.append({
-                "symbol": item.get("symbol"),
-                "description": item.get("description"),
-                "type": item.get("type"),
-            })
-        return json.dumps({"query": query, "count": len(results), "results": results})
+        if not results and (provider is None or cfg.prefer_yfinance_fallback):
+            try:
+                results = await anyio.to_thread.run_sync(_yfinance_search, query, limit)
+                provider = "yfinance"
+            except Exception as e:
+                errors.append(f"yfinance: {type(e).__name__}: {e}")
+
+        # Only a hard failure of every provider is an error; an empty result set
+        # from a provider that answered is a valid "no matches" outcome.
+        if provider is None:
+            raise ToolError(_retrieval_error("symbol search", query, errors))
+
+        payload = {
+            "query": query,
+            "provider": provider,
+            "count": len(results),
+            "results": results,
+        }
+        if errors:
+            payload["errors"] = errors
+        return json.dumps(payload)
