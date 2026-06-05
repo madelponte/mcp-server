@@ -482,10 +482,10 @@ async def _searxng_query(
 ) -> list[dict]:
     """Run a SearXNG JSON query and return [{url, title, snippet, ...}].
 
-    ``published_date`` and ``score`` are included when SearXNG supplies them
-    (date is engine-dependent; score is its merged relevance ranking). They come
-    free in the search response — no per-result page fetch — and give the model
-    enough to judge relevance and recency on their own.
+    ``published_date`` is included when the engine supplies one (it comes free
+    in the search response, no per-result page fetch). It is engine-dependent:
+    most general-web engines omit it, while news/dated sources populate it —
+    some via ``publishedDate``, some via ``pubdate`` — so we accept either.
     """
     params = {"q": query, "format": "json", "safesearch": str(safe_search)}
     if categories:
@@ -515,11 +515,12 @@ async def _searxng_query(
             "title": r.get("title"),
             "snippet": (r.get("content") or "").strip(),
         }
-        # Engine-dependent extras, surfaced only when present.
-        if r.get("publishedDate"):
-            item["published_date"] = r["publishedDate"]
-        if r.get("score") is not None:
-            item["score"] = r["score"]
+        # Engine-dependent; most general-web engines omit a date entirely. News
+        # engines tend to put the timestamp in `pubdate` and leave
+        # `publishedDate` null, so accept whichever one is populated.
+        published = r.get("publishedDate") or r.get("pubdate")
+        if published:
+            item["published_date"] = published
         out.append(item)
     return out
 
@@ -616,17 +617,25 @@ def register(mcp: FastMCP) -> None:
         num_results: int | None = None,
     ) -> str:
         """
-        Search the web and return a ranked list of results.
+        Search the web and return a ranked list of results to choose from.
 
         Use this when you don't already know the answer, the question concerns
         current events, or you need to verify a fact. Craft a focused query
         (a few keywords) — do NOT just echo the user's whole prompt. If the
         first search isn't useful, you may call this again with a refined query.
 
-        Each result includes: url, title, snippet, and — if it exists —
-        a published_date and a relevance score, so you can judge
-        which links are worth reading in full. To actually read the full contents 
-        of a link, pass its url to fetch_page.
+        Each result has: url, title, a short snippet, and a published_date when
+        the engine provides one. IMPORTANT: the snippet is a brief, truncated
+        preview written by the search engine — NOT the content of the page. It
+        is meant only to help you decide which links to open. It is often
+        incomplete, lacks the specifics you need, and can be out of date, so do
+        not treat it as the answer or quote/cite from it.
+
+        To actually read a result, call fetch_page on its url. As a rule, open
+        the most promising result(s) with fetch_page before you answer, verify a
+        claim, or cite a source — relying on the snippet alone is only
+        acceptable for a simple, unambiguous fact the snippets clearly agree on.
+        When in doubt, fetch the page.
 
         :param query: A concise search query (keywords, not a full sentence).
         :param time_range: Optional recency filter. One of "day", "week",
