@@ -1,90 +1,126 @@
 # openwebui-tools MCP server
 
-A single [MCP](https://modelcontextprotocol.io) server that bundles four tools
-originally written for Open WebUI, so they can be used from any MCP-capable
-client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP support, etc.).
-
-Bundled tools:
-
-| Tool group | MCP tools exposed |
-|------------|-------------------|
-| **Agentic Web Search** | `search_web`, `fetch_page` |
-| **Stock Data** | `get_company_data`, `search_symbol` |
-| **Wolfram Alpha** | `query_wolfram_alpha` |
-| **YouTube Transcript** | `get_youtube_transcript` |
+A single [MCP](https://modelcontextprotocol.io) server that bundles four tool
+groups originally written for Open WebUI, so they can be used from any
+MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
+support, etc.).
 
 Built on [FastMCP](https://github.com/modelcontextprotocol/python-sdk). The
-default transport is **streamable-http** so the server is reachable over the
+default transport is **streamable-http**, so the server is reachable over the
 network at `http://<host>:8000/mcp`.
 
-## Error handling
+## Tools
 
-All tools follow a single convention: **a genuine failure raises a
-`ToolError`**, which FastMCP returns to the client as a tool result with
-`isError: true` (the error message becomes the result's text content). Tools
-never hand back a failure disguised as normal output — no `❌ ...` strings, no
-in-band `{"error": ...}` payloads. This matters for smaller local models, which
-will otherwise happily summarize an error string as if it were data.
+| Tool group             | MCP tools exposed                     |
+| ---------------------- | ------------------------------------- |
+| **Agentic Web Search** | `search_web`, `fetch_page`            |
+| **Stock Data**         | `get_company_data`, `search_symbol`   |
+| **Wolfram Alpha**      | `query_wolfram_alpha`                 |
+| **YouTube Transcript** | `get_youtube_transcript`              |
 
-What this means for callers:
+Every tool is context-budget aware: list/range parameters are **maximums**, not
+fixed amounts. The model can request less per call, and anything above the
+server-configured cap is silently clamped so an oversized response can't
+overwhelm a model's context window. Omitting a value uses the cap.
 
-- **Success** returns the tool's normal payload — a JSON string for the web
-  search and stock tools, plain text for Wolfram Alpha and YouTube transcripts.
-- **Failure** is signalled at the protocol level (`isError: true`); inspect the
-  result's error flag, and show or retry based on the message rather than
-  feeding it back to the model as content.
-- A **valid-but-empty** result is *not* a failure — e.g. a web search with zero
-  hits returns normally with an empty `results` list.
+### Agentic Web Search
 
-When extending the server, raise
-`from mcp.server.fastmcp.exceptions import ToolError` for any real failure
-instead of returning an error sentinel.
+`search_web(query, time_range=None, category=None, num_results=None, enrich_results=None)`
+— Search the web via SearXNG and return a ranked list of results. Each result
+carries a url, title, snippet, optional published date, and (for the top
+results) page metadata: a description plus a heading/JSON-LD table-of-contents
+outline, so the model can decide which links are worth fetching in full.
+`time_range` accepts `day`/`week`/`month`/`year`/`all`; `category` accepts
+SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
+`videos`, `images`, `music`, `files`, `map`, comma-separated to combine).
+`enrich_results` controls how many top results get full page metadata (`0`
+skips enrichment).
 
-## Caching
+`fetch_page(url, mode="text", section=None)` — Fetch the contents of a page (or
+a URL returned by `search_web`). `mode="text"` returns readable plain text;
+`mode="structured"` returns metadata only (title, description, heading outline,
+JSON-LD). Document links (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB)
+are extracted via Apache Tika and always returned as text. Passing a `section`
+(a heading from a `page_headings` outline) returns just that section of an HTML
+page instead of the whole thing.
 
-Several tools keep a small in-memory, process-local TTL cache (a shared helper,
-[`tools/cache.py`](tools/cache.py)) so an agent loop that hits the same thing
-repeatedly within a task doesn't pay for it every time. Nothing is persisted to
-disk and only successful results are cached.
+Fetching is resilient: a direct `httpx` request first, an automatic
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
+Cloudflare-blocked pages, and a short page cache so an agent loop that
+re-fetches the same URL skips the network round-trip.
 
-| Tool | What's cached | Default TTL | Env prefix |
-|------|---------------|-------------|------------|
-| `fetch_page` (and `search_web` enrichment) | the fetched page, keyed by URL | 5 min (`300s`) | `WEB_SEARCH_CACHE_*` |
-| `get_youtube_transcript` | the finished transcript, keyed by video id + languages | 24 h (`86400s`) | `YOUTUBE_CACHE_*` |
-| Stock Data tools | each upstream API response | 60 s | `STOCK_CACHE_TTL_SECONDS` |
+### Stock Data
 
-For each, `*_CACHE_TTL_SECONDS=0` disables caching, and `*_CACHE_MAX_ENTRIES`
-bounds memory by evicting the oldest entry once full (`0` = unbounded). The page
-cache deliberately stores the raw fetch, not the formatted output, so a repeat
-fetch of the same URL skips the network even when a different `mode`/`section`
-is requested. Transcripts get a long TTL because they essentially never change.
+`get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None)`
+— One ticker, only the sections you ask for. Available `sections`:
+
+- `quote` — latest price, day's change, open/high/low/previous close, volume.
+- `profile` — name, sector, industry, market cap, employees, exchange, and key
+  fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
+- `financials` — income statement, balance sheet, or cash flow, controlled by
+  `statement` (`income`/`balance`/`cashflow`) and `period`
+  (`annual`/`quarterly`); `periods` sets how many to return.
+- `earnings` — historical earnings: actual vs. estimated EPS, surprise %,
+  revenue. `periods` sets how many to return.
+- `news` — recent articles (headline, source, summary, url, published date).
+  `news_items` sets how many to return.
+- `insiders` — insider buying/selling with a buy/sell summary and individual
+  transactions. `insider_weeks` sets how far back to look.
+
+Defaults to `["quote", "profile"]` when `sections` is omitted. Data is sourced
+across providers (Finnhub / yfinance / FMP) with optional yfinance fallback. On
+partial success the response includes an `errors` map listing sections that
+returned nothing; if every requested section fails, the call raises an error so
+a failure is never mistaken for data.
+
+`search_symbol(query)` — Look up a ticker by company name or partial symbol
+(e.g. `"apple"` → `AAPL`). Requires a Finnhub API key.
+
+> **Note:** earlier versions exposed `get_stock_quote`, `get_company_profile`,
+> `get_financials`, `get_earnings`, and `get_company_news` as separate tools.
+> These are now folded into the single `get_company_data` tool via the
+> `sections` parameter, which keeps the tool count low (better for smaller
+> models' tool selection) and lets one call fetch several sections at once.
+
+### Wolfram Alpha
+
+`query_wolfram_alpha(query, assumption=None)` — Exact computation and
+authoritative reference data: math, unit/currency conversion, physics &
+chemistry, astronomy, geography & demographics, dates & times, finance,
+nutrition, weather history, linguistics, and structured entity comparisons.
+Queries should be English keyword-style (`"France population"`, not a full
+sentence). If a result returns assumptions, re-send the same input with the
+relevant `assumption` value to disambiguate.
+
+### YouTube Transcript
+
+`get_youtube_transcript(url, languages=None)` — Fetch a video's transcript /
+closed captions as plain text for summarizing, quoting, searching, or
+translating. Accepts any YouTube URL form (`watch`, `youtu.be`, `/shorts/`,
+`/embed/`, `/live/`) or a bare 11-character video ID. `languages` is an optional
+comma-separated priority list (e.g. `"en,es"`); it falls back to any available
+transcript. Transcripts are cached (they almost never change), and optional
+Webshare / generic proxy settings are supported for networks where YouTube
+blocks the server's IP.
 
 ## Configuration
 
 Every Open WebUI "valve" became an environment variable. Copy the example file
 and edit it:
 
-```bash
+```
 cp .env.example .env
 ```
 
-See [.env.example](.env.example) for the full list with defaults. Key things to
-set:
+See [.env.example](https://github.com/madelponte/mcp-server/blob/main/.env.example)
+for the full list with defaults. Key things to set:
 
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
-- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (the `search_symbol`
-  tool requires it; everything else falls back to keyless yfinance).
+- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (`search_symbol` requires it; everything else falls back to keyless yfinance).
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
 `WOLFRAM_`, `YOUTUBE_`.
-
-The `WEB_SEARCH_SEARXNG_TIME_RANGE` and `WEB_SEARCH_SEARXNG_CATEGORIES` valves
-set the *defaults* for `search_web`, but the tool also takes optional
-`time_range` (`day`/`week`/`month`/`year`/`all`) and `category` (e.g. `news`,
-`science`, `it`) parameters per call, so a model can ask for, say, "news from
-today" without reconfiguring the server. Omitting them falls back to these env
-values.
 
 ### Authentication
 
@@ -96,7 +132,7 @@ ignored for the `stdio` transport, which has no network surface.
 
 Generate a strong token, e.g.:
 
-```bash
+```
 openssl rand -hex 32
 ```
 
@@ -116,33 +152,34 @@ MCP_AUTH_TOKEN=<your-generated-token>
 The compose file builds the server and also starts the supporting services the
 web search tool expects — [SearXNG](https://docs.searxng.org/) (search),
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (Cloudflare
-fallback), and [Apache Tika](https://tika.apache.org/) (PDF extraction):
+fallback), and [Apache Tika](https://tika.apache.org/) (document text
+extraction):
 
-```bash
+```
 cp .env.example .env        # then edit it
 docker compose up --build
 ```
 
 The MCP endpoint is then available at `http://localhost:8000/mcp`.
 
-If you don't need web search, delete the `searxng`/`flaresolverr`/`tika`
-services (and the `depends_on` block) from `docker-compose.yml`. The other
-three tools have no local-service dependencies.
+If you don't need web search, delete the `searxng` / `flaresolverr` / `tika`
+services (and the `depends_on` block) from `docker-compose.yml`. The other three
+tools have no local-service dependencies.
 
 > **SearXNG note:** JSON output must be enabled for `search_web` to work — the
-> bundled [searxng/settings.yml](searxng/settings.yml) does this. Set a real
-> `SEARXNG_SECRET` in your `.env`.
+> bundled [searxng/settings.yml](https://github.com/madelponte/mcp-server/blob/main/searxng/settings.yml)
+> does this. Set a real `SEARXNG_SECRET` in your `.env`.
 
 ## Run with Docker (server only)
 
-```bash
+```
 docker build -t openwebui-tools-mcp .
 docker run --rm -p 8000:8000 --env-file .env openwebui-tools-mcp
 ```
 
 ## Run locally (no Docker)
 
-```bash
+```
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env        # then edit it
@@ -161,3 +198,7 @@ configure the client to send an `Authorization: Bearer <token>` header (most MCP
 clients expose a "headers" or "auth token" field for HTTP servers). For stdio
 mode, configure the client to launch `python server.py` with the environment
 variables set.
+
+## License
+
+MIT
