@@ -223,9 +223,119 @@ class YouTubeSettings(BaseSettings):
     )
 
 
+class GeocodingSettings(BaseSettings):
+    """Valves for the Geocoding & Place Search tool (OpenStreetMap)."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="GEO_", env_file=".env", extra="ignore"
+    )
+
+    # Geocoding backend. Defaults to OpenStreetMap's public Nominatim instance;
+    # point this at your own deployment to self-host (and then set
+    # min_request_interval_seconds to 0 to drop the public-API throttle).
+    nominatim_url: str = Field(
+        "https://nominatim.openstreetmap.org",
+        description="Base URL of a Nominatim instance (no trailing /search).",
+    )
+    # Point-of-interest backend. Defaults to the public Overpass API; can be
+    # pointed at a self-hosted Overpass instance.
+    overpass_url: str = Field(
+        "https://overpass-api.de/api/interpreter",
+        description="Full URL of an Overpass API interpreter endpoint.",
+    )
+
+    # Nominatim's usage policy REQUIRES a descriptive User-Agent that identifies
+    # the application (ideally with contact info). The shared browser-style UA
+    # used elsewhere is NOT acceptable here — set this to identify your deployment.
+    user_agent: str = Field(
+        "openwebui-tools-mcp/1.0 (OpenStreetMap geocoding; "
+        "+https://github.com/madelponte/mcp-server)",
+        description=(
+            "User-Agent sent to Nominatim/Overpass. Required by Nominatim's usage "
+            "policy and must identify your application — customize it with contact info."
+        ),
+    )
+    nominatim_email: str = Field(
+        "",
+        description=(
+            "Optional contact email passed to Nominatim (email= param). Recommended "
+            "by the usage policy so they can reach you before blocking on heavy use."
+        ),
+    )
+    language: str = Field(
+        "en",
+        description="Preferred result language (sent as the Accept-Language header).",
+    )
+
+    http_timeout_seconds: float = Field(
+        20.0, description="HTTP timeout for a Nominatim request, in seconds."
+    )
+    overpass_timeout_seconds: float = Field(
+        30.0,
+        description=(
+            "Timeout for an Overpass request, in seconds. Also passed into the "
+            "Overpass query's [timeout:N] so the server stops its own work in time."
+        ),
+    )
+    # Nominatim's public API allows at most 1 request/second. We serialize calls
+    # and space them by this interval. Set to 0 when self-hosting to disable it.
+    min_request_interval_seconds: float = Field(
+        1.0,
+        description=(
+            "Minimum seconds between Nominatim requests (the public API caps at "
+            "1/sec). Set to 0 to disable throttling when self-hosting."
+        ),
+    )
+
+    # The following are MAXIMUMS, not fixed amounts. The tools let the model
+    # request fewer per call; anything larger is clamped so an oversized response
+    # can't overwhelm the model's context window. Omitting the value uses the cap.
+    max_results: int = Field(
+        10, description="Maximum geocoding matches returned per query."
+    )
+    default_results: int = Field(
+        5, description="Geocoding matches returned when the model doesn't specify."
+    )
+    max_nearby_results: int = Field(
+        20, description="Maximum nearby places returned per query."
+    )
+    default_nearby_results: int = Field(
+        8, description="Nearby places returned when the model doesn't specify."
+    )
+
+    default_radius_m: int = Field(
+        1500, description="Search radius (meters) used when the model doesn't specify."
+    )
+    max_radius_m: int = Field(
+        20000, description="Maximum search radius (meters) for a nearby query."
+    )
+    overpass_max_elements: int = Field(
+        120,
+        description=(
+            "Safety cap on elements fetched from Overpass before they are sorted by "
+            "distance and trimmed to the requested count. Bounds the response size "
+            "in dense areas (the nearest few may be missed if a tiny radius holds "
+            "more than this)."
+        ),
+    )
+
+    cache_ttl_seconds: int = Field(
+        86400,
+        description=(
+            "Cache geocoding/Overpass results this many seconds (0 disables). "
+            "Place data changes slowly, so a long TTL is safe and helps honor the "
+            "public APIs' rate limits."
+        ),
+    )
+    cache_max_entries: int = Field(
+        256, description="Max cached results before the oldest is evicted (0 = unbounded)."
+    )
+
+
 # Singletons imported by the tool modules and the server entrypoint.
 server_settings = ServerSettings()
 web_search_settings = WebSearchSettings()
 stock_settings = StockSettings()
 wolfram_settings = WolframSettings()
 youtube_settings = YouTubeSettings()
+geocoding_settings = GeocodingSettings()
