@@ -13,6 +13,7 @@ from urllib.parse import urlparse, parse_qs
 
 import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 # Compatible with youtube-transcript-api >= 1.0.0
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -26,6 +27,16 @@ from youtube_transcript_api._errors import (
 )
 
 from config import youtube_settings as cfg
+from .cache import TTLCache
+
+# Error convention: every genuine failure raises ToolError, which FastMCP turns
+# into a result with `isError: true`, so a model can't mistake the failure for
+# transcript text. See the README "Error handling" section.
+
+# Transcripts essentially never change, so we cache the finished result (keyed by
+# video id + requested languages) for a long TTL. See the README "Caching"
+# section.
+_transcript_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -127,7 +138,7 @@ def register(mcp: FastMCP) -> None:
         :param languages: Optional comma-separated language codes to prefer
                           (e.g. "en,es"). Overrides the default for this call.
         :return: The transcript as a single string (optionally with timestamps),
-                 prefixed by a short metadata header, or an error message.
+                 prefixed by a short metadata header.
         """
         try:
             video_id = _extract_video_id(url)
@@ -136,6 +147,11 @@ def register(mcp: FastMCP) -> None:
             lang_list: List[str] = [
                 code.strip() for code in lang_str.split(",") if code.strip()
             ] or ["en"]
+
+            cache_key = f"{video_id}\x00{','.join(lang_list)}"
+            cached = _transcript_cache.get(cache_key)
+            if cached is not None:
+                return cached
 
             client = _build_client()
 
@@ -158,7 +174,7 @@ def register(mcp: FastMCP) -> None:
 
             snippets = list(fetched)
             if not snippets:
-                return f"❌ The transcript for video {video_id} is empty."
+                raise ToolError(f"The transcript for video {video_id} is empty.")
 
             language = getattr(fetched, "language", None) or "unknown"
             language_code = getattr(fetched, "language_code", None) or "?"
@@ -200,25 +216,29 @@ def register(mcp: FastMCP) -> None:
                 "---"
             )
 
-            return f"{header}\n{body}{truncated_note}"
+            result = f"{header}\n{body}{truncated_note}"
+            _transcript_cache.set(cache_key, result)
+            return result
 
+        except ToolError:
+            raise
         except ValueError as ve:
-            return f"❌ {ve}"
+            raise ToolError(str(ve))
         except TranscriptsDisabled:
-            return "❌ This video has subtitles/transcripts disabled by the uploader."
+            raise ToolError("This video has subtitles/transcripts disabled by the uploader.")
         except NoTranscriptFound:
-            return (
-                "❌ No transcript was found for this video in any language. "
+            raise ToolError(
+                "No transcript was found for this video in any language. "
                 "It may not have captions at all."
             )
         except VideoUnavailable:
-            return "❌ This video is unavailable (private, removed, or region-blocked)."
+            raise ToolError("This video is unavailable (private, removed, or region-blocked).")
         except (RequestBlocked, IpBlocked):
-            return (
-                "❌ YouTube is blocking requests from this server's IP address. "
+            raise ToolError(
+                "YouTube is blocking requests from this server's IP address. "
                 "This is common on cloud providers (AWS, GCP, Azure, etc.). "
                 "Configure a residential proxy via the YOUTUBE_WEBSHARE_PROXY_* or "
                 "YOUTUBE_HTTP_PROXY_URL environment variables to work around it."
             )
         except Exception as exc:
-            return f"❌ Error fetching transcript: {type(exc).__name__}: {exc}"
+            raise ToolError(f"Error fetching transcript: {type(exc).__name__}: {exc}")

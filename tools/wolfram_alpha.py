@@ -8,8 +8,13 @@ Translated from the Open WebUI tool — the HTML "card" rendering was dropped
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from config import wolfram_settings as cfg
+
+# Error convention: every genuine failure raises ToolError, which FastMCP turns
+# into a result with `isError: true`. This keeps failures from being mistaken
+# for normal output by a model. See the README "Error handling" section.
 
 BASE_URL = "https://www.wolframalpha.com/api/v1/llm-api"
 
@@ -48,13 +53,13 @@ def register(mcp: FastMCP) -> None:
         """
         app_id = (cfg.app_id or "").strip()
         if not app_id:
-            return (
-                "❌ Wolfram Alpha AppID is not configured. Set the WOLFRAM_APP_ID "
+            raise ToolError(
+                "Wolfram Alpha AppID is not configured. Set the WOLFRAM_APP_ID "
                 "environment variable. Get a free AppID at https://developer.wolframalpha.com"
             )
 
         if not query or not query.strip():
-            return "❌ Empty query. Provide a Wolfram Alpha query string."
+            raise ToolError("Empty query. Provide a Wolfram Alpha query string.")
 
         clean_query = query.strip().replace("\n", " ")
 
@@ -68,23 +73,27 @@ def register(mcp: FastMCP) -> None:
             params["assumption"] = assumption
 
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
                 response = await client.get(
                     BASE_URL,
                     params=params,
                     headers={"User-Agent": "MCP-WolframAlpha/1.0"},
                 )
         except httpx.TimeoutException:
-            return "❌ Wolfram Alpha request timed out after 30s."
+            raise ToolError(
+                f"Wolfram Alpha request timed out after {cfg.http_timeout_seconds}s."
+            )
         except httpx.HTTPError as exc:
-            return f"❌ Network error contacting Wolfram Alpha: {exc}"
+            raise ToolError(f"Network error contacting Wolfram Alpha: {exc}")
 
         status = response.status_code
         body = response.text or ""
 
-        # 501: Wolfram couldn't interpret the input. Body often has suggestions.
+        # 501: Wolfram couldn't interpret the input. No answer was produced, so
+        # this is an error — but the body often carries useful suggestions, so
+        # surface them in the error message for the model to retry with.
         if status == 501:
-            return (
+            raise ToolError(
                 f"Wolfram Alpha could not interpret the query: '{clean_query}'.\n"
                 f"Suggestions from the API:\n{body.strip()}\n\n"
                 "Try rephrasing as a simpler keyword-style query, or pick one of "
@@ -92,19 +101,19 @@ def register(mcp: FastMCP) -> None:
             )
 
         if status == 403:
-            return (
-                "❌ Wolfram Alpha rejected the AppID (HTTP 403). "
+            raise ToolError(
+                "Wolfram Alpha rejected the AppID (HTTP 403). "
                 "Check that WOLFRAM_APP_ID is set correctly."
             )
 
         body_snippet = body[:200]
         if status == 400:
-            return f"❌ Wolfram Alpha rejected the request (HTTP 400): {body_snippet}"
+            raise ToolError(f"Wolfram Alpha rejected the request (HTTP 400): {body_snippet}")
 
         if status >= 400:
-            return f"❌ Wolfram Alpha error (HTTP {status}): {body_snippet}"
+            raise ToolError(f"Wolfram Alpha error (HTTP {status}): {body_snippet}")
 
         if not body.strip():
-            return "❌ Wolfram Alpha returned an empty response."
+            raise ToolError("Wolfram Alpha returned an empty response.")
 
         return body

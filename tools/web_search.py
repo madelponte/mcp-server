@@ -17,8 +17,27 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
+from .cache import TTLCache
+
+# Error convention: every genuine failure raises ToolError, which FastMCP turns
+# into a result with `isError: true`, so a model can't mistake the failure for
+# search/page data. A valid-but-empty result (e.g. a search with zero hits) is
+# NOT a failure and is still returned as normal JSON. See the README
+# "Error handling" section.
+
+# SearXNG time_range values the API accepts; "" means no time restriction.
+# We also accept a few friendly synonyms for "no restriction" from the model.
+SEARXNG_TIME_RANGES = {"", "day", "week", "month", "year"}
+_TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
+
+# Process-wide cache of fetched pages, keyed by URL. Shared by fetch_page and
+# search_web's result enrichment so a repeated fetch within a task skips the
+# network round-trip. Fetch settings all come from static config, so the URL
+# alone is a sufficient key. See the README "Caching" section.
+_page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
 # ---------------------------------------------------------------------------
 # Cloudflare detection
@@ -78,6 +97,35 @@ def _trim(text: str, limit: int) -> str:
     if limit <= 0 or len(text) <= limit:
         return text
     return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]"
+
+
+def _clamp_count(
+    requested: Optional[int],
+    maximum: int,
+    *,
+    minimum: int,
+    default: Optional[int] = None,
+) -> int:
+    """Resolve a model-requested count against its configured maximum.
+
+    ``None`` (the model didn't ask) yields ``default`` when one is configured,
+    otherwise ``maximum`` (the old fixed-amount behavior). Either way the result
+    is clamped to ``[minimum, maximum]`` so the model can dial the amount down
+    but never request more than the cap — the guard that keeps an oversized
+    response from overwhelming its context window. ``minimum`` is 1 for the
+    result count and 0 for enrichment (0 meaningfully disables it).
+    """
+    if requested is None:
+        if default is None:
+            return maximum
+        requested = default
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        return maximum
+    if requested < minimum:
+        return minimum
+    return min(requested, maximum)
 
 
 # ---------------------------------------------------------------------------
@@ -558,14 +606,18 @@ async def _searxng_query(
     items = data.get("results") or []
     out: list[dict] = []
     for r in items[:num_results]:
-        out.append(
-            {
-                "url": r.get("url"),
-                "title": r.get("title"),
-                "snippet": (r.get("content") or "").strip(),
-                "engine": r.get("engine"),
-            }
-        )
+        item = {
+            "url": r.get("url"),
+            "title": r.get("title"),
+            "snippet": (r.get("content") or "").strip(),
+        }
+        # News/dated sources populate a publish date; general-web engines omit
+        # it. SearXNG exposes it inconsistently as either "publishedDate" or
+        # "pubdate" depending on the engine, so surface whichever is present.
+        published = r.get("publishedDate") or r.get("pubdate")
+        if published:
+            item["published_date"] = published
+        out.append(item)
     return out
 
 
@@ -628,19 +680,36 @@ def _compact_reddit_json(data: Any) -> Any:
 # Tool registration
 # ---------------------------------------------------------------------------
 
+async def _cached_resilient_fetch(url: str) -> dict:
+    """``_resilient_fetch`` with a process-wide TTL cache keyed by URL.
+
+    Caching the raw fetch (rather than the formatted tool output) means a
+    re-fetch of the same URL — common in agent loops, and shared between
+    fetch_page and search_web enrichment — skips the network round-trip, while
+    each caller still formats the cached result for its own mode/section needs.
+    Only successful fetches are cached; a failure propagates and is not stored.
+    """
+    cached = _page_cache.get(url)
+    if cached is not None:
+        return cached
+    fetched = await _resilient_fetch(
+        url,
+        timeout=cfg.http_timeout_seconds,
+        user_agent=cfg.user_agent,
+        verify_ssl=cfg.verify_ssl,
+        flaresolverr_url=cfg.flaresolverr_url or None,
+        flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
+    )
+    _page_cache.set(url, fetched)
+    return fetched
+
+
 async def _enrich_result(url: Optional[str]) -> Optional[dict]:
     """Fetch a URL just enough to extract structured metadata."""
     if not url:
         return None
     try:
-        fetched = await _resilient_fetch(
-            url,
-            timeout=cfg.http_timeout_seconds,
-            user_agent=cfg.user_agent,
-            verify_ssl=cfg.verify_ssl,
-            flaresolverr_url=cfg.flaresolverr_url or None,
-            flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
-        )
+        fetched = await _cached_resilient_fetch(url)
     except Exception as e:
         return {"error": str(e)}
 
@@ -655,7 +724,13 @@ async def _enrich_result(url: Optional[str]) -> Optional[dict]:
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
-    async def search_web(query: str) -> str:
+    async def search_web(
+        query: str,
+        time_range: str | None = None,
+        category: str | None = None,
+        num_results: int | None = None,
+        enrich_results: int | None = None,
+    ) -> str:
         """
         Search the web and return a ranked list of results.
 
@@ -664,42 +739,90 @@ def register(mcp: FastMCP) -> None:
         (a few keywords) — do NOT just echo the user's whole prompt. If the
         first search isn't useful, you may call this again with a refined query.
 
-        Each result includes: url, title, snippet, and (for the top results)
-        page metadata such as a description and a heading-based outline /
-        JSON-LD table of contents, so you can decide which links are worth
-        fetching in full.
+        Each result includes: url, title, snippet, an optional published_date
+        (when the source provides one), and (for the top results) page metadata
+        such as a description and a heading-based outline / JSON-LD table of
+        contents, so you can decide which links are worth fetching in full.
 
         :param query: A concise search query (keywords, not a full sentence).
+        :param time_range: Optional recency filter. One of "day", "week",
+            "month", or "year" to restrict results to that window (use "day"
+            for "today"/"latest" news). Pass "all" (or omit) for no time
+            restriction. Defaults to the server's configured value.
+        :param category: Optional SearXNG category to search in, e.g. "general"
+            (default), "news", "science", "it", "social media", "videos",
+            "images", "music", "files", or "map". Use "news" for current-events
+            reporting. Comma-separate to combine categories. Defaults to the
+            server's configured value.
+        :param num_results: How many search results to return. Request fewer for
+            a focused lookup, or omit to use the server default. Value is capped by
+            the server.
+        :param enrich_results: How many of the top results to fetch page
+            metadata (description + heading/JSON-LD table-of-contents outline)
+            for. Each outline costs context, so request only as many as you
+            need: pass a small number for a quick scan, 0 to skip enrichment
+            and get just url/title/snippet, or omit to use the server default.
+            Value is capped by the server.
         :return: JSON string of results.
         """
         query = (query or "").strip()
         if not query:
-            return json.dumps({"error": "Empty query"})
+            raise ToolError("Empty query.")
+
+        # Resolve optional overrides, falling back to the configured env valves.
+        if time_range is None:
+            resolved_time_range = cfg.searxng_time_range
+        else:
+            tr = time_range.strip().lower()
+            if tr in _TIME_RANGE_NO_RESTRICTION:
+                resolved_time_range = ""
+            elif tr in SEARXNG_TIME_RANGES:
+                resolved_time_range = tr
+            else:
+                raise ToolError(
+                    f"Invalid time_range {time_range!r}. Use one of: day, week, "
+                    "month, year, or all (no restriction)."
+                )
+
+        if category is None:
+            resolved_categories = cfg.searxng_categories
+        else:
+            resolved_categories = category.strip() or cfg.searxng_categories
 
         try:
             results = await _searxng_query(
                 base_url=cfg.searxng_url,
                 query=query,
-                num_results=max(1, cfg.num_results),
-                categories=cfg.searxng_categories,
+                num_results=_clamp_count(num_results, cfg.max_num_results, minimum=1),
+                categories=resolved_categories,
                 language=cfg.searxng_language,
-                time_range=cfg.searxng_time_range,
+                time_range=resolved_time_range,
                 safe_search=cfg.searxng_safesearch,
                 timeout=cfg.http_timeout_seconds,
                 verify_ssl=cfg.verify_ssl,
                 user_agent=cfg.user_agent,
             )
         except Exception as e:
-            return json.dumps({"error": f"SearXNG query failed: {e}", "query": query})
+            raise ToolError(f"SearXNG query failed for {query!r}: {e}")
+
+        applied = {"time_range": resolved_time_range or "all", "category": resolved_categories}
 
         if not results:
-            return json.dumps({"query": query, "results": []})
+            return json.dumps({"query": query, **applied, "results": []})
 
         for r in results:
             if r.get("snippet"):
                 r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
 
-        enrich_n = min(max(0, cfg.enrich_top_n), len(results))
+        enrich_n = min(
+            _clamp_count(
+                enrich_results,
+                cfg.max_enrich_results,
+                minimum=0,
+                default=cfg.default_enrich_results,
+            ),
+            len(results),
+        )
         if enrich_n > 0:
             tasks = [_enrich_result(r.get("url")) for r in results[:enrich_n]]
             enriched = await asyncio.gather(*tasks, return_exceptions=True)
@@ -717,7 +840,11 @@ def register(mcp: FastMCP) -> None:
                 if data.get("toc"):
                     results[i]["page_toc"] = data["toc"][:20]
 
-        return json.dumps({"query": query, "results": results}, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"query": query, **applied, "results": results},
+            ensure_ascii=False,
+            indent=2,
+        )
 
     @mcp.tool()
     async def fetch_page(url: str, mode: str = "text", section: str | None = None) -> str:
@@ -747,14 +874,14 @@ def register(mcp: FastMCP) -> None:
         :return: JSON string with the result.
         """
         if not url or not isinstance(url, str):
-            return json.dumps({"error": "Missing url"})
+            raise ToolError("Missing url.")
         url = url.strip()
         if not re.match(r"^https?://", url, re.I):
-            return json.dumps({"error": f"Invalid URL: {url}"})
+            raise ToolError(f"Invalid URL: {url}")
 
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
-            return json.dumps({"error": f"Invalid mode '{mode}'. Use 'text' or 'structured'."})
+            raise ToolError(f"Invalid mode '{mode}'. Use 'text' or 'structured'.")
 
         section = (section or "").strip() or None
 
@@ -762,16 +889,9 @@ def register(mcp: FastMCP) -> None:
         reddit_rewritten = fetch_url != url
 
         try:
-            fetched = await _resilient_fetch(
-                fetch_url,
-                timeout=cfg.http_timeout_seconds,
-                user_agent=cfg.user_agent,
-                verify_ssl=cfg.verify_ssl,
-                flaresolverr_url=cfg.flaresolverr_url or None,
-                flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
-            )
+            fetched = await _cached_resilient_fetch(fetch_url)
         except Exception as e:
-            return json.dumps({"error": f"Fetch failed: {e}", "url": fetch_url})
+            raise ToolError(f"Fetch failed for {fetch_url}: {e}")
 
         status = fetched["status"]
         ctype = (fetched.get("content_type") or "").lower()
@@ -785,9 +905,7 @@ def register(mcp: FastMCP) -> None:
             if not body and fetched.get("text"):
                 body = fetched["text"].encode("utf-8", errors="replace")
             if not body:
-                return json.dumps(
-                    {"error": "Document returned no content", "url": fetch_url, "status": status}
-                )
+                raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
             extracted = await asyncio.to_thread(
                 _tika_extract,
                 body,
@@ -838,7 +956,7 @@ def register(mcp: FastMCP) -> None:
             try:
                 structured = _structured_from_html(text, fetch_url)
             except Exception as e:
-                return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
             if structured.get("headings"):
                 structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
             return json.dumps(
@@ -858,7 +976,7 @@ def register(mcp: FastMCP) -> None:
         try:
             full_soup = BeautifulSoup(text, "lxml")
         except Exception as e:
-            return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+            raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
         soup_title = _page_title(full_soup)
 
@@ -870,22 +988,12 @@ def register(mcp: FastMCP) -> None:
                     for h in full_soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
                 ]
                 available = [a for a in (a.strip() for a in available) if a][: cfg.max_enrich_headings]
-                return json.dumps(
-                    {
-                        "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype,
-                        "via": via,
-                        "format": "section",
-                        "error": f"Section '{section}' not found on page.",
-                        "available_headings": available,
-                        "hint": (
-                            "Retry with a heading from `available_headings`, or omit "
-                            "`section` to fetch the whole page."
-                        ),
-                    },
-                    ensure_ascii=False,
+                available_str = "; ".join(available) if available else "(none found)"
+                raise ToolError(
+                    f"Section '{section}' not found on {fetch_url}. "
+                    f"Available headings: {available_str}. "
+                    "Retry with one of those headings, or omit `section` to fetch "
+                    "the whole page."
                 )
 
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
@@ -910,7 +1018,7 @@ def register(mcp: FastMCP) -> None:
         try:
             plain = _plain_text_from_html(text)
         except Exception as e:
-            return json.dumps({"error": f"Failed to parse HTML: {e}", "url": fetch_url})
+            raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"

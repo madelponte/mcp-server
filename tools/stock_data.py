@@ -1,22 +1,33 @@
 """
 Stock Data MCP tool.
 
-Quotes, fundamentals, financials, earnings, and news.
+Exposes two tools:
+
+- ``get_company_data(symbol, sections=[...])`` — a single entry point for
+  per-company data. The caller chooses which sections to fetch:
+  ``quote``, ``profile``, ``financials``, ``earnings``, ``news``, ``insiders``.
+- ``search_symbol(query)`` — look up a ticker by company name (Finnhub only).
+
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
 WebUI tool; per-user valves and status emitters were removed.
 """
 
 import json
-import time
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 import anyio
 import requests
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from config import stock_settings as cfg
+from .cache import TTLCache
+
+# Error convention: every genuine failure raises ToolError, which FastMCP turns
+# into a result with `isError: true`, so a model can't mistake the failure for
+# market data. See the README "Error handling" section.
 
 # -------------------------- Helpers --------------------------
 
@@ -67,33 +78,44 @@ def _format_large_number(n: Optional[float]) -> Optional[str]:
     return f"{n:.2f}"
 
 
+def _retrieval_error(what: str, symbol: str, errors: list[str]) -> str:
+    """Build a ToolError message for a failed data retrieval, keeping the
+    per-provider error detail (otherwise lost when we raise instead of return)."""
+    msg = f"Could not retrieve {what} for {symbol}."
+    if errors:
+        msg += " Provider errors: " + "; ".join(errors)
+    return msg
+
+
+def _clamp_amount(requested: Optional[int], maximum: int) -> int:
+    """Resolve a model-requested range/count against its configured maximum.
+
+    ``None`` (the model didn't ask) yields ``maximum``, preserving the old
+    fixed-amount behavior. Otherwise the value is clamped to ``[1, maximum]`` so
+    the model can dial the amount down but never request more than the cap — the
+    guard that keeps an oversized response from overwhelming its context window.
+    """
+    if requested is None:
+        return maximum
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        return maximum
+    if requested < 1:
+        return 1
+    return min(requested, maximum)
+
+
 # -------------------------- Cache + HTTP --------------------------
 
-_cache: dict[str, tuple[float, Any]] = {}
-
-
-def _cache_get(key: str) -> Optional[Any]:
-    if cfg.cache_ttl_seconds <= 0:
-        return None
-    entry = _cache.get(key)
-    if not entry:
-        return None
-    ts, value = entry
-    if time.time() - ts > cfg.cache_ttl_seconds:
-        _cache.pop(key, None)
-        return None
-    return value
-
-
-def _cache_set(key: str, value: Any) -> None:
-    if cfg.cache_ttl_seconds <= 0:
-        return
-    _cache[key] = (time.time(), value)
+# Unbounded (max_entries=0) to preserve the original behavior; quote/profile
+# responses are small and the TTL is short.
+_cache = TTLCache(cfg.cache_ttl_seconds)
 
 
 def _http_get_json(url: str, params: Optional[dict] = None) -> Any:
     cache_key = f"GET::{url}::{json.dumps(params or {}, sort_keys=True)}"
-    cached = _cache_get(cache_key)
+    cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     resp = requests.get(
@@ -104,7 +126,7 @@ def _http_get_json(url: str, params: Optional[dict] = None) -> Any:
     )
     resp.raise_for_status()
     data = resp.json()
-    _cache_set(cache_key, data)
+    _cache.set(cache_key, data)
     return data
 
 
@@ -213,7 +235,7 @@ def _finnhub_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _finnhub_financials(symbol: str, statement: str, period: str) -> Optional[dict]:
+def _finnhub_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
     token = _finnhub_require_key()
     freq = "annual" if period == "annual" else "quarterly"
     data = _http_get_json(
@@ -226,7 +248,7 @@ def _finnhub_financials(symbol: str, statement: str, period: str) -> Optional[di
     statement_key = {"income": "ic", "balance": "bs", "cashflow": "cf"}[statement]
 
     periods = []
-    for entry in data["data"][: cfg.max_financial_periods]:
+    for entry in data["data"][:limit]:
         report = (entry.get("report") or {}).get(statement_key) or []
         simplified = {item.get("label") or item.get("concept"): item.get("value") for item in report if item}
         periods.append({
@@ -246,7 +268,7 @@ def _finnhub_financials(symbol: str, statement: str, period: str) -> Optional[di
     }
 
 
-def _finnhub_earnings(symbol: str) -> Optional[dict]:
+def _finnhub_earnings(symbol: str, limit: int) -> Optional[dict]:
     token = _finnhub_require_key()
     data = _http_get_json(
         "https://finnhub.io/api/v1/stock/earnings", {"symbol": symbol, "token": token}
@@ -255,7 +277,7 @@ def _finnhub_earnings(symbol: str) -> Optional[dict]:
         return None
 
     rows = []
-    for row in data[:8]:
+    for row in data[:limit]:
         rows.append({
             "period": row.get("period"),
             "year": row.get("year"),
@@ -269,7 +291,7 @@ def _finnhub_earnings(symbol: str) -> Optional[dict]:
     return {"provider": "finnhub", "symbol": symbol, "earnings": rows}
 
 
-def _finnhub_news(symbol: str) -> Optional[dict]:
+def _finnhub_news(symbol: str, limit: int) -> Optional[dict]:
     token = _finnhub_require_key()
     from datetime import date, timedelta
     today = date.today()
@@ -283,7 +305,7 @@ def _finnhub_news(symbol: str) -> Optional[dict]:
         return None
 
     articles = []
-    for item in data[: cfg.max_news_items]:
+    for item in data[:limit]:
         articles.append({
             "headline": item.get("headline"),
             "source": item.get("source"),
@@ -490,7 +512,7 @@ def _yfinance_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _yfinance_financials(symbol: str, statement: str, period: str) -> Optional[dict]:
+def _yfinance_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
     ticker = _yfinance_ticker(symbol)
     try:
         if statement == "income":
@@ -505,7 +527,7 @@ def _yfinance_financials(symbol: str, statement: str, period: str) -> Optional[d
     if df is None or df.empty:
         return None
 
-    df = df.iloc[:, : cfg.max_financial_periods]
+    df = df.iloc[:, :limit]
 
     periods = []
     for col in df.columns:
@@ -535,13 +557,13 @@ def _yfinance_financials(symbol: str, statement: str, period: str) -> Optional[d
     }
 
 
-def _yfinance_earnings(symbol: str) -> Optional[dict]:
+def _yfinance_earnings(symbol: str, limit: int) -> Optional[dict]:
     ticker = _yfinance_ticker(symbol)
     rows = []
     try:
         df = ticker.earnings_history
         if df is not None and not df.empty:
-            df = df.iloc[: cfg.max_financial_periods * 2]
+            df = df.iloc[:limit]
             for idx, row in df.iterrows():
                 period_label = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
                 rows.append({
@@ -558,7 +580,7 @@ def _yfinance_earnings(symbol: str) -> Optional[dict]:
         try:
             df = ticker.quarterly_income_stmt
             if df is not None and not df.empty and "Diluted EPS" in df.index:
-                for col in df.columns[: cfg.max_financial_periods]:
+                for col in df.columns[:limit]:
                     rows.append({
                         "period": col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col),
                         "actual_eps": _safe_float(df.at["Diluted EPS", col]),
@@ -575,7 +597,7 @@ def _yfinance_earnings(symbol: str) -> Optional[dict]:
     return {"provider": "yfinance", "symbol": symbol, "earnings": rows}
 
 
-def _yfinance_news(symbol: str) -> Optional[dict]:
+def _yfinance_news(symbol: str, limit: int) -> Optional[dict]:
     ticker = _yfinance_ticker(symbol)
     try:
         news = ticker.news or []
@@ -585,7 +607,7 @@ def _yfinance_news(symbol: str) -> Optional[dict]:
         return None
 
     articles = []
-    for item in news[: cfg.max_news_items]:
+    for item in news[:limit]:
         content = item.get("content") if isinstance(item, dict) else None
         if content:
             pub_ts = content.get("pubDate") or content.get("displayTime")
@@ -759,14 +781,14 @@ def _fmp_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _fmp_financials(symbol: str, statement: str, period: str) -> Optional[dict]:
+def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
     key = _fmp_require_key()
     endpoint = {
         "income": "income-statement",
         "balance": "balance-sheet-statement",
         "cashflow": "cash-flow-statement",
     }[statement]
-    params = {"apikey": key, "limit": cfg.max_financial_periods}
+    params = {"apikey": key, "limit": limit}
     if period == "quarterly":
         params["period"] = "quarter"
     data = _http_get_json(
@@ -776,7 +798,7 @@ def _fmp_financials(symbol: str, statement: str, period: str) -> Optional[dict]:
         return None
 
     periods = []
-    for entry in data[: cfg.max_financial_periods]:
+    for entry in data[:limit]:
         cleaned = {
             k: v
             for k, v in entry.items()
@@ -800,17 +822,17 @@ def _fmp_financials(symbol: str, statement: str, period: str) -> Optional[dict]:
     }
 
 
-def _fmp_earnings(symbol: str) -> Optional[dict]:
+def _fmp_earnings(symbol: str, limit: int) -> Optional[dict]:
     key = _fmp_require_key()
     data = _http_get_json(
         f"https://financialmodelingprep.com/api/v3/historical/earning_calendar/{symbol}",
-        {"apikey": key, "limit": 8},
+        {"apikey": key, "limit": limit},
     )
     if not data or not isinstance(data, list):
         return None
 
     rows = []
-    for row in data[:8]:
+    for row in data[:limit]:
         actual = _safe_float(row.get("eps"))
         estimate = _safe_float(row.get("epsEstimated"))
         surprise = (actual - estimate) if (actual is not None and estimate is not None) else None
@@ -833,261 +855,256 @@ def _fmp_earnings(symbol: str) -> Optional[dict]:
 
 
 # ===================================================================
+#                       SECTION DISPATCH
+# ===================================================================
+#
+# Each section of company data resolves a provider, calls it, and (when the
+# primary provider yields nothing) retries with yfinance. The 1:1 tools this
+# replaced each repeated that pattern; it now lives in one helper so the
+# consolidated `get_company_data` tool can fetch any mix of sections.
+
+VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders")
+DEFAULT_SECTIONS = ("quote", "profile")
+
+
+def _fetch_section(provider: str, primary: dict, yf_fn, args: tuple) -> tuple[Optional[dict], list[str]]:
+    """Run the provider's fetcher for one section, then fall back to yfinance.
+
+    ``primary`` maps a concrete provider name to its fetcher. If the resolved
+    provider has no entry (e.g. FMP for news/insiders), yfinance handles it —
+    mirroring the original tools' ``else: yfinance`` branch. Returns
+    ``(result_or_None, errors)``; ``errors`` keeps the per-provider detail.
+    """
+    errors: list[str] = []
+    fn = primary.get(provider)
+    if fn is None:
+        fn = yf_fn
+        provider = "yfinance"
+
+    result: Optional[dict] = None
+    try:
+        result = fn(*args)
+    except Exception as e:
+        errors.append(f"{provider}: {type(e).__name__}: {e}")
+
+    if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
+        try:
+            result = yf_fn(*args)
+        except Exception as e:
+            errors.append(f"yfinance: {type(e).__name__}: {e}")
+
+    return result, errors
+
+
+# Section fetchers share a uniform (symbol, opts) signature so the dispatch loop
+# can call any of them the same way. `opts` carries the per-call knobs the model
+# chose, already clamped to their configured maximums by `_gather_sections`: the
+# financials `statement`/`period`, and the resolved amount for each section.
+
+def _section_quote(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_quote, "yfinance": _yfinance_quote, "fmp": _fmp_quote},
+        _yfinance_quote, (symbol,),
+    )
+
+
+def _section_profile(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_profile, "yfinance": _yfinance_profile, "fmp": _fmp_profile},
+        _yfinance_profile, (symbol,),
+    )
+
+
+def _section_financials(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.financials_provider, for_financials=True),
+        {"fmp": _fmp_financials, "yfinance": _yfinance_financials, "finnhub": _finnhub_financials},
+        _yfinance_financials,
+        (symbol, opts["statement"], opts["period"], opts["financial_periods"]),
+    )
+
+
+def _section_earnings(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_earnings, "fmp": _fmp_earnings, "yfinance": _yfinance_earnings},
+        _yfinance_earnings, (symbol, opts["earnings_periods"]),
+    )
+
+
+def _section_news(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_news, "yfinance": _yfinance_news},
+        _yfinance_news, (symbol, opts["news_items"]),
+    )
+
+
+def _section_insiders(symbol: str, opts: dict):
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_insider_transactions, "yfinance": _yfinance_insider_transactions},
+        _yfinance_insider_transactions, (symbol, opts["insider_weeks"]),
+    )
+
+
+_SECTION_FETCHERS = {
+    "quote": _section_quote,
+    "profile": _section_profile,
+    "financials": _section_financials,
+    "earnings": _section_earnings,
+    "news": _section_news,
+    "insiders": _section_insiders,
+}
+
+
+def _gather_sections(
+    symbol: str,
+    sections: list[str],
+    statement: str,
+    period: str,
+    periods: Optional[int],
+    news_items: Optional[int],
+    insider_weeks: Optional[int],
+):
+    """Fetch every requested section in one worker thread.
+
+    The amount knobs (``periods``/``news_items``/``insider_weeks``) are the raw
+    values the model requested (or ``None`` for "use the configured maximum").
+    Each is clamped to its env-configured cap here before any fetcher runs, so a
+    section can never return more than its maximum. ``periods`` drives both the
+    financials and earnings sections, each clamped to its own cap.
+
+    Returns ``(data, errors)`` where ``data`` maps a section name to its payload
+    and ``errors`` maps a section name to why it produced nothing (a provider
+    error, or "no data available" for a valid-but-empty result).
+    """
+    opts = {
+        "statement": statement,
+        "period": period,
+        "financial_periods": _clamp_amount(periods, cfg.max_financial_periods),
+        "earnings_periods": _clamp_amount(periods, cfg.max_earnings_periods),
+        "news_items": _clamp_amount(news_items, cfg.max_news_items),
+        "insider_weeks": _clamp_amount(insider_weeks, cfg.max_insider_lookback_weeks),
+    }
+    data: dict[str, Any] = {}
+    errors: dict[str, list[str]] = {}
+    for section in sections:
+        result, errs = _SECTION_FETCHERS[section](symbol, opts)
+        if result:
+            data[section] = result
+        else:
+            errors[section] = errs or ["no data available"]
+    return data, errors
+
+
+# ===================================================================
 #                       TOOL REGISTRATION
 # ===================================================================
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
-    async def get_stock_quote(symbol: str) -> str:
-        """
-        Get the current stock quote for a ticker symbol — including price, day's change,
-        open/high/low/previous close, and trading volume.
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
-        :return: A JSON string with the latest quote data.
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        provider = _resolve_provider(cfg.default_provider)
-        result: Optional[dict] = None
-        errors: list[str] = []
-
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_quote, symbol)
-            elif provider == "yfinance":
-                result = await anyio.to_thread.run_sync(_yfinance_quote, symbol)
-            elif provider == "fmp":
-                result = await anyio.to_thread.run_sync(_fmp_quote, symbol)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-            result = None
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_quote, symbol)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve quote.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_company_profile(symbol: str) -> str:
-        """
-        Get the company profile and key fundamentals for a ticker — name, sector, industry,
-        market cap, employees, exchange, P/E, EPS, dividend yield, 52-week range, and beta.
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :return: A JSON string with the company profile and key metrics.
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        provider = _resolve_provider(cfg.default_provider)
-        result: Optional[dict] = None
-        errors: list[str] = []
-
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_profile, symbol)
-            elif provider == "yfinance":
-                result = await anyio.to_thread.run_sync(_yfinance_profile, symbol)
-            elif provider == "fmp":
-                result = await anyio.to_thread.run_sync(_fmp_profile, symbol)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_profile, symbol)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve profile.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_financials(
+    async def get_company_data(
         symbol: str,
+        sections: Optional[list[str]] = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
+        periods: Optional[int] = None,
+        news_items: Optional[int] = None,
+        insider_weeks: Optional[int] = None,
     ) -> str:
         """
-        Get financial statements for a company — income statement, balance sheet, or cash flow.
-        Returns the most recent N periods (configured by STOCK_MAX_FINANCIAL_PERIODS).
+        Get company data for a ticker, fetching only the sections you ask for.
 
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :param statement: Which statement to fetch — "income", "balance", or "cashflow".
-        :param period: "annual" for yearly statements, "quarterly" for quarterly.
-        :return: A JSON string with the requested financial statements.
+        Pass one or more sections; each adds a block to the response:
+
+        - "quote" — latest price, day's change, open/high/low/previous close, volume.
+        - "profile" — name, sector, industry, market cap, employees, exchange, and
+          key fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
+        - "financials" — income statement, balance sheet, or cash flow. Controlled by
+          the `statement` and `period` parameters; `periods` sets how many to return.
+        - "earnings" — historical earnings: actual vs. estimated EPS, surprise %, revenue.
+          `periods` sets how many to return.
+        - "news" — recent news articles (headline, source, summary, url, published date).
+          `news_items` sets how many to return.
+        - "insiders" — insider buying/selling, with a buy/sell summary and individual
+          transactions. `insider_weeks` sets how far back to look.
+
+        Request only what you need — fetching every section, or a long history, is
+        slower, uses more API quota, and fills your context window. A price check needs
+        just ["quote"]; "how is the company doing" might use ["quote", "profile",
+        "earnings"]. Start small and ask again for more if you need it.
+
+        The amount parameters (`periods`, `news_items`, `insider_weeks`) let you dial the
+        range down per call. Each is capped by a server maximum (STOCK_MAX_*); a larger
+        request is silently clamped to that cap, and omitting it uses the cap. So pass a
+        small value when you only need recent data.
+
+        :param symbol: The stock ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
+        :param sections: Which sections to fetch — any of: quote, profile, financials,
+            earnings, news, insiders. Defaults to ["quote", "profile"] when omitted.
+        :param statement: For the "financials" section only — "income", "balance", or
+            "cashflow". Ignored by other sections.
+        :param period: For the "financials" section only — "annual" or "quarterly".
+            Ignored by other sections.
+        :param periods: How many historical periods to return for the "financials" and
+            "earnings" sections (most recent first). Capped by STOCK_MAX_FINANCIAL_PERIODS
+            and STOCK_MAX_EARNINGS_PERIODS respectively; omit to use the maximum.
+        :param news_items: How many news articles to return for the "news" section.
+            Capped by STOCK_MAX_NEWS_ITEMS; omit to use the maximum.
+        :param insider_weeks: How many weeks of insider activity to look back on for the
+            "insiders" section. Capped by STOCK_MAX_INSIDER_LOOKBACK_WEEKS; omit to use
+            the maximum.
+        :return: A JSON string ``{"symbol", "sections", "data": {<section>: {...}}}``.
+            On partial success an ``"errors"`` map lists sections that returned nothing.
+            If every requested section fails, the call raises an error instead.
         """
         symbol = (symbol or "").strip().upper()
         if not symbol:
-            return json.dumps({"error": "Symbol is required."})
+            raise ToolError("Symbol is required.")
+
+        requested = sections if sections else list(DEFAULT_SECTIONS)
+        normalized: list[str] = []
+        for s in requested:
+            key = (s or "").strip().lower()
+            if key and key not in normalized:
+                normalized.append(key)
+
+        if not normalized:
+            raise ToolError(
+                "At least one section is required. Valid sections: "
+                + ", ".join(VALID_SECTIONS) + "."
+            )
+        invalid = [s for s in normalized if s not in VALID_SECTIONS]
+        if invalid:
+            raise ToolError(
+                f"Invalid section(s): {', '.join(invalid)}. "
+                f"Valid sections are: {', '.join(VALID_SECTIONS)}."
+            )
+
         if statement not in ("income", "balance", "cashflow"):
-            return json.dumps({"error": "statement must be one of: income, balance, cashflow"})
+            raise ToolError("statement must be one of: income, balance, cashflow")
         if period not in ("annual", "quarterly"):
-            return json.dumps({"error": "period must be 'annual' or 'quarterly'"})
+            raise ToolError("period must be 'annual' or 'quarterly'")
 
-        provider = _resolve_provider(cfg.financials_provider, for_financials=True)
-        result: Optional[dict] = None
-        errors: list[str] = []
+        data, errors = await anyio.to_thread.run_sync(
+            _gather_sections, symbol, normalized, statement, period,
+            periods, news_items, insider_weeks,
+        )
 
-        try:
-            if provider == "fmp":
-                result = await anyio.to_thread.run_sync(_fmp_financials, symbol, statement, period)
-            elif provider == "yfinance":
-                result = await anyio.to_thread.run_sync(_yfinance_financials, symbol, statement, period)
-            elif provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_financials, symbol, statement, period)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
+        if not data:
+            # Every requested section failed — surface as a ToolError so the
+            # failure can't be mistaken for data (see the README error convention).
+            flat = [f"{sec}: {'; '.join(errs)}" for sec, errs in errors.items() if errs]
+            raise ToolError(_retrieval_error("company data", symbol, flat))
 
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_financials, symbol, statement, period)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve financials.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_earnings(symbol: str) -> str:
-        """
-        Get historical earnings reports for a company — actual EPS, estimated EPS,
-        surprise %, and revenue figures by quarter.
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :return: A JSON string with historical earnings data.
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        result: Optional[dict] = None
-        errors: list[str] = []
-        provider = _resolve_provider(cfg.default_provider)
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_earnings, symbol)
-            elif provider == "fmp":
-                result = await anyio.to_thread.run_sync(_fmp_earnings, symbol)
-            else:
-                result = await anyio.to_thread.run_sync(_yfinance_earnings, symbol)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_earnings, symbol)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve earnings.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_company_news(symbol: str) -> str:
-        """
-        Get recent news articles about a specific company.
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :return: A JSON string with recent news articles (headline, source, summary, url, published date).
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        result: Optional[dict] = None
-        errors: list[str] = []
-        provider = _resolve_provider(cfg.default_provider)
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_news, symbol)
-            else:
-                result = await anyio.to_thread.run_sync(_yfinance_news, symbol)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_news, symbol)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve news.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
-
-    @mcp.tool()
-    async def get_insider_transactions(symbol: str) -> str:
-        """
-        Get recent insider buying and selling activity for a stock — transactions filed
-        by company insiders (officers, directors, and major shareholders) over the last
-        N weeks (configured by STOCK_INSIDER_LOOKBACK_WEEKS). Returns a buy/sell summary
-        and the individual transactions (insider name, date, share change, and price).
-
-        :param symbol: The stock ticker symbol (e.g. "AAPL").
-        :return: A JSON string with insider transaction data and a buy/sell summary.
-        """
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            return json.dumps({"error": "Symbol is required."})
-
-        weeks = cfg.insider_lookback_weeks
-        result: Optional[dict] = None
-        errors: list[str] = []
-        provider = _resolve_provider(cfg.default_provider)
-        try:
-            if provider == "finnhub":
-                result = await anyio.to_thread.run_sync(_finnhub_insider_transactions, symbol, weeks)
-            else:
-                result = await anyio.to_thread.run_sync(_yfinance_insider_transactions, symbol, weeks)
-        except Exception as e:
-            errors.append(f"{provider}: {type(e).__name__}: {e}")
-
-        if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
-            try:
-                result = await anyio.to_thread.run_sync(_yfinance_insider_transactions, symbol, weeks)
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        if not result:
-            return json.dumps({
-                "symbol": symbol,
-                "error": "Could not retrieve insider transactions.",
-                "provider_errors": errors,
-            })
-        return json.dumps(result, default=str)
+        payload: dict[str, Any] = {"symbol": symbol, "sections": normalized, "data": data}
+        if errors:
+            # Partial success: report which sections returned nothing and why.
+            payload["errors"] = errors
+        return json.dumps(payload, default=str)
 
     @mcp.tool()
     async def search_symbol(query: str) -> str:
@@ -1101,13 +1118,12 @@ def register(mcp: FastMCP) -> None:
         """
         query = (query or "").strip()
         if not query:
-            return json.dumps({"error": "Query is required."})
+            raise ToolError("Query is required.")
 
         if not cfg.finnhub_api_key:
-            return json.dumps({
-                "error": "Symbol search requires a Finnhub API key (STOCK_FINNHUB_API_KEY).",
-                "query": query,
-            })
+            raise ToolError(
+                "Symbol search requires a Finnhub API key (STOCK_FINNHUB_API_KEY)."
+            )
 
         try:
             data = await anyio.to_thread.run_sync(
@@ -1115,13 +1131,14 @@ def register(mcp: FastMCP) -> None:
                 "https://finnhub.io/api/v1/search",
                 {"q": query, "token": cfg.finnhub_api_key},
             )
-            results = []
-            for item in (data.get("result") or [])[:10]:
-                results.append({
-                    "symbol": item.get("symbol"),
-                    "description": item.get("description"),
-                    "type": item.get("type"),
-                })
-            return json.dumps({"query": query, "count": len(results), "results": results})
         except Exception as e:
-            return json.dumps({"error": f"Search failed: {type(e).__name__}: {e}", "query": query})
+            raise ToolError(f"Symbol search failed for {query!r}: {type(e).__name__}: {e}")
+
+        results = []
+        for item in (data.get("result") or [])[:10]:
+            results.append({
+                "symbol": item.get("symbol"),
+                "description": item.get("description"),
+                "type": item.get("type"),
+            })
+        return json.dumps({"query": query, "count": len(results), "results": results})
