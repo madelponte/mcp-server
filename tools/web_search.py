@@ -610,7 +610,6 @@ async def _searxng_query(
             "url": r.get("url"),
             "title": r.get("title"),
             "snippet": (r.get("content") or "").strip(),
-            "engine": r.get("engine"),
         }
         # News/dated sources populate a publish date; general-web engines omit
         # it. SearXNG exposes it inconsistently as either "publishedDate" or

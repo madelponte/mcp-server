@@ -62,14 +62,14 @@ class WebSearchSettings(BaseSettings):
         5, description="Maximum number of search results to return."
     )
     max_enrich_results: int = Field(
-        3,
+        5,
         description=(
             "Maximum number of top results to fetch structured metadata "
             "(description + table-of-contents outline) for (0 disables)."
         ),
     )
     default_enrich_results: int = Field(
-        2,
+        3,
         description=(
             "Number of top results to enrich when the model doesn't specify "
             "(clamped to max_enrich_results; 0 disables enrichment by default)."
