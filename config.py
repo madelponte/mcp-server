@@ -53,10 +53,27 @@ class WebSearchSettings(BaseSettings):
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
     )
-    num_results: int = Field(5, description="Number of search results to return.")
-    enrich_top_n: int = Field(
+    # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
+    # the model request fewer results / less enrichment per call; anything above
+    # these caps is clamped down so an oversized response (or a pile of
+    # table-of-contents outlines) can't overwhelm the model's context window.
+    # When the model doesn't specify, the cap is used (the prior behavior).
+    max_num_results: int = Field(
+        5, description="Maximum number of search results to return."
+    )
+    max_enrich_results: int = Field(
+        5,
+        description=(
+            "Maximum number of top results to fetch structured metadata "
+            "(description + table-of-contents outline) for (0 disables)."
+        ),
+    )
+    default_enrich_results: int = Field(
         3,
-        description="Fetch structured metadata for this many top results (0 disables).",
+        description=(
+            "Number of top results to enrich when the model doesn't specify "
+            "(clamped to max_enrich_results; 0 disables enrichment by default)."
+        ),
     )
     searxng_categories: str = Field("general", description="Comma-separated SearXNG categories.")
     searxng_language: str = Field("en", description="SearXNG language code (e.g. 'en', 'all').")
@@ -91,6 +108,17 @@ class WebSearchSettings(BaseSettings):
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
     user_agent: str = Field(DEFAULT_UA, description="User-Agent sent with direct fetches.")
 
+    cache_ttl_seconds: int = Field(
+        300,
+        description=(
+            "Cache fetched pages this many seconds so an agent loop that re-fetches "
+            "the same URL skips the network round-trip (0 disables the cache)."
+        ),
+    )
+    cache_max_entries: int = Field(
+        128, description="Max number of cached pages before the oldest is evicted (0 = unbounded)."
+    )
+
     max_page_chars: int = Field(25000, description="Max characters of page content before truncation.")
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
@@ -119,10 +147,20 @@ class StockSettings(BaseSettings):
 
     request_timeout: int = Field(15, description="HTTP request timeout in seconds.")
     cache_ttl_seconds: int = Field(60, description="Cache responses this long (0 disables).")
-    max_news_items: int = Field(5, description="Max news articles per query.")
-    max_financial_periods: int = Field(4, description="Max historical financial periods returned.")
-    insider_lookback_weeks: int = Field(
-        12, description="How many weeks of insider buying/selling to return."
+
+    # The following are MAXIMUMS, not fixed amounts. `get_company_data` lets the
+    # model request a smaller range per call; anything above these caps is
+    # clamped down so an oversized response can't overwhelm the model's context
+    # window. When the model doesn't specify, the cap is used (the prior behavior).
+    max_news_items: int = Field(5, description="Maximum news articles returned per query.")
+    max_financial_periods: int = Field(
+        4, description="Maximum historical financial periods (income/balance/cashflow) returned."
+    )
+    max_earnings_periods: int = Field(
+        8, description="Maximum historical earnings periods returned."
+    )
+    max_insider_lookback_weeks: int = Field(
+        12, description="Maximum weeks of insider buying/selling to look back on."
     )
 
 
@@ -136,6 +174,9 @@ class WolframSettings(BaseSettings):
     app_id: str = Field("", description="Wolfram Alpha AppID (free at developer.wolframalpha.com).")
     default_units: str = Field("metric", description="Default unit system: 'metric' or 'nonmetric'.")
     max_chars: int = Field(6800, description="Max characters in Wolfram's response.")
+    http_timeout_seconds: float = Field(
+        30.0, description="HTTP timeout for the Wolfram Alpha request, in seconds."
+    )
 
 
 class YouTubeSettings(BaseSettings):
@@ -152,6 +193,16 @@ class YouTubeSettings(BaseSettings):
         False, description="Prefix each line with a [M:SS]/[H:MM:SS] timestamp."
     )
     max_characters: int = Field(0, description="Truncate transcript to this many chars (0 = no limit).")
+    cache_ttl_seconds: int = Field(
+        86400,
+        description=(
+            "Cache transcripts this many seconds (0 disables). Transcripts almost "
+            "never change, so a long TTL is safe and avoids re-fetching."
+        ),
+    )
+    cache_max_entries: int = Field(
+        256, description="Max number of cached transcripts before the oldest is evicted (0 = unbounded)."
+    )
     webshare_proxy_username: str = Field("", description="Webshare Residential proxy username.")
     webshare_proxy_password: str = Field("", description="Webshare Residential proxy password.")
     http_proxy_url: str = Field(
