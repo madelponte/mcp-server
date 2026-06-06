@@ -46,6 +46,8 @@ There is **no test suite, linter, or formatter** configured. CI (`.github/workfl
 
 **Sync libraries in async tools.** Tool functions are `async`. Blocking/synchronous clients (e.g. the Stock tool's `requests` and `yfinance` calls) must be offloaded with `anyio.to_thread.run_sync(...)` rather than called directly — see `tools/stock_data.py`. `httpx.AsyncClient` is used directly where the library is async-native (web search, Wolfram).
 
+**JSON output is centralized.** Tools never call `json.dumps` for their results — they serialize through `tools/serialize.py:to_json()`, which emits **compact** JSON by default (to conserve the model's context window) and **indented** JSON when debug mode is on. Debug mode is a single server-level switch (`MCP_DEBUG`, on `ServerSettings`): when enabled it also forces DEBUG-level logging and each tool logs its invocation via `log_call(...)` / a result summary via `log_result(...)` to stdout. Wrap each tool's `return` with `log_result(log, "<tool>", to_json(payload))`, and call `log_call(log, "<tool>", **args)` at the top of the function. Tools that return plain text (Wolfram, YouTube) skip `to_json` but still use `log_call`/`log_result`.
+
 **Tool docstrings are the model's API.** The `@mcp.tool()` function docstring is what the model sees. Keep the detailed usage guidance there (query formatting rules, when-to-use / when-not-to-use, param semantics) as the existing tools do.
 
 ## Web Search support services

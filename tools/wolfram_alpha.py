@@ -6,12 +6,17 @@ Translated from the Open WebUI tool — the HTML "card" rendering was dropped
 (MCP returns plain text), the rest of the behavior is preserved.
 """
 
+import logging
+
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from config import wolfram_settings as cfg
 from .cache import TTLCache
+from .serialize import log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`. This keeps failures from being mistaken
@@ -58,6 +63,7 @@ def register(mcp: FastMCP) -> None:
             to disambiguate (e.g. when "mercury" could mean the planet or element).
         :return: The text result from Wolfram Alpha.
         """
+        log_call(log, "query_wolfram_alpha", query=query, assumption=assumption)
         app_id = (cfg.app_id or "").strip()
         if not app_id:
             raise ToolError(
@@ -86,7 +92,7 @@ def register(mcp: FastMCP) -> None:
         )
         cached = _result_cache.get(cache_key)
         if cached is not None:
-            return cached
+            return log_result(log, "query_wolfram_alpha", cached)
 
         try:
             async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
@@ -133,4 +139,4 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("Wolfram Alpha returned an empty response.")
 
         _result_cache.set(cache_key, body)
-        return body
+        return log_result(log, "query_wolfram_alpha", body)

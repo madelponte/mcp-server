@@ -10,6 +10,7 @@ were removed.
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
@@ -21,6 +22,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
+from .serialize import to_json, log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -765,6 +769,15 @@ def register(mcp: FastMCP) -> None:
             Value is capped by the server.
         :return: JSON string of results.
         """
+        log_call(
+            log,
+            "search_web",
+            query=query,
+            time_range=time_range,
+            category=category,
+            num_results=num_results,
+            enrich_results=enrich_results,
+        )
         query = (query or "").strip()
         if not query:
             raise ToolError("Empty query.")
@@ -808,7 +821,9 @@ def register(mcp: FastMCP) -> None:
         applied = {"time_range": resolved_time_range or "all", "category": resolved_categories}
 
         if not results:
-            return json.dumps({"query": query, **applied, "results": []})
+            return log_result(
+                log, "search_web", to_json({"query": query, **applied, "results": []})
+            )
 
         for r in results:
             if r.get("snippet"):
@@ -840,10 +855,10 @@ def register(mcp: FastMCP) -> None:
                 if data.get("toc"):
                     results[i]["page_toc"] = data["toc"][:20]
 
-        return json.dumps(
-            {"query": query, **applied, "results": results},
-            ensure_ascii=False,
-            indent=2,
+        return log_result(
+            log,
+            "search_web",
+            to_json({"query": query, **applied, "results": results}),
         )
 
     @mcp.tool()
@@ -873,6 +888,7 @@ def register(mcp: FastMCP) -> None:
         :param section: Optional heading text to extract just that section.
         :return: JSON string with the result.
         """
+        log_call(log, "fetch_page", url=url, mode=mode, section=section)
         if not url or not isinstance(url, str):
             raise ToolError("Missing url.")
         url = url.strip()
@@ -914,17 +930,20 @@ def register(mcp: FastMCP) -> None:
                 ocr_strategy=cfg.tika_ocr_strategy,
             )
             extracted = _trim(extracted, cfg.max_page_chars)
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype or "application/octet-stream",
-                    "via": via,
-                    "format": "document_text",
-                    "content": extracted,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype or "application/octet-stream",
+                        "via": via,
+                        "format": "document_text",
+                        "content": extracted,
+                    }
+                ),
             )
 
         text = fetched.get("text") or ""
@@ -934,19 +953,21 @@ def register(mcp: FastMCP) -> None:
             try:
                 parsed = json.loads(text)
                 compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
-                dumped = json.dumps(compact, ensure_ascii=False, indent=2)
-                dumped = _trim(dumped, cfg.max_page_chars)
-                return json.dumps(
-                    {
-                        "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype or "application/json",
-                        "via": via,
-                        "format": "json",
-                        "content": dumped,
-                    },
-                    ensure_ascii=False,
+                dumped = _trim(to_json(compact), cfg.max_page_chars)
+                return log_result(
+                    log,
+                    "fetch_page",
+                    to_json(
+                        {
+                            "url": fetch_url,
+                            "original_url": url,
+                            "status": status,
+                            "content_type": ctype or "application/json",
+                            "via": via,
+                            "format": "json",
+                            "content": dumped,
+                        }
+                    ),
                 )
             except Exception:
                 pass
@@ -959,17 +980,20 @@ def register(mcp: FastMCP) -> None:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
             if structured.get("headings"):
                 structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "structured",
-                    "content": structured,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype,
+                        "via": via,
+                        "format": "structured",
+                        "content": structured,
+                    }
+                ),
             )
 
         # mode == "text"
@@ -998,21 +1022,24 @@ def register(mcp: FastMCP) -> None:
 
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
             section_body = _trim(section_body, cfg.max_page_chars)
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "section",
-                    "title": soup_title,
-                    "matched_heading": section_data["matched_heading"],
-                    "level": section_data["level"],
-                    "next_heading": section_data["next_heading"],
-                    "content": section_body,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype,
+                        "via": via,
+                        "format": "section",
+                        "title": soup_title,
+                        "matched_heading": section_data["matched_heading"],
+                        "level": section_data["level"],
+                        "next_heading": section_data["next_heading"],
+                        "content": section_body,
+                    }
+                ),
             )
 
         try:
@@ -1029,17 +1056,20 @@ def register(mcp: FastMCP) -> None:
         else:
             note = None
 
-        return json.dumps(
-            {
-                "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype,
-                "via": via,
-                "format": "text",
-                "title": soup_title,
-                "content": plain,
-                "note": note,
-            },
-            ensure_ascii=False,
+        return log_result(
+            log,
+            "fetch_page",
+            to_json(
+                {
+                    "url": fetch_url,
+                    "original_url": url,
+                    "status": status,
+                    "content_type": ctype,
+                    "via": via,
+                    "format": "text",
+                    "title": soup_title,
+                    "content": plain,
+                    "note": note,
+                }
+            ),
         )
