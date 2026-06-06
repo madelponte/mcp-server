@@ -31,6 +31,17 @@ class ServerSettings(BaseSettings):
         description="MCP transport: 'streamable-http', 'sse', or 'stdio'.",
     )
     log_level: str = Field("INFO", description="Python logging level.")
+    debug: bool = Field(
+        False,
+        description=(
+            "Debug mode. When true, tools serialize their JSON results as "
+            "indented, human-readable JSON (instead of the default compact JSON) "
+            "and emit verbose DEBUG-level logs of each tool call and its arguments "
+            "to stdout. Off by default so results stay compact in the model's "
+            "context window. Enabling it forces the effective log level to DEBUG "
+            "regardless of MCP_LOG_LEVEL."
+        ),
+    )
     auth_token: str = Field(
         "",
         description=(

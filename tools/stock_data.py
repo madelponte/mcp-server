@@ -15,6 +15,7 @@ WebUI tool; per-user valves and status emitters were removed.
 """
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -25,6 +26,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import stock_settings as cfg
 from .cache import TTLCache
+from .serialize import to_json, log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -1056,49 +1060,48 @@ def register(mcp: FastMCP) -> None:
         """
         Get company data for a ticker, fetching only the sections you ask for.
 
-        Pass one or more sections; each adds a block to the response:
-
-        - "quote" — latest price, day's change, open/high/low/previous close, volume.
+        Sections (each adds a block to the response):
+        - "quote" — latest price, day's change, open/high/low/prev close, volume.
         - "profile" — name, sector, industry, market cap, employees, exchange, and
-          key fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
-        - "financials" — income statement, balance sheet, or cash flow. Controlled by
-          the `statement` and `period` parameters; `periods` sets how many to return.
-        - "earnings" — historical earnings: actual vs. estimated EPS, surprise %, revenue.
-          `periods` sets how many to return.
-        - "news" — recent news articles (headline, source, summary, url, published date).
-          `news_items` sets how many to return.
-        - "insiders" — insider buying/selling, with a buy/sell summary and individual
-          transactions. `insider_weeks` sets how far back to look.
+          fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
+        - "financials" — income statement, balance sheet, or cash flow (set by
+          `statement` and `period`; `periods` sets how many).
+        - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
+        - "news" — recent articles: headline, source, summary, url, date (`news_items`).
+        - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
 
-        Request only what you need — fetching every section, or a long history, is
-        slower, uses more API quota, and fills your context window. A price check needs
-        just ["quote"]; "how is the company doing" might use ["quote", "profile",
-        "earnings"]. Start small and ask again for more if you need it.
+        Request only what you need — extra sections and long history are slower and
+        fill your context. A price check is just ["quote"]; "how's the company doing"
+        might be ["quote", "profile", "earnings"]. Start small, ask again for more.
 
-        The amount parameters (`periods`, `news_items`, `insider_weeks`) let you dial the
-        range down per call. Each is capped by a server maximum (STOCK_MAX_*); a larger
-        request is silently clamped to that cap, and omitting it uses the cap. So pass a
-        small value when you only need recent data.
+        `periods`, `news_items`, `insider_weeks` are capped by server maximums;
+        larger values are clamped, and omitting uses the max.
 
-        :param symbol: The stock ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
-        :param sections: Which sections to fetch — any of: quote, profile, financials,
-            earnings, news, insiders. Defaults to ["quote", "profile"] when omitted.
-        :param statement: For the "financials" section only — "income", "balance", or
-            "cashflow". Ignored by other sections.
-        :param period: For the "financials" section only — "annual" or "quarterly".
-            Ignored by other sections.
-        :param periods: How many historical periods to return for the "financials" and
-            "earnings" sections (most recent first). Capped by STOCK_MAX_FINANCIAL_PERIODS
-            and STOCK_MAX_EARNINGS_PERIODS respectively; omit to use the maximum.
-        :param news_items: How many news articles to return for the "news" section.
-            Capped by STOCK_MAX_NEWS_ITEMS; omit to use the maximum.
-        :param insider_weeks: How many weeks of insider activity to look back on for the
-            "insiders" section. Capped by STOCK_MAX_INSIDER_LOOKBACK_WEEKS; omit to use
-            the maximum.
-        :return: A JSON string ``{"symbol", "sections", "data": {<section>: {...}}}``.
-            On partial success an ``"errors"`` map lists sections that returned nothing.
-            If every requested section fails, the call raises an error instead.
+        :param symbol: Ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
+        :param sections: Any of: quote, profile, financials, earnings, news,
+            insiders. Defaults to ["quote", "profile"].
+        :param statement: "financials" only — "income", "balance", or "cashflow".
+        :param period: "financials" only — "annual" or "quarterly".
+        :param periods: Historical periods for "financials"/"earnings" (recent
+            first); capped, omit for max.
+        :param news_items: Articles for "news"; capped, omit for max.
+        :param insider_weeks: Weeks of insider activity for "insiders"; capped,
+            omit for max.
+        :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``. On
+            partial success an ``"errors"`` map lists sections that returned
+            nothing. If every section fails, the call raises an error.
         """
+        log_call(
+            log,
+            "get_company_data",
+            symbol=symbol,
+            sections=sections,
+            statement=statement,
+            period=period,
+            periods=periods,
+            news_items=news_items,
+            insider_weeks=insider_weeks,
+        )
         symbol = (symbol or "").strip().upper()
         if not symbol:
             raise ToolError("Symbol is required.")
@@ -1142,21 +1145,18 @@ def register(mcp: FastMCP) -> None:
         if errors:
             # Partial success: report which sections returned nothing and why.
             payload["errors"] = errors
-        return json.dumps(payload, default=str)
+        return log_result(log, "get_company_data", to_json(payload))
 
     @mcp.tool()
     async def search_symbol(query: str) -> str:
         """
-        Search for a stock ticker symbol by company name or partial symbol.
-        Useful when the user names a company but you don't know its ticker.
+        Find a stock ticker symbol by company name or partial symbol. Use when the
+        user names a company but you don't know its ticker.
 
-        Uses Finnhub when a key (STOCK_FINNHUB_API_KEY) is configured, and
-        otherwise falls back to a keyless Yahoo Finance lookup, so the tool
-        stays useful in a no-key deployment.
-
-        :param query: The company name or partial ticker to search for (e.g. "apple").
-        :return: A JSON string with matching tickers and company names.
+        :param query: Company name or partial ticker (e.g. "apple").
+        :return: JSON with matching tickers and company names.
         """
+        log_call(log, "search_symbol", query=query)
         query = (query or "").strip()
         if not query:
             raise ToolError("Query is required.")
@@ -1196,4 +1196,4 @@ def register(mcp: FastMCP) -> None:
         }
         if errors:
             payload["errors"] = errors
-        return json.dumps(payload)
+        return log_result(log, "search_symbol", to_json(payload))
