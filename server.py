@@ -21,7 +21,18 @@ from tools import web_search, stock_data, wolfram_alpha, youtube_transcript, geo
 
 
 def build_server() -> FastMCP:
-    logging.basicConfig(level=getattr(logging, server_settings.log_level.upper(), logging.INFO))
+    # Debug mode forces DEBUG-level logging regardless of MCP_LOG_LEVEL so the
+    # verbose per-tool-call logs are actually emitted.
+    level = (
+        logging.DEBUG
+        if server_settings.debug
+        else getattr(logging, server_settings.log_level.upper(), logging.INFO)
+    )
+    logging.basicConfig(level=level)
+    if server_settings.debug:
+        logging.getLogger(__name__).debug(
+            "MCP_DEBUG enabled: pretty-printed JSON output and verbose tool logging are ON."
+        )
 
     mcp = FastMCP(
         "openwebui-tools",
@@ -77,7 +88,7 @@ def run_http(transport: str) -> None:
         app,
         host=server_settings.host,
         port=server_settings.port,
-        log_level=server_settings.log_level.lower(),
+        log_level="debug" if server_settings.debug else server_settings.log_level.lower(),
     )
 
 

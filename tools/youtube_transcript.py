@@ -7,6 +7,7 @@ Open WebUI tool; status-emitter calls were removed.
 """
 
 import functools
+import logging
 import re
 from typing import List
 from urllib.parse import urlparse, parse_qs
@@ -28,6 +29,9 @@ from youtube_transcript_api._errors import (
 
 from config import youtube_settings as cfg
 from .cache import TTLCache
+from .serialize import log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -140,6 +144,7 @@ def register(mcp: FastMCP) -> None:
         :return: The transcript as a single string (optionally with timestamps),
                  prefixed by a short metadata header.
         """
+        log_call(log, "get_youtube_transcript", url=url, languages=languages)
         try:
             video_id = _extract_video_id(url)
 
@@ -151,7 +156,7 @@ def register(mcp: FastMCP) -> None:
             cache_key = f"{video_id}\x00{','.join(lang_list)}"
             cached = _transcript_cache.get(cache_key)
             if cached is not None:
-                return cached
+                return log_result(log, "get_youtube_transcript", cached)
 
             client = _build_client()
 
@@ -218,7 +223,7 @@ def register(mcp: FastMCP) -> None:
 
             result = f"{header}\n{body}{truncated_note}"
             _transcript_cache.set(cache_key, result)
-            return result
+            return log_result(log, "get_youtube_transcript", result)
 
         except ToolError:
             raise

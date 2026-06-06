@@ -15,6 +15,7 @@ WebUI tool; per-user valves and status emitters were removed.
 """
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
@@ -25,6 +26,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import stock_settings as cfg
 from .cache import TTLCache
+from .serialize import to_json, log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -1099,6 +1103,17 @@ def register(mcp: FastMCP) -> None:
             On partial success an ``"errors"`` map lists sections that returned nothing.
             If every requested section fails, the call raises an error instead.
         """
+        log_call(
+            log,
+            "get_company_data",
+            symbol=symbol,
+            sections=sections,
+            statement=statement,
+            period=period,
+            periods=periods,
+            news_items=news_items,
+            insider_weeks=insider_weeks,
+        )
         symbol = (symbol or "").strip().upper()
         if not symbol:
             raise ToolError("Symbol is required.")
@@ -1142,7 +1157,7 @@ def register(mcp: FastMCP) -> None:
         if errors:
             # Partial success: report which sections returned nothing and why.
             payload["errors"] = errors
-        return json.dumps(payload, default=str)
+        return log_result(log, "get_company_data", to_json(payload))
 
     @mcp.tool()
     async def search_symbol(query: str) -> str:
@@ -1157,6 +1172,7 @@ def register(mcp: FastMCP) -> None:
         :param query: The company name or partial ticker to search for (e.g. "apple").
         :return: A JSON string with matching tickers and company names.
         """
+        log_call(log, "search_symbol", query=query)
         query = (query or "").strip()
         if not query:
             raise ToolError("Query is required.")
@@ -1196,4 +1212,4 @@ def register(mcp: FastMCP) -> None:
         }
         if errors:
             payload["errors"] = errors
-        return json.dumps(payload)
+        return log_result(log, "search_symbol", to_json(payload))

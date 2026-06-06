@@ -13,7 +13,7 @@ By default it uses the public OpenStreetMap APIs. Set ``GEO_NOMINATIM_URL`` /
 User-Agent and a 1 req/sec cap on the public API) is honored — see config.py.
 """
 
-import json
+import logging
 import math
 import re
 import time
@@ -25,6 +25,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import geocoding_settings as cfg
 from .cache import TTLCache
+from .serialize import to_json, log_call, log_result
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake a failure for a
@@ -397,6 +400,16 @@ def register(mcp: FastMCP) -> None:
             `results` list (name, coordinates, distance_m, category, and
             cuisine/address/phone/website/opening_hours when available).
         """
+        log_call(
+            log,
+            "find_nearby_places",
+            category=category,
+            near=near,
+            latitude=latitude,
+            longitude=longitude,
+            radius_m=radius_m,
+            limit=limit,
+        )
         if not (category or "").strip():
             raise ToolError("Empty category. Say what to look for, e.g. 'pharmacy'.")
 
@@ -471,16 +484,20 @@ def register(mcp: FastMCP) -> None:
         results.sort(key=lambda p: p["distance_m"])
         results = results[:n]
 
-        return json.dumps(
-            {
-                "query_category": category.strip(),
-                "center": {
-                    "latitude": lat,
-                    "longitude": lon,
-                    "name": center_name,
-                },
-                "radius_m": radius,
-                "count": len(results),
-                "results": results,
-            }
+        return log_result(
+            log,
+            "find_nearby_places",
+            to_json(
+                {
+                    "query_category": category.strip(),
+                    "center": {
+                        "latitude": lat,
+                        "longitude": lon,
+                        "name": center_name,
+                    },
+                    "radius_m": radius,
+                    "count": len(results),
+                    "results": results,
+                }
+            ),
         )
