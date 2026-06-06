@@ -35,33 +35,25 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def query_wolfram_alpha(query: str, assumption: str | None = None) -> str:
         """
-        Compute or look up factual data using Wolfram Alpha. Use this for anything
-        requiring exact computation or authoritative reference data, including:
-        math (algebra, calculus, linear algebra, statistics, number theory),
-        unit/currency conversions, physics & chemistry (constants, formulas,
-        properties, reactions), astronomy (planetary positions, eclipses, distances),
-        geography & demographics (populations, GDP, distances between cities),
-        dates & times (timezone conversion, day of week, time between dates),
-        finance (stock data, historical prices), nutrition, weather history,
-        words & linguistics, and structured comparisons of named entities.
+        Compute or look up exact factual data with Wolfram Alpha: math, unit/currency
+        conversions, physics, chemistry, astronomy, geography, demographics, dates &
+        times, finance, nutrition, weather history, and entity comparisons.
 
-        Query formatting (important):
-        - Send English keyword-style queries, not full sentences:
-          "France population" not "how many people live in France".
-        - Use single-letter variable names (n, n_1, x) in math.
-        - Use exponent notation like 6*10^14, never 6e14.
-        - Use named constants ("speed of light") rather than substituting numbers.
-        - One property per call — make separate calls for separate properties.
-        - If a previous result returned 'Assumptions', re-send the SAME input
-          with the assumption parameter set to the relevant value, do not rephrase.
+        Query rules:
+        - Use keyword style, not sentences: "France population", not "how many
+          people live in France".
+        - Math: single-letter variables (n, x), exponents like 6*10^14 (not 6e14),
+          named constants ("speed of light") not raw numbers.
+        - One property per call.
+        - If a result lists 'Assumptions', re-send the SAME query with `assumption`
+          set to that value — don't rephrase.
 
-        Do NOT use for: opinions, current news, code generation, creative writing,
-        or simple lookups already answerable from general knowledge.
+        Don't use for opinions, current news, code, or things you already know.
 
-        :param query: The Wolfram Alpha query (English, keyword-style, single line).
-        :param assumption: Optional assumption value from a previous result, used
-            to disambiguate (e.g. when "mercury" could mean the planet or element).
-        :return: The text result from Wolfram Alpha.
+        :param query: Keyword-style query, single line.
+        :param assumption: Assumption value from a prior result, to disambiguate
+            (e.g. "mercury" = planet vs. element).
+        :return: Text result from Wolfram Alpha.
         """
         log_call(log, "query_wolfram_alpha", query=query, assumption=assumption)
         app_id = (cfg.app_id or "").strip()
