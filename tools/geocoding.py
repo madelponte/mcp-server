@@ -380,23 +380,22 @@ def register(mcp: FastMCP) -> None:
         restaurants in Portland", "pharmacies near me", "museums near here".
 
         Give the location ONE of two ways:
-        - `near`: a place name or address (geocoded for you).
-        - `latitude` + `longitude`: explicit coordinates (used if both are given).
+        - `near`: a place name or address (geocoded for you), or
+        - `latitude` + `longitude`: explicit coordinates (used if both given).
 
         `category` is plain language, not OSM tags: restaurant, coffee, bar,
         supermarket, pharmacy, hospital, atm, bank, gas station, hotel, museum,
-        park, gym, and many more. Prefix a food category with a diet — vegan,
-        vegetarian, halal, kosher, or gluten free ("vegan restaurant", or just
-        "vegan"). An unknown category matches place names, so brands like
+        park, gym, etc. Prefix food with a diet (vegan, vegetarian, halal, kosher,
+        gluten free). Unknown categories match place names, so brands like
         "Starbucks" work too.
 
         :param category: What to look for, in plain language.
         :param near: Place name/address to search around (geocoded for you).
         :param latitude: Search-center latitude (use with longitude).
         :param longitude: Search-center longitude (use with latitude).
-        :param radius_m: Search radius in meters (server-capped); omit for default.
-        :param limit: Max places to return (server-capped); sorted nearest-first.
-        :return: JSON with the resolved `center`, `radius_m`, and a nearest-first
+        :param radius_m: Search radius in meters (capped); omit for default.
+        :param limit: Max places to return (capped); sorted nearest-first.
+        :return: JSON with resolved `center`, `radius_m`, and a nearest-first
             `results` list (name, coordinates, distance_m, category, and
             cuisine/address/phone/website/opening_hours when available).
         """

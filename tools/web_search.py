@@ -739,38 +739,26 @@ def register(mcp: FastMCP) -> None:
         """
         Search the web and return a ranked list of results.
 
-        Use this when you don't already know the answer, the question concerns
-        current events, or you need to verify a fact. Craft a focused query
-        (a few keywords) — do NOT just echo the user's whole prompt. If the
-        first search isn't useful, you may call this again with a refined query.
+        Use when you don't know the answer, need current events, or want to verify
+        a fact. Use a few focused keywords — don't echo the whole prompt. Retry with
+        a refined query if the first isn't useful.
 
-        Each result includes: url, title, snippet, an optional published_date
-        (when the source provides one), and (for the top results) page metadata
-        such as a description and a heading-based outline / JSON-LD table of
-        contents, so you can decide which links are worth fetching in full.
+        Each result has url, title, snippet, optional published_date, and (for top
+        results) page metadata — a description and heading/JSON-LD outline — so you
+        can pick which links to fetch in full.
 
-        :param query: A concise search query (keywords, not a full sentence).
-        :param time_range: Optional recency filter. One of "day", "week",
-            "month", or "year" to restrict results to that window (use "day"
-            for "today"/"latest" news). Pass "all" (or omit) for no time
-            restriction. Defaults to the server's configured value.
-        :param category: Optional SearXNG category to search in, e.g. "general"
-            (default), "news", "science", "it", "social media", "videos",
-            "images", "music", "files", or "map". Use "news" for current-events
-            reporting. Comma-separate to combine categories. Defaults to the
-            server's configured value. NOTE: "map" returns web pages about places,
-            NOT a list of nearby businesses — to find points of interest near a
-            location (restaurants, pharmacies, ATMs, "X near me"), use the
-            find_nearby_places tool instead, which queries OpenStreetMap directly.
-        :param num_results: How many search results to return. Request fewer for
-            a focused lookup, or omit to use the server default. Value is capped by
-            the server.
-        :param enrich_results: How many of the top results to fetch page
-            metadata (description + heading/JSON-LD table-of-contents outline)
-            for. Each outline costs context, so request only as many as you
-            need: pass a small number for a quick scan, 0 to skip enrichment
-            and get just url/title/snippet, or omit to use the server default.
-            Value is capped by the server.
+        :param query: Concise keyword query, not a full sentence.
+        :param time_range: Recency filter: "day" (use for today/latest), "week",
+            "month", "year", or "all"/omit for no limit.
+        :param category: SearXNG category: "general" (default), "news" (current
+            events), "science", "it", "social media", "videos", "images", "music",
+            "files", or "map". Comma-separate to combine. NOTE: "map" returns web
+            pages about places, NOT nearby businesses — to find places near a
+            location ("X near me"), use find_nearby_places instead.
+        :param num_results: Max results to return; omit for server default. Capped.
+        :param enrich_results: How many top results to fetch page metadata
+            (description + outline) for. Each outline costs context — pass a small
+            number, 0 to skip (url/title/snippet only), or omit for default. Capped.
         :return: JSON string of results.
         """
         log_call(
@@ -868,31 +856,24 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def fetch_page(url: str, mode: str = "text", section: str | None = None) -> str:
         """
-        Fetch the contents of a web page (or a URL returned by search_web).
+        Fetch the contents of a web page (or a URL from search_web).
 
         YOUTUBE: pass a YouTube video URL (youtube.com/watch, youtu.be, /shorts/,
-        /embed/, /live/) and this returns the video's TRANSCRIPT instead of the
-        web page — use it whenever you need to summarize, quote, search, or answer
-        questions about a YouTube video. No separate tool is needed.
+        /embed/, /live/) and this returns the video's TRANSCRIPT instead — use it to
+        summarize, quote, or answer questions about a video. No separate tool needed.
 
-        Choose the mode that fits your need:
-        - "text":       plain readable text of the page. Best for reading an
-                        article or extracting facts. Also used automatically for
-                        document links (PDF, Word, Excel, PowerPoint, OpenDocument,
-                        RTF, EPUB), which are extracted via Apache Tika.
-        - "structured": metadata only — title, description, heading outline,
-                        and JSON-LD structured data (schema.org Recipe, HowTo,
-                        Article, etc.).
+        Modes:
+        - "text": readable page text — best for reading an article or extracting
+          facts. Also auto-used for document links (PDF, Word, Excel, PowerPoint,
+          OpenDocument, RTF, EPUB).
+        - "structured": metadata only — title, description, heading outline, and
+          JSON-LD data (schema.org Recipe, HowTo, Article, etc.).
 
-        OPTIONAL: if you already know which section you care about (for example
-        because search_web returned a page_headings outline that listed it),
-        pass the heading text as `section` to get back ONLY that section instead
-        of the whole page. Matching is case-insensitive and tolerant of whitespace;
-        substring matches are accepted as a fallback. `section` only applies to
-        HTML pages — it is ignored for document links (PDF, Office, etc.) and
-        JSON responses (e.g. Reddit).
+        OPTIONAL `section`: if you know which heading you want (e.g. from a
+        search_web outline), pass its text to get back ONLY that section. Matching
+        is case-insensitive. HTML pages only — ignored for documents and JSON.
 
-        :param url: Absolute URL to fetch (http/https).
+        :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract just that section.
         :return: JSON string with the result.
