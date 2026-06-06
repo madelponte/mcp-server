@@ -1,9 +1,10 @@
 """
 MCP server entrypoint.
 
-Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, YouTube Transcript,
-and Geocoding & Place Search tools into a single MCP server. Configuration comes
-entirely from environment variables — see config.py and .env.example.
+Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, and Geocoding &
+Place Search tools into a single MCP server. (YouTube video transcripts are
+served by web_search's fetch_page rather than a standalone tool.) Configuration
+comes entirely from environment variables — see config.py and .env.example.
 
 Run locally:
     python server.py
@@ -17,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
 from config import server_settings
-from tools import web_search, stock_data, wolfram_alpha, youtube_transcript, geocoding
+from tools import web_search, stock_data, wolfram_alpha, geocoding
 
 
 def build_server() -> FastMCP:
@@ -37,19 +38,19 @@ def build_server() -> FastMCP:
     mcp = FastMCP(
         "openwebui-tools",
         instructions=(
-            "Tools for web search & page fetching, stock market data, Wolfram Alpha "
-            "computations, YouTube transcript retrieval, and geocoding & nearby "
-            "place search (OpenStreetMap)."
+            "Tools for web search & page fetching (fetch_page also returns YouTube "
+            "video transcripts), stock market data, Wolfram Alpha computations, and "
+            "geocoding & nearby place search (OpenStreetMap)."
         ),
         host=server_settings.host,
         port=server_settings.port,
     )
 
-    # Register every tool group.
+    # Register every tool group. (YouTube transcripts are handled inside
+    # web_search.fetch_page, not as a separate tool — see tools/youtube_transcript.py.)
     web_search.register(mcp)
     stock_data.register(mcp)
     wolfram_alpha.register(mcp)
-    youtube_transcript.register(mcp)
     geocoding.register(mcp)
 
     return mcp

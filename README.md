@@ -1,9 +1,9 @@
 # openwebui-tools MCP server
 
-A single [MCP](https://modelcontextprotocol.io) server that bundles five tool
-groups (four originally written for Open WebUI), so they can be used from any
+A single [MCP](https://modelcontextprotocol.io) server that bundles four tool
+groups (originally written for Open WebUI), so they can be used from any
 MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
-support, etc.).
+support, etc.). `fetch_page` doubles as a YouTube transcript fetcher.
 
 Built on [FastMCP](https://github.com/modelcontextprotocol/python-sdk). The
 default transport is **streamable-http**, so the server is reachable over the
@@ -16,7 +16,6 @@ network at `http://<host>:8000/mcp`.
 | **Agentic Web Search** | `search_web`, `fetch_page`            |
 | **Stock Data**         | `get_company_data`, `search_symbol`   |
 | **Wolfram Alpha**      | `query_wolfram_alpha`                 |
-| **YouTube Transcript** | `get_youtube_transcript`              |
 | **Place Search**       | `find_nearby_places`                  |
 
 Every tool is context-budget aware: list/range parameters are **maximums**, not
@@ -43,7 +42,11 @@ a URL returned by `search_web`). `mode="text"` returns readable plain text;
 JSON-LD). Document links (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB)
 are extracted via Apache Tika and always returned as text. Passing a `section`
 (a heading from a `page_headings` outline) returns just that section of an HTML
-page instead of the whole thing.
+page instead of the whole thing. A YouTube video URL returns the video's
+transcript rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
+
+Reddit URLs are automatically rewritten to Reddit's `.json` API and returned as
+compacted JSON (post + comments tree) rather than the HTML page.
 
 Fetching is resilient: a direct `httpx` request first, an automatic
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
@@ -94,16 +97,17 @@ Queries should be English keyword-style (`"France population"`, not a full
 sentence). If a result returns assumptions, re-send the same input with the
 relevant `assumption` value to disambiguate.
 
-### YouTube Transcript
+### YouTube transcripts (via `fetch_page`)
 
-`get_youtube_transcript(url, languages=None)` — Fetch a video's transcript /
-closed captions as plain text for summarizing, quoting, searching, or
-translating. Accepts any YouTube URL form (`watch`, `youtu.be`, `/shorts/`,
-`/embed/`, `/live/`) or a bare 11-character video ID. `languages` is an optional
-comma-separated priority list (e.g. `"en,es"`); it falls back to any available
-transcript. Transcripts are cached (they almost never change), and optional
+There is no separate YouTube tool — pass a YouTube video URL to `fetch_page` and
+it returns the video's transcript / closed captions instead of scraping the
+watch page, for summarizing, quoting, searching, or translating. Any YouTube URL
+form works (`watch`, `youtu.be`, `/shorts/`, `/embed/`, `/live/`). Preferred
+languages come from `YOUTUBE_DEFAULT_LANGUAGES` (falling back to any available
+transcript). Transcripts are cached (they almost never change), and optional
 Webshare / generic proxy settings are supported for networks where YouTube
-blocks the server's IP.
+blocks the server's IP. Folding this into `fetch_page` keeps the tool count low,
+which helps smaller models avoid tool-selection paralysis.
 
 ### Place Search
 
@@ -142,12 +146,20 @@ for the full list with defaults. Key things to set:
 
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves `search_symbol` and quote/profile coverage; everything falls back to keyless yfinance).
+- `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 
-- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
+- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
 `WOLFRAM_`, `YOUTUBE_`, `GEO_`.
+
+### Debug mode
+
+Set `MCP_DEBUG=true` to enable debug mode: tool responses are serialized as
+indented, human-readable JSON (instead of compact JSON) and each tool call emits
+verbose per-call logs to stdout. Useful for troubleshooting; leave it off in
+normal operation so responses stay compact in the model's context window.
 
 ### Authentication
 
@@ -214,7 +226,8 @@ python server.py
 ```
 
 Set `MCP_TRANSPORT=stdio` to run as a stdio MCP server instead (useful for
-clients that spawn the process directly rather than connecting over HTTP).
+clients that spawn the process directly rather than connecting over HTTP). Or
+`MCP_TRANSPORT=sse` for SSE (Server-Sent Events) transport.
 
 ## Connecting a client
 

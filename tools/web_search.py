@@ -23,6 +23,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from config import web_search_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result
+from .youtube_transcript import is_youtube_video_url, fetch_transcript
 
 log = logging.getLogger(__name__)
 
@@ -757,7 +758,10 @@ def register(mcp: FastMCP) -> None:
             (default), "news", "science", "it", "social media", "videos",
             "images", "music", "files", or "map". Use "news" for current-events
             reporting. Comma-separate to combine categories. Defaults to the
-            server's configured value.
+            server's configured value. NOTE: "map" returns web pages about places,
+            NOT a list of nearby businesses — to find points of interest near a
+            location (restaurants, pharmacies, ATMs, "X near me"), use the
+            find_nearby_places tool instead, which queries OpenStreetMap directly.
         :param num_results: How many search results to return. Request fewer for
             a focused lookup, or omit to use the server default. Value is capped by
             the server.
@@ -866,6 +870,11 @@ def register(mcp: FastMCP) -> None:
         """
         Fetch the contents of a web page (or a URL returned by search_web).
 
+        YOUTUBE: pass a YouTube video URL (youtube.com/watch, youtu.be, /shorts/,
+        /embed/, /live/) and this returns the video's TRANSCRIPT instead of the
+        web page — use it whenever you need to summarize, quote, search, or answer
+        questions about a YouTube video. No separate tool is needed.
+
         Choose the mode that fits your need:
         - "text":       plain readable text of the page. Best for reading an
                         article or extracting facts. Also used automatically for
@@ -894,6 +903,26 @@ def register(mcp: FastMCP) -> None:
         url = url.strip()
         if not re.match(r"^https?://", url, re.I):
             raise ToolError(f"Invalid URL: {url}")
+
+        # A YouTube video URL has no useful scrapeable page content — the actual
+        # content is the spoken transcript. Detect it and return the transcript
+        # directly (via the YouTube helper) instead of fetching the watch page,
+        # so the model needs only this one tool for both web pages and videos.
+        if is_youtube_video_url(url):
+            transcript = await fetch_transcript(url)
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": url,
+                        "original_url": url,
+                        "status": 200,
+                        "format": "youtube_transcript",
+                        "content": transcript,
+                    }
+                ),
+            )
 
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
