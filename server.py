@@ -1,9 +1,10 @@
 """
 MCP server entrypoint.
 
-Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, YouTube Transcript,
-and Geocoding & Place Search tools into a single MCP server. Configuration comes
-entirely from environment variables — see config.py and .env.example.
+Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, and Geocoding &
+Place Search tools into a single MCP server. (YouTube video transcripts are
+served by web_search's fetch_page rather than a standalone tool.) Configuration
+comes entirely from environment variables — see config.py and .env.example.
 
 Run locally:
     python server.py
@@ -17,28 +18,39 @@ from mcp.server.fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
 from config import server_settings
-from tools import web_search, stock_data, wolfram_alpha, youtube_transcript, geocoding
+from tools import web_search, stock_data, wolfram_alpha, geocoding
 
 
 def build_server() -> FastMCP:
-    logging.basicConfig(level=getattr(logging, server_settings.log_level.upper(), logging.INFO))
+    # Debug mode forces DEBUG-level logging regardless of MCP_LOG_LEVEL so the
+    # verbose per-tool-call logs are actually emitted.
+    level = (
+        logging.DEBUG
+        if server_settings.debug
+        else getattr(logging, server_settings.log_level.upper(), logging.INFO)
+    )
+    logging.basicConfig(level=level)
+    if server_settings.debug:
+        logging.getLogger(__name__).debug(
+            "MCP_DEBUG enabled: pretty-printed JSON output and verbose tool logging are ON."
+        )
 
     mcp = FastMCP(
         "openwebui-tools",
         instructions=(
-            "Tools for web search & page fetching, stock market data, Wolfram Alpha "
-            "computations, YouTube transcript retrieval, and geocoding & nearby "
-            "place search (OpenStreetMap)."
+            "Tools for web search & page fetching (fetch_page also returns YouTube "
+            "video transcripts), stock market data, Wolfram Alpha computations, and "
+            "geocoding & nearby place search (OpenStreetMap)."
         ),
         host=server_settings.host,
         port=server_settings.port,
     )
 
-    # Register every tool group.
+    # Register every tool group. (YouTube transcripts are handled inside
+    # web_search.fetch_page, not as a separate tool — see tools/youtube_transcript.py.)
     web_search.register(mcp)
     stock_data.register(mcp)
     wolfram_alpha.register(mcp)
-    youtube_transcript.register(mcp)
     geocoding.register(mcp)
 
     return mcp
@@ -77,7 +89,7 @@ def run_http(transport: str) -> None:
         app,
         host=server_settings.host,
         port=server_settings.port,
-        log_level=server_settings.log_level.lower(),
+        log_level="debug" if server_settings.debug else server_settings.log_level.lower(),
     )
 
 

@@ -10,6 +10,7 @@ were removed.
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
@@ -21,6 +22,10 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
+from .serialize import to_json, log_call, log_result
+from .youtube_transcript import is_youtube_video_url, fetch_transcript
+
+log = logging.getLogger(__name__)
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -734,37 +739,37 @@ def register(mcp: FastMCP) -> None:
         """
         Search the web and return a ranked list of results.
 
-        Use this when you don't already know the answer, the question concerns
-        current events, or you need to verify a fact. Craft a focused query
-        (a few keywords) — do NOT just echo the user's whole prompt. If the
-        first search isn't useful, you may call this again with a refined query.
+        Use when you don't know the answer, need current events, or want to verify
+        a fact. Use a few focused keywords — don't echo the whole prompt. Retry with
+        a refined query if the first isn't useful.
 
-        Each result includes: url, title, snippet, an optional published_date
-        (when the source provides one), and (for the top results) page metadata
-        such as a description and a heading-based outline / JSON-LD table of
-        contents, so you can decide which links are worth fetching in full.
+        Each result has url, title, snippet, optional published_date, and (for top
+        results) page metadata — a description and heading/JSON-LD outline — so you
+        can pick which links to fetch in full.
 
-        :param query: A concise search query (keywords, not a full sentence).
-        :param time_range: Optional recency filter. One of "day", "week",
-            "month", or "year" to restrict results to that window (use "day"
-            for "today"/"latest" news). Pass "all" (or omit) for no time
-            restriction. Defaults to the server's configured value.
-        :param category: Optional SearXNG category to search in, e.g. "general"
-            (default), "news", "science", "it", "social media", "videos",
-            "images", "music", "files", or "map". Use "news" for current-events
-            reporting. Comma-separate to combine categories. Defaults to the
-            server's configured value.
-        :param num_results: How many search results to return. Request fewer for
-            a focused lookup, or omit to use the server default. Value is capped by
-            the server.
-        :param enrich_results: How many of the top results to fetch page
-            metadata (description + heading/JSON-LD table-of-contents outline)
-            for. Each outline costs context, so request only as many as you
-            need: pass a small number for a quick scan, 0 to skip enrichment
-            and get just url/title/snippet, or omit to use the server default.
-            Value is capped by the server.
+        :param query: Concise keyword query, not a full sentence.
+        :param time_range: Recency filter: "day" (use for today/latest), "week",
+            "month", "year", or "all"/omit for no limit.
+        :param category: SearXNG category: "general" (default), "news" (current
+            events), "science", "it", "social media", "videos", "images", "music",
+            "files", or "map". Comma-separate to combine. NOTE: "map" returns web
+            pages about places, NOT nearby businesses — to find places near a
+            location ("X near me"), use find_nearby_places instead.
+        :param num_results: Max results to return; omit for server default. Capped.
+        :param enrich_results: How many top results to fetch page metadata
+            (description + outline) for. Each outline costs context — pass a small
+            number, 0 to skip (url/title/snippet only), or omit for default. Capped.
         :return: JSON string of results.
         """
+        log_call(
+            log,
+            "search_web",
+            query=query,
+            time_range=time_range,
+            category=category,
+            num_results=num_results,
+            enrich_results=enrich_results,
+        )
         query = (query or "").strip()
         if not query:
             raise ToolError("Empty query.")
@@ -808,7 +813,9 @@ def register(mcp: FastMCP) -> None:
         applied = {"time_range": resolved_time_range or "all", "category": resolved_categories}
 
         if not results:
-            return json.dumps({"query": query, **applied, "results": []})
+            return log_result(
+                log, "search_web", to_json({"query": query, **applied, "results": []})
+            )
 
         for r in results:
             if r.get("snippet"):
@@ -840,44 +847,63 @@ def register(mcp: FastMCP) -> None:
                 if data.get("toc"):
                     results[i]["page_toc"] = data["toc"][:20]
 
-        return json.dumps(
-            {"query": query, **applied, "results": results},
-            ensure_ascii=False,
-            indent=2,
+        return log_result(
+            log,
+            "search_web",
+            to_json({"query": query, **applied, "results": results}),
         )
 
     @mcp.tool()
     async def fetch_page(url: str, mode: str = "text", section: str | None = None) -> str:
         """
-        Fetch the contents of a web page (or a URL returned by search_web).
+        Fetch the contents of a web page (or a URL from search_web).
 
-        Choose the mode that fits your need:
-        - "text":       plain readable text of the page. Best for reading an
-                        article or extracting facts. Also used automatically for
-                        document links (PDF, Word, Excel, PowerPoint, OpenDocument,
-                        RTF, EPUB), which are extracted via Apache Tika.
-        - "structured": metadata only — title, description, heading outline,
-                        and JSON-LD structured data (schema.org Recipe, HowTo,
-                        Article, etc.).
+        YOUTUBE: pass a YouTube video URL (youtube.com/watch, youtu.be, /shorts/,
+        /embed/, /live/) and this returns the video's TRANSCRIPT instead — use it to
+        summarize, quote, or answer questions about a video. No separate tool needed.
 
-        OPTIONAL: if you already know which section you care about (for example
-        because search_web returned a page_headings outline that listed it),
-        pass the heading text as `section` to get back ONLY that section instead
-        of the whole page. Matching is case-insensitive and tolerant of whitespace;
-        substring matches are accepted as a fallback. `section` only applies to
-        HTML pages — it is ignored for document links (PDF, Office, etc.) and
-        JSON responses (e.g. Reddit).
+        Modes:
+        - "text": readable page text — best for reading an article or extracting
+          facts. Also auto-used for document links (PDF, Word, Excel, PowerPoint,
+          OpenDocument, RTF, EPUB).
+        - "structured": metadata only — title, description, heading outline, and
+          JSON-LD data (schema.org Recipe, HowTo, Article, etc.).
 
-        :param url: Absolute URL to fetch (http/https).
+        OPTIONAL `section`: if you know which heading you want (e.g. from a
+        search_web outline), pass its text to get back ONLY that section. Matching
+        is case-insensitive. HTML pages only — ignored for documents and JSON.
+
+        :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract just that section.
         :return: JSON string with the result.
         """
+        log_call(log, "fetch_page", url=url, mode=mode, section=section)
         if not url or not isinstance(url, str):
             raise ToolError("Missing url.")
         url = url.strip()
         if not re.match(r"^https?://", url, re.I):
             raise ToolError(f"Invalid URL: {url}")
+
+        # A YouTube video URL has no useful scrapeable page content — the actual
+        # content is the spoken transcript. Detect it and return the transcript
+        # directly (via the YouTube helper) instead of fetching the watch page,
+        # so the model needs only this one tool for both web pages and videos.
+        if is_youtube_video_url(url):
+            transcript = await fetch_transcript(url)
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": url,
+                        "original_url": url,
+                        "status": 200,
+                        "format": "youtube_transcript",
+                        "content": transcript,
+                    }
+                ),
+            )
 
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
@@ -914,17 +940,20 @@ def register(mcp: FastMCP) -> None:
                 ocr_strategy=cfg.tika_ocr_strategy,
             )
             extracted = _trim(extracted, cfg.max_page_chars)
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype or "application/octet-stream",
-                    "via": via,
-                    "format": "document_text",
-                    "content": extracted,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype or "application/octet-stream",
+                        "via": via,
+                        "format": "document_text",
+                        "content": extracted,
+                    }
+                ),
             )
 
         text = fetched.get("text") or ""
@@ -934,19 +963,21 @@ def register(mcp: FastMCP) -> None:
             try:
                 parsed = json.loads(text)
                 compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
-                dumped = json.dumps(compact, ensure_ascii=False, indent=2)
-                dumped = _trim(dumped, cfg.max_page_chars)
-                return json.dumps(
-                    {
-                        "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype or "application/json",
-                        "via": via,
-                        "format": "json",
-                        "content": dumped,
-                    },
-                    ensure_ascii=False,
+                dumped = _trim(to_json(compact), cfg.max_page_chars)
+                return log_result(
+                    log,
+                    "fetch_page",
+                    to_json(
+                        {
+                            "url": fetch_url,
+                            "original_url": url,
+                            "status": status,
+                            "content_type": ctype or "application/json",
+                            "via": via,
+                            "format": "json",
+                            "content": dumped,
+                        }
+                    ),
                 )
             except Exception:
                 pass
@@ -959,17 +990,20 @@ def register(mcp: FastMCP) -> None:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
             if structured.get("headings"):
                 structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "structured",
-                    "content": structured,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype,
+                        "via": via,
+                        "format": "structured",
+                        "content": structured,
+                    }
+                ),
             )
 
         # mode == "text"
@@ -998,21 +1032,24 @@ def register(mcp: FastMCP) -> None:
 
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
             section_body = _trim(section_body, cfg.max_page_chars)
-            return json.dumps(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "section",
-                    "title": soup_title,
-                    "matched_heading": section_data["matched_heading"],
-                    "level": section_data["level"],
-                    "next_heading": section_data["next_heading"],
-                    "content": section_body,
-                },
-                ensure_ascii=False,
+            return log_result(
+                log,
+                "fetch_page",
+                to_json(
+                    {
+                        "url": fetch_url,
+                        "original_url": url,
+                        "status": status,
+                        "content_type": ctype,
+                        "via": via,
+                        "format": "section",
+                        "title": soup_title,
+                        "matched_heading": section_data["matched_heading"],
+                        "level": section_data["level"],
+                        "next_heading": section_data["next_heading"],
+                        "content": section_body,
+                    }
+                ),
             )
 
         try:
@@ -1029,17 +1066,20 @@ def register(mcp: FastMCP) -> None:
         else:
             note = None
 
-        return json.dumps(
-            {
-                "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype,
-                "via": via,
-                "format": "text",
-                "title": soup_title,
-                "content": plain,
-                "note": note,
-            },
-            ensure_ascii=False,
+        return log_result(
+            log,
+            "fetch_page",
+            to_json(
+                {
+                    "url": fetch_url,
+                    "original_url": url,
+                    "status": status,
+                    "content_type": ctype,
+                    "via": via,
+                    "format": "text",
+                    "title": soup_title,
+                    "content": plain,
+                    "note": note,
+                }
+            ),
         )
