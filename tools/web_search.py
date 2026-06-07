@@ -324,6 +324,128 @@ def _find_section(soup: BeautifulSoup, section: str) -> Optional[dict]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Query (lexical / regex) filtering
+#
+# `fetch_page`'s optional `query` does server-side extractive filtering: rather
+# than returning a whole page (or transcript), it returns only the segments that
+# lexically match the query, each with a little surrounding context. This keeps a
+# long page or video transcript from flooding the model's context window when it
+# only needs the parts about one topic.
+# ---------------------------------------------------------------------------
+
+def _compile_query(query: str) -> re.Pattern:
+    """Compile the model's `query` into a case-insensitive pattern.
+
+    The query may be a plain keyword/phrase or a regular expression. If it isn't
+    valid regex (e.g. unbalanced brackets in `cost (usd)`), fall back to matching
+    it as a literal substring so a naive query still works.
+    """
+    try:
+        return re.compile(query, re.IGNORECASE)
+    except re.error:
+        return re.compile(re.escape(query), re.IGNORECASE)
+
+
+def _segment_text(text: str) -> list[str]:
+    """Split readable text (or a transcript) into the units query matching works on.
+
+    A segment is one line of `_plain_text_from_html` output (≈ a paragraph) or
+    one transcript caption line (which carries its [timestamp] when timestamps
+    are enabled). Blank lines are dropped.
+    """
+    return [s for s in (ln.strip() for ln in text.split("\n")) if s]
+
+
+def _extract_matches(
+    text: str, query: str, *, context: int, max_windows: int
+) -> tuple[list[str], int, int]:
+    """Find segments matching `query` and return them with surrounding context.
+
+    Returns ``(windows, total_matches, total_windows)``. Each window is the
+    matching segment(s) plus ``context`` segments on either side; windows that
+    overlap or sit adjacent are merged so a run of nearby matches reads as one
+    block. ``windows`` holds at most ``max_windows`` of them (the formatted
+    output), while ``total_windows`` counts how many existed before that cap and
+    ``total_matches`` counts every matching segment. ``windows`` is empty when
+    nothing matched.
+    """
+    segments = _segment_text(text)
+    if not segments:
+        return [], 0, 0
+
+    pattern = _compile_query(query)
+    match_idxs = [i for i, seg in enumerate(segments) if pattern.search(seg)]
+    if not match_idxs:
+        return [], 0, 0
+
+    # Expand each match into a [start, end] window, merging into the previous one
+    # when they touch (gap of at most one segment) so adjacent matches don't
+    # produce a string of tiny, overlapping fragments.
+    bounds: list[list[int]] = []
+    for idx in match_idxs:
+        start = max(0, idx - context)
+        end = min(len(segments) - 1, idx + context)
+        if bounds and start <= bounds[-1][1] + 1:
+            bounds[-1][1] = max(bounds[-1][1], end)
+        else:
+            bounds.append([start, end])
+
+    windows = ["\n".join(segments[s : e + 1]) for s, e in bounds[:max_windows]]
+    return windows, len(match_idxs), len(bounds)
+
+
+def _format_match_windows(windows: list[str]) -> str:
+    """Join match windows, separating distinct ones with a labeled marker.
+
+    A single window is returned as-is; multiple windows each get a
+    ``───── match i of N ─────`` header so the model can tell the pieces come
+    from different parts of the page.
+    """
+    if len(windows) == 1:
+        return windows[0]
+    total = len(windows)
+    return "\n\n".join(
+        f"───── match {i} of {total} ─────\n{w}" for i, w in enumerate(windows, 1)
+    )
+
+
+def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
+    """Filter `text` to the segments matching `query`; raise if nothing matches.
+
+    Returns fields to merge into a fetch_page result: the formatted ``content``
+    (match windows joined by labeled separators), the total ``match_count``, the
+    number of ``sections`` (windows) shown, and a ``note`` when some windows were
+    dropped to stay within the cap. ``kind`` names what was searched (e.g.
+    "content", "transcript segment") for the not-found error.
+    """
+    windows, match_count, total_windows = _extract_matches(
+        text,
+        query,
+        context=cfg.query_context_segments,
+        max_windows=cfg.max_query_matches,
+    )
+    if not windows:
+        raise ToolError(
+            f"No {kind} matching query {query!r} found on {url}. "
+            "Try a simpler keyword or a different spelling, loosen the regex, or "
+            "omit `query` to retrieve the full content."
+        )
+    note = None
+    if total_windows > len(windows):
+        note = (
+            f"{total_windows} matching sections found; showing the first "
+            f"{len(windows)}. Refine `query` to narrow the results."
+        )
+    return {
+        "query": query,
+        "match_count": match_count,
+        "sections": len(windows),
+        "content": _format_match_windows(windows),
+        "note": note,
+    }
+
+
 def _structured_from_html(html: str, url: str) -> dict:
     """Return a structured representation of the page."""
     soup = BeautifulSoup(html, "lxml")
@@ -854,7 +976,12 @@ def register(mcp: FastMCP) -> None:
         )
 
     @mcp.tool()
-    async def fetch_page(url: str, mode: str = "text", section: str | None = None) -> str:
+    async def fetch_page(
+        url: str,
+        mode: str = "text",
+        section: str | None = None,
+        query: str | None = None,
+    ) -> str:
         """
         Fetch the contents of a web page (or a URL from search_web).
 
@@ -873,37 +1000,54 @@ def register(mcp: FastMCP) -> None:
         search_web outline), pass its text to get back ONLY that section. Matching
         is case-insensitive. HTML pages only — ignored for documents and JSON.
 
+        OPTIONAL `query`: a keyword/phrase or regex. Returns ONLY matching passages
+        (case-insensitive) plus a little context, not the whole page — pull one
+        topic from a long article, document, or transcript. For YouTube, matches
+        keep their [M:SS] timestamps, so use it to find WHERE a topic is discussed.
+        Multiple hits are split by "── match i of N ──"; no match returns an error.
+        Works on text/documents/transcripts (not JSON); combine with `section`.
+
         :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract just that section.
+        :param query: Optional keyword/phrase/regex to return only matching passages.
         :return: JSON string with the result.
         """
-        log_call(log, "fetch_page", url=url, mode=mode, section=section)
+        log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
         if not url or not isinstance(url, str):
             raise ToolError("Missing url.")
         url = url.strip()
         if not re.match(r"^https?://", url, re.I):
             raise ToolError(f"Invalid URL: {url}")
 
+        query = (query or "").strip() or None
+
         # A YouTube video URL has no useful scrapeable page content — the actual
         # content is the spoken transcript. Detect it and return the transcript
         # directly (via the YouTube helper) instead of fetching the watch page,
         # so the model needs only this one tool for both web pages and videos.
         if is_youtube_video_url(url):
-            transcript = await fetch_transcript(url)
-            return log_result(
-                log,
-                "fetch_page",
-                to_json(
-                    {
-                        "url": url,
-                        "original_url": url,
-                        "status": 200,
-                        "format": "youtube_transcript",
-                        "content": transcript,
-                    }
-                ),
-            )
+            # Force timestamps on when filtering so each matched caption line
+            # carries the [M:SS] marker the caller is usually after.
+            transcript = await fetch_transcript(url, force_timestamps=bool(query))
+            payload = {
+                "url": url,
+                "original_url": url,
+                "status": 200,
+                "format": "youtube_transcript",
+                "content": transcript,
+            }
+            if query:
+                # Keep the metadata header (video id/language/source) for context
+                # and filter only the transcript body that follows the "---" rule.
+                header, sep, body = transcript.partition("\n---\n")
+                qres = _query_payload(
+                    body or transcript, query, url, kind="transcript segment"
+                )
+                filtered = f"{header}{sep}{qres.pop('content')}" if sep else qres.pop("content")
+                payload.update(qres)
+                payload["content"] = filtered
+            return log_result(log, "fetch_page", to_json(payload))
 
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
@@ -939,22 +1083,21 @@ def register(mcp: FastMCP) -> None:
                 timeout=cfg.tika_timeout_seconds,
                 ocr_strategy=cfg.tika_ocr_strategy,
             )
-            extracted = _trim(extracted, cfg.max_page_chars)
-            return log_result(
-                log,
-                "fetch_page",
-                to_json(
-                    {
-                        "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype or "application/octet-stream",
-                        "via": via,
-                        "format": "document_text",
-                        "content": extracted,
-                    }
-                ),
-            )
+            doc_payload = {
+                "url": fetch_url,
+                "original_url": url,
+                "status": status,
+                "content_type": ctype or "application/octet-stream",
+                "via": via,
+                "format": "document_text",
+            }
+            if query:
+                qres = _query_payload(extracted, query, fetch_url, kind="content")
+                doc_payload.update(qres)
+                doc_payload["content"] = _trim(qres["content"], cfg.max_page_chars)
+            else:
+                doc_payload["content"] = _trim(extracted, cfg.max_page_chars)
+            return log_result(log, "fetch_page", to_json(doc_payload))
 
         text = fetched.get("text") or ""
 
@@ -983,7 +1126,9 @@ def register(mcp: FastMCP) -> None:
                 pass
 
         # HTML / text
-        if mode == "structured":
+        # `query` is a content search, so it overrides "structured" (which would
+        # return only metadata); structured mode applies only without a query.
+        if mode == "structured" and not query:
             try:
                 structured = _structured_from_html(text, fetch_url)
             except Exception as e:
@@ -1030,56 +1175,64 @@ def register(mcp: FastMCP) -> None:
                     "the whole page."
                 )
 
-            section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
-            section_body = _trim(section_body, cfg.max_page_chars)
-            return log_result(
-                log,
-                "fetch_page",
-                to_json(
-                    {
-                        "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype,
-                        "via": via,
-                        "format": "section",
-                        "title": soup_title,
-                        "matched_heading": section_data["matched_heading"],
-                        "level": section_data["level"],
-                        "next_heading": section_data["next_heading"],
-                        "content": section_body,
-                    }
-                ),
-            )
+            section_payload = {
+                "url": fetch_url,
+                "original_url": url,
+                "status": status,
+                "content_type": ctype,
+                "via": via,
+                "format": "section",
+                "title": soup_title,
+                "matched_heading": section_data["matched_heading"],
+                "level": section_data["level"],
+                "next_heading": section_data["next_heading"],
+            }
+            # When `query` is also given, search within the matched section.
+            if query:
+                qres = _query_payload(
+                    section_data["text"], query, fetch_url, kind="content in that section"
+                )
+                section_payload.update(qres)
+                section_body = f"# {section_data['matched_heading']}\n\n{qres['content']}".strip()
+            else:
+                section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
+            section_payload["content"] = _trim(section_body, cfg.max_page_chars)
+            return log_result(log, "fetch_page", to_json(section_payload))
 
         try:
             plain = _plain_text_from_html(text)
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-        if soup_title:
-            plain = f"{soup_title}\n\n{plain}"
-        plain = _trim(plain, cfg.max_page_chars)
-
         if fetched.get("blocked_detected") and via == "direct":
             note = "NOTE: page appeared to be Cloudflare-blocked and FlareSolverr fallback did not succeed."
         else:
             note = None
 
-        return log_result(
-            log,
-            "fetch_page",
-            to_json(
-                {
-                    "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype,
-                    "via": via,
-                    "format": "text",
-                    "title": soup_title,
-                    "content": plain,
-                    "note": note,
-                }
-            ),
-        )
+        text_payload = {
+            "url": fetch_url,
+            "original_url": url,
+            "status": status,
+            "content_type": ctype,
+            "via": via,
+            "format": "text",
+            "title": soup_title,
+        }
+
+        if query:
+            qres = _query_payload(plain, query, fetch_url, kind="content")
+            content = qres.pop("content")
+            if soup_title:
+                content = f"{soup_title}\n\n{content}"
+            text_payload.update(qres)
+            text_payload["content"] = _trim(content, cfg.max_page_chars)
+            # A query-filter note takes precedence over the Cloudflare note, but
+            # keep the block warning if there was no truncation note to report.
+            text_payload["note"] = text_payload.get("note") or note
+        else:
+            if soup_title:
+                plain = f"{soup_title}\n\n{plain}"
+            text_payload["content"] = _trim(plain, cfg.max_page_chars)
+            text_payload["note"] = note
+
+        return log_result(log, "fetch_page", to_json(text_payload))
