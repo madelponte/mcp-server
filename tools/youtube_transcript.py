@@ -133,7 +133,9 @@ def _build_client() -> YouTubeTranscriptApi:
     return YouTubeTranscriptApi()
 
 
-async def fetch_transcript(url: str, languages: str | None = None) -> str:
+async def fetch_transcript(
+    url: str, languages: str | None = None, *, force_timestamps: bool = False
+) -> str:
     """Fetch a YouTube video's transcript as plain text (metadata header + body).
 
     This is the shared logic behind web_search.fetch_page's YouTube handling;
@@ -144,6 +146,10 @@ async def fetch_transcript(url: str, languages: str | None = None) -> str:
         /live/) or a bare 11-character video ID.
     :param languages: Optional comma-separated language codes to prefer
         (e.g. "en,es"); falls back to the configured YOUTUBE_DEFAULT_LANGUAGES.
+    :param force_timestamps: When True, prefix each line with its [M:SS]/
+        [H:MM:SS] timestamp even if YOUTUBE_INCLUDE_TIMESTAMPS is off. fetch_page
+        sets this when it's filtering a transcript with `query`, so each matched
+        caption line still carries the timestamp the caller is hunting for.
     :return: The transcript as a single string (optionally with timestamps),
         prefixed by a short metadata header.
     """
@@ -156,7 +162,8 @@ async def fetch_transcript(url: str, languages: str | None = None) -> str:
             code.strip() for code in lang_str.split(",") if code.strip()
         ] or ["en"]
 
-        cache_key = f"{video_id}\x00{','.join(lang_list)}"
+        include_ts = cfg.include_timestamps or force_timestamps
+        cache_key = f"{video_id}\x00{','.join(lang_list)}\x00{int(include_ts)}"
         cached = _transcript_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -193,7 +200,6 @@ async def fetch_transcript(url: str, languages: str | None = None) -> str:
             else ("manually-created" if is_generated is False else "unknown source")
         )
 
-        include_ts = cfg.include_timestamps
         lines: List[str] = []
         for snip in snippets:
             text = (snip.text or "").replace("\n", " ").strip()
