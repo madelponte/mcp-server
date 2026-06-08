@@ -949,7 +949,7 @@ def _fmp_earnings(symbol: str, limit: int) -> dict | None:
 # replaced each repeated that pattern; it now lives in one helper so the
 # consolidated `get_company_data` tool can fetch any mix of sections.
 
-VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "history")
+VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history")
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
@@ -1053,7 +1053,7 @@ _SECTION_FETCHERS = {
     "earnings": _section_earnings,
     "news": _section_news,
     "insiders": _section_insiders,
-    "history": _section_history,
+    "price_history": _section_history,
 }
 
 
@@ -1127,7 +1127,8 @@ def register(mcp: FastMCP) -> None:
         - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
         - "news" — recent articles: headline, source, summary, url, date (`news_items`).
         - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
-        - "history" — daily OHLC price bars, most recent first (`history_bars`).
+        - "price_history" — recent daily price bars (one per trading day: date,
+          open/high/low/close, volume), newest first; `history_bars` sets how many.
 
         Request only what you need — extra sections and long history are slower and
         fill your context. A price check is just ["quote"]; "how's the company doing"
@@ -1138,7 +1139,7 @@ def register(mcp: FastMCP) -> None:
 
         :param symbol: Ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
         :param sections: Any of: quote, profile, financials, earnings, news,
-            insiders, history. Defaults to ["quote", "profile"].
+            insiders, price_history. Defaults to ["quote", "profile"].
         :param statement: "financials" only — "income", "balance", or "cashflow".
         :param period: "financials" only — "annual" or "quarterly".
         :param periods: Historical periods for "financials"/"earnings" (recent
@@ -1146,8 +1147,8 @@ def register(mcp: FastMCP) -> None:
         :param news_items: Articles for "news"; capped, omit for max.
         :param insider_weeks: Weeks of insider activity for "insiders"; capped,
             omit for max.
-        :param history_bars: Daily OHLC bars for "history" (most recent first);
-            capped, omit for max.
+        :param history_bars: How many trading days of "price_history" to return
+            (one bar each); capped, omit for max.
         :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``. On
             partial success an ``"errors"`` map lists sections that returned
             nothing. If every section fails, the call raises an error.
