@@ -197,6 +197,9 @@ class StockSettings(BaseSettings):
     max_insider_lookback_weeks: int = Field(
         12, description="Maximum weeks of insider buying/selling to look back on."
     )
+    max_history_bars: int = Field(
+        30, description="Maximum daily OHLC price-history bars returned."
+    )
 
 
 class WolframSettings(BaseSettings):

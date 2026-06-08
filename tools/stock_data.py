@@ -721,6 +721,50 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
     }
 
 
+def _yfinance_history(symbol: str, bars: int) -> dict | None:
+    """Daily OHLC price history (the lone non-point-in-time section).
+
+    yfinance's ``.history()`` is the cheap source of a price time series;
+    Finnhub/FMP don't offer comparable OHLC bars on their free tiers, so this
+    section is yfinance-only. We request a calendar window wide enough to hold
+    ``bars`` trading days (~5 per 7 calendar days, plus slack for holidays) and
+    keep the most recent ``bars`` rows.
+    """
+    from datetime import date, timedelta
+
+    ticker = _yfinance_ticker(symbol)
+    start = (date.today() - timedelta(days=bars * 2 + 10)).isoformat()
+    try:
+        df = ticker.history(start=start, interval="1d", auto_adjust=False)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+
+    df = df.tail(bars)
+    rows = []
+    for idx, row in df.iterrows():
+        bar_date = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+        rows.append({
+            "date": bar_date,
+            "open": _safe_float(row.get("Open")),
+            "high": _safe_float(row.get("High")),
+            "low": _safe_float(row.get("Low")),
+            "close": _safe_float(row.get("Close")),
+            "volume": _safe_int(row.get("Volume")),
+        })
+    # Most recent first, matching the other history-bearing sections.
+    rows.reverse()
+
+    return {
+        "provider": "yfinance",
+        "symbol": symbol,
+        "interval": "1d",
+        "count": len(rows),
+        "bars": rows,
+    }
+
+
 def _yfinance_search(query: str, limit: int) -> list[dict]:
     """Look up tickers by company name via Yahoo's keyless search endpoint.
 
@@ -905,7 +949,7 @@ def _fmp_earnings(symbol: str, limit: int) -> dict | None:
 # replaced each repeated that pattern; it now lives in one helper so the
 # consolidated `get_company_data` tool can fetch any mix of sections.
 
-VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders")
+VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "history")
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
@@ -992,6 +1036,16 @@ def _section_insiders(symbol: str, opts: dict):
     )
 
 
+def _section_history(symbol: str, opts: dict):
+    # Price history is yfinance-only (Finnhub/FMP have no cheap OHLC bars); the
+    # empty primary map routes every resolved provider to the yfinance fetcher.
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {},
+        _yfinance_history, (symbol, opts["history_bars"]),
+    )
+
+
 _SECTION_FETCHERS = {
     "quote": _section_quote,
     "profile": _section_profile,
@@ -999,6 +1053,7 @@ _SECTION_FETCHERS = {
     "earnings": _section_earnings,
     "news": _section_news,
     "insiders": _section_insiders,
+    "history": _section_history,
 }
 
 
@@ -1010,6 +1065,7 @@ def _gather_sections(
     periods: int | None,
     news_items: int | None,
     insider_weeks: int | None,
+    history_bars: int | None,
 ):
     """Fetch every requested section in one worker thread.
 
@@ -1030,6 +1086,7 @@ def _gather_sections(
         "earnings_periods": _clamp_amount(periods, cfg.max_earnings_periods),
         "news_items": _clamp_amount(news_items, cfg.max_news_items),
         "insider_weeks": _clamp_amount(insider_weeks, cfg.max_insider_lookback_weeks),
+        "history_bars": _clamp_amount(history_bars, cfg.max_history_bars),
     }
     data: dict[str, Any] = {}
     errors: dict[str, list[str]] = {}
@@ -1056,6 +1113,7 @@ def register(mcp: FastMCP) -> None:
         periods: int | None = None,
         news_items: int | None = None,
         insider_weeks: int | None = None,
+        history_bars: int | None = None,
     ) -> str:
         """
         Get company data for a ticker, fetching only the sections you ask for.
@@ -1069,17 +1127,18 @@ def register(mcp: FastMCP) -> None:
         - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
         - "news" — recent articles: headline, source, summary, url, date (`news_items`).
         - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
+        - "history" — daily OHLC price bars, most recent first (`history_bars`).
 
         Request only what you need — extra sections and long history are slower and
         fill your context. A price check is just ["quote"]; "how's the company doing"
         might be ["quote", "profile", "earnings"]. Start small, ask again for more.
 
-        `periods`, `news_items`, `insider_weeks` are capped by server maximums;
-        larger values are clamped, and omitting uses the max.
+        `periods`, `news_items`, `insider_weeks`, `history_bars` are capped by
+        server maximums; larger values are clamped, and omitting uses the max.
 
         :param symbol: Ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
         :param sections: Any of: quote, profile, financials, earnings, news,
-            insiders. Defaults to ["quote", "profile"].
+            insiders, history. Defaults to ["quote", "profile"].
         :param statement: "financials" only — "income", "balance", or "cashflow".
         :param period: "financials" only — "annual" or "quarterly".
         :param periods: Historical periods for "financials"/"earnings" (recent
@@ -1087,6 +1146,8 @@ def register(mcp: FastMCP) -> None:
         :param news_items: Articles for "news"; capped, omit for max.
         :param insider_weeks: Weeks of insider activity for "insiders"; capped,
             omit for max.
+        :param history_bars: Daily OHLC bars for "history" (most recent first);
+            capped, omit for max.
         :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``. On
             partial success an ``"errors"`` map lists sections that returned
             nothing. If every section fails, the call raises an error.
@@ -1101,6 +1162,7 @@ def register(mcp: FastMCP) -> None:
             periods=periods,
             news_items=news_items,
             insider_weeks=insider_weeks,
+            history_bars=history_bars,
         )
         symbol = (symbol or "").strip().upper()
         if not symbol:
@@ -1132,7 +1194,7 @@ def register(mcp: FastMCP) -> None:
 
         data, errors = await anyio.to_thread.run_sync(
             _gather_sections, symbol, normalized, statement, period,
-            periods, news_items, insider_weeks,
+            periods, news_items, insider_weeks, history_bars,
         )
 
         if not data:
