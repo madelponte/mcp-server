@@ -36,14 +36,18 @@ SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
 `enrich_results` controls how many top results get full page metadata (`0`
 skips enrichment).
 
-`fetch_page(url, mode="text", section=None)` — Fetch the contents of a page (or
-a URL returned by `search_web`). `mode="text"` returns readable plain text;
-`mode="structured"` returns metadata only (title, description, heading outline,
-JSON-LD). Document links (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB)
-are extracted via Apache Tika and always returned as text. Passing a `section`
-(a heading from a `page_headings` outline) returns just that section of an HTML
-page instead of the whole thing. A YouTube video URL returns the video's
-transcript rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
+`fetch_page(url, mode="text", section=None, query=None)` — Fetch the contents
+of a page (or a URL returned by `search_web`). `mode="text"` returns readable
+plain text; `mode="structured"` returns metadata only (title, description,
+heading outline, JSON-LD). Document links (PDF, Word, Excel, PowerPoint,
+OpenDocument, RTF, EPUB) are extracted via Apache Tika and always returned as
+text. Passing a `section` (a heading from a `page_headings` outline) returns
+just that section of an HTML page instead of the whole thing. Passing a `query`
+(a keyword, phrase, or regex) returns only the matching passages plus surrounding
+context instead of the full page — useful for pulling one topic from a long
+article, document, or transcript; for YouTube, matched segments keep their
+`[M:SS]` timestamps. A YouTube video URL returns the video's transcript rather
+than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
 
 Reddit URLs are automatically rewritten to Reddit's `.json` API and returned as
 compacted JSON (post + comments tree) rather than the HTML page.
