@@ -17,7 +17,7 @@ WebUI tool; per-user valves and status emitters were removed.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import anyio
 import requests
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 
 # -------------------------- Helpers --------------------------
 
-def _safe_float(v: Any) -> Optional[float]:
+def _safe_float(v: Any) -> float | None:
     try:
         if v is None or v == "":
             return None
@@ -45,7 +45,7 @@ def _safe_float(v: Any) -> Optional[float]:
         return None
 
 
-def _safe_int(v: Any) -> Optional[int]:
+def _safe_int(v: Any) -> int | None:
     try:
         if v is None or v == "":
             return None
@@ -54,7 +54,7 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
-def _ts_to_iso(ts: Optional[int]) -> Optional[str]:
+def _ts_to_iso(ts: int | None) -> str | None:
     if not ts:
         return None
     try:
@@ -63,7 +63,7 @@ def _ts_to_iso(ts: Optional[int]) -> Optional[str]:
         return None
 
 
-def _format_large_number(n: Optional[float]) -> Optional[str]:
+def _format_large_number(n: float | None) -> str | None:
     """Render large numbers like market cap in human-readable form."""
     if n is None:
         return None
@@ -92,7 +92,7 @@ def _retrieval_error(what: str, symbol: str, errors: list[str]) -> str:
     return msg
 
 
-def _clamp_amount(requested: Optional[int], maximum: int) -> int:
+def _clamp_amount(requested: int | None, maximum: int) -> int:
     """Resolve a model-requested range/count against its configured maximum.
 
     ``None`` (the model didn't ask) yields ``maximum``, preserving the old
@@ -118,7 +118,7 @@ def _clamp_amount(requested: Optional[int], maximum: int) -> int:
 _cache = TTLCache(cfg.cache_ttl_seconds)
 
 
-def _http_get_json(url: str, params: Optional[dict] = None) -> Any:
+def _http_get_json(url: str, params: dict | None = None) -> Any:
     cache_key = f"GET::{url}::{json.dumps(params or {}, sort_keys=True)}"
     cached = _cache.get(cache_key)
     if cached is not None:
@@ -160,7 +160,7 @@ def _finnhub_require_key() -> str:
     return cfg.finnhub_api_key
 
 
-def _finnhub_quote(symbol: str) -> Optional[dict]:
+def _finnhub_quote(symbol: str) -> dict | None:
     token = _finnhub_require_key()
     data = _http_get_json("https://finnhub.io/api/v1/quote", {"symbol": symbol, "token": token})
     if not data or all(v in (0, None) for v in (data.get("c"), data.get("o"), data.get("h"))):
@@ -183,7 +183,7 @@ def _finnhub_quote(symbol: str) -> Optional[dict]:
     }
 
 
-def _finnhub_profile(symbol: str) -> Optional[dict]:
+def _finnhub_profile(symbol: str) -> dict | None:
     token = _finnhub_require_key()
     profile = _http_get_json(
         "https://finnhub.io/api/v1/stock/profile2", {"symbol": symbol, "token": token}
@@ -240,7 +240,7 @@ def _finnhub_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _finnhub_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
+def _finnhub_financials(symbol: str, statement: str, period: str, limit: int) -> dict | None:
     token = _finnhub_require_key()
     freq = "annual" if period == "annual" else "quarterly"
     data = _http_get_json(
@@ -273,7 +273,7 @@ def _finnhub_financials(symbol: str, statement: str, period: str, limit: int) ->
     }
 
 
-def _finnhub_earnings(symbol: str, limit: int) -> Optional[dict]:
+def _finnhub_earnings(symbol: str, limit: int) -> dict | None:
     token = _finnhub_require_key()
     data = _http_get_json(
         "https://finnhub.io/api/v1/stock/earnings", {"symbol": symbol, "token": token}
@@ -296,7 +296,7 @@ def _finnhub_earnings(symbol: str, limit: int) -> Optional[dict]:
     return {"provider": "finnhub", "symbol": symbol, "earnings": rows}
 
 
-def _finnhub_news(symbol: str, limit: int) -> Optional[dict]:
+def _finnhub_news(symbol: str, limit: int) -> dict | None:
     token = _finnhub_require_key()
     from datetime import date, timedelta
     today = date.today()
@@ -344,7 +344,7 @@ _INSIDER_TX_CODES = {
 }
 
 
-def _finnhub_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
+def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
     token = _finnhub_require_key()
     from datetime import date, timedelta
     today = date.today()
@@ -430,7 +430,7 @@ def _yfinance_ticker(symbol: str):
     return yf.Ticker(symbol)
 
 
-def _yfinance_quote(symbol: str) -> Optional[dict]:
+def _yfinance_quote(symbol: str) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     try:
         fast = ticker.fast_info or {}
@@ -465,7 +465,7 @@ def _yfinance_quote(symbol: str) -> Optional[dict]:
     }
 
 
-def _yfinance_profile(symbol: str) -> Optional[dict]:
+def _yfinance_profile(symbol: str) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     try:
         info = ticker.info or {}
@@ -531,7 +531,7 @@ def _yfinance_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _yfinance_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
+def _yfinance_financials(symbol: str, statement: str, period: str, limit: int) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     try:
         if statement == "income":
@@ -576,7 +576,7 @@ def _yfinance_financials(symbol: str, statement: str, period: str, limit: int) -
     }
 
 
-def _yfinance_earnings(symbol: str, limit: int) -> Optional[dict]:
+def _yfinance_earnings(symbol: str, limit: int) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     rows = []
     try:
@@ -616,7 +616,7 @@ def _yfinance_earnings(symbol: str, limit: int) -> Optional[dict]:
     return {"provider": "yfinance", "symbol": symbol, "earnings": rows}
 
 
-def _yfinance_news(symbol: str, limit: int) -> Optional[dict]:
+def _yfinance_news(symbol: str, limit: int) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     try:
         news = ticker.news or []
@@ -650,7 +650,7 @@ def _yfinance_news(symbol: str, limit: int) -> Optional[dict]:
     return {"provider": "yfinance", "symbol": symbol, "count": len(articles), "articles": articles}
 
 
-def _yfinance_insider_transactions(symbol: str, weeks: int) -> Optional[dict]:
+def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
     ticker = _yfinance_ticker(symbol)
     try:
         df = ticker.insider_transactions
@@ -754,7 +754,7 @@ def _fmp_require_key() -> str:
     return cfg.fmp_api_key
 
 
-def _fmp_quote(symbol: str) -> Optional[dict]:
+def _fmp_quote(symbol: str) -> dict | None:
     key = _fmp_require_key()
     data = _http_get_json(
         f"https://financialmodelingprep.com/api/v3/quote/{symbol}", {"apikey": key}
@@ -786,7 +786,7 @@ def _fmp_quote(symbol: str) -> Optional[dict]:
     }
 
 
-def _fmp_profile(symbol: str) -> Optional[dict]:
+def _fmp_profile(symbol: str) -> dict | None:
     key = _fmp_require_key()
     data = _http_get_json(
         f"https://financialmodelingprep.com/api/v3/profile/{symbol}", {"apikey": key}
@@ -823,7 +823,7 @@ def _fmp_profile(symbol: str) -> Optional[dict]:
     }
 
 
-def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> Optional[dict]:
+def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> dict | None:
     key = _fmp_require_key()
     endpoint = {
         "income": "income-statement",
@@ -864,7 +864,7 @@ def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> Opt
     }
 
 
-def _fmp_earnings(symbol: str, limit: int) -> Optional[dict]:
+def _fmp_earnings(symbol: str, limit: int) -> dict | None:
     key = _fmp_require_key()
     data = _http_get_json(
         f"https://financialmodelingprep.com/api/v3/historical/earning_calendar/{symbol}",
@@ -909,7 +909,7 @@ VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insider
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
-def _fetch_section(provider: str, primary: dict, yf_fn, args: tuple) -> tuple[Optional[dict], list[str]]:
+def _fetch_section(provider: str, primary: dict, yf_fn, args: tuple) -> tuple[dict | None, list[str]]:
     """Run the provider's fetcher for one section, then fall back to yfinance.
 
     ``primary`` maps a concrete provider name to its fetcher. If the resolved
@@ -923,7 +923,7 @@ def _fetch_section(provider: str, primary: dict, yf_fn, args: tuple) -> tuple[Op
         fn = yf_fn
         provider = "yfinance"
 
-    result: Optional[dict] = None
+    result: dict | None = None
     try:
         result = fn(*args)
     except Exception as e:
@@ -1007,9 +1007,9 @@ def _gather_sections(
     sections: list[str],
     statement: str,
     period: str,
-    periods: Optional[int],
-    news_items: Optional[int],
-    insider_weeks: Optional[int],
+    periods: int | None,
+    news_items: int | None,
+    insider_weeks: int | None,
 ):
     """Fetch every requested section in one worker thread.
 
@@ -1050,12 +1050,12 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def get_company_data(
         symbol: str,
-        sections: Optional[list[str]] = None,
+        sections: list[str] | None = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
-        periods: Optional[int] = None,
-        news_items: Optional[int] = None,
-        insider_weeks: Optional[int] = None,
+        periods: int | None = None,
+        news_items: int | None = None,
+        insider_weeks: int | None = None,
     ) -> str:
         """
         Get company data for a ticker, fetching only the sections you ask for.
@@ -1167,7 +1167,7 @@ def register(mcp: FastMCP) -> None:
         limit = 10
         errors: list[str] = []
         results: list[dict] = []
-        provider: Optional[str] = None
+        provider: str | None = None
 
         if cfg.finnhub_api_key:
             try:
