@@ -134,6 +134,30 @@ class WebSearchSettings(BaseSettings):
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
 
+    # `fetch_page`'s optional `query` does server-side extractive filtering:
+    # it returns only the segments (paragraphs / transcript caption lines) that
+    # lexically match the query, each with this many neighbouring segments of
+    # context on either side. A larger context reads more naturally but costs
+    # more of the model's context window.
+    query_context_segments: int = Field(
+        2,
+        description=(
+            "When fetch_page is given a `query`, how many surrounding segments "
+            "(paragraphs / transcript lines) of context to include on each side "
+            "of a matching segment."
+        ),
+    )
+    # MAXIMUM, not a fixed amount: a context-budget cap on how many distinct
+    # match windows a single filtered fetch_page response may contain.
+    max_query_matches: int = Field(
+        10,
+        description=(
+            "Maximum number of distinct match windows fetch_page's `query` "
+            "filter returns before the remainder are dropped (a context-budget "
+            "cap; the reported match_count still counts every match)."
+        ),
+    )
+
 
 class StockSettings(BaseSettings):
     """Valves for the Stock Data tool."""
