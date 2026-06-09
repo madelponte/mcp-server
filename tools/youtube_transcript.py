@@ -12,7 +12,6 @@ fetch_page uses to route to it.
 import functools
 import logging
 import re
-from typing import List
 from urllib.parse import urlparse, parse_qs
 
 import anyio
@@ -158,7 +157,7 @@ async def fetch_transcript(
         video_id = _extract_video_id(url)
 
         lang_str = languages if languages else cfg.default_languages
-        lang_list: List[str] = [
+        lang_list: list[str] = [
             code.strip() for code in lang_str.split(",") if code.strip()
         ] or ["en"]
 
@@ -200,7 +199,7 @@ async def fetch_transcript(
             else ("manually-created" if is_generated is False else "unknown source")
         )
 
-        lines: List[str] = []
+        lines: list[str] = []
         for snip in snippets:
             text = (snip.text or "").replace("\n", " ").strip()
             if not text:

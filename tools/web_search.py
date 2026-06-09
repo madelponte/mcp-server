@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import httpx
@@ -105,11 +105,11 @@ def _trim(text: str, limit: int) -> str:
 
 
 def _clamp_count(
-    requested: Optional[int],
+    requested: int | None,
     maximum: int,
     *,
     minimum: int,
-    default: Optional[int] = None,
+    default: int | None = None,
 ) -> int:
     """Resolve a model-requested count against its configured maximum.
 
@@ -169,7 +169,7 @@ def _headings_outline(soup: BeautifulSoup, max_items: int = 40) -> list[dict]:
     return outline
 
 
-def _toc_from_jsonld(jsonld: list) -> Optional[list[str]]:
+def _toc_from_jsonld(jsonld: list) -> list[str] | None:
     """Extract useful 'table of contents'-like info from JSON-LD when possible."""
     toc: list[str] = []
 
@@ -200,7 +200,7 @@ def _toc_from_jsonld(jsonld: list) -> Optional[list[str]]:
     return toc or None
 
 
-def _page_title(soup: BeautifulSoup) -> Optional[str]:
+def _page_title(soup: BeautifulSoup) -> str | None:
     if soup.title and soup.title.string:
         return soup.title.string.strip()
     og = soup.find("meta", attrs={"property": "og:title"})
@@ -209,7 +209,7 @@ def _page_title(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def _page_description(soup: BeautifulSoup) -> Optional[str]:
+def _page_description(soup: BeautifulSoup) -> str | None:
     for sel in [
         ("meta", {"name": "description"}),
         ("meta", {"property": "og:description"}),
@@ -240,7 +240,7 @@ def _norm_heading(s: str) -> str:
     return s
 
 
-def _find_section(soup: BeautifulSoup, section: str) -> Optional[dict]:
+def _find_section(soup: BeautifulSoup, section: str) -> dict | None:
     """Locate a heading matching `section` and return text up to the next equal/higher heading."""
     if not section:
         return None
@@ -275,7 +275,7 @@ def _find_section(soup: BeautifulSoup, section: str) -> Optional[dict]:
     matched_text = " ".join(matched.get_text(" ", strip=True).split())
 
     pieces: list[str] = []
-    next_heading_text: Optional[str] = None
+    next_heading_text: str | None = None
 
     for el in matched.find_all_next():
         if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
@@ -589,7 +589,7 @@ async def _resilient_fetch(
     timeout: float,
     user_agent: str,
     verify_ssl: bool,
-    flaresolverr_url: Optional[str],
+    flaresolverr_url: str | None,
     flaresolverr_timeout_ms: int,
 ) -> dict:
     """Try direct httpx; on a Cloudflare wall, retry through FlareSolverr if configured."""
@@ -831,7 +831,7 @@ async def _cached_resilient_fetch(url: str) -> dict:
     return fetched
 
 
-async def _enrich_result(url: Optional[str]) -> Optional[dict]:
+async def _enrich_result(url: str | None) -> dict | None:
     """Fetch a URL just enough to extract structured metadata."""
     if not url:
         return None
