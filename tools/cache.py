@@ -20,7 +20,7 @@ case is a redundant fetch on a cache miss race, never corruption.
 
 import time
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any
 
 
 class TTLCache:
@@ -31,7 +31,7 @@ class TTLCache:
         self.max_entries = max_entries
         self._data: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Any | None:
         """Return the cached value, or None if absent, expired, or caching is off."""
         if self.ttl <= 0:
             return None
