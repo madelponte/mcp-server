@@ -130,7 +130,7 @@ class WebSearchSettings(BaseSettings):
         128, description="Max number of cached pages before the oldest is evicted (0 = unbounded)."
     )
 
-    max_page_chars: int = Field(25000, description="Max characters of page content before truncation.")
+    max_page_chars: int = Field(15000, description="Max characters of page content before truncation.")
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
 

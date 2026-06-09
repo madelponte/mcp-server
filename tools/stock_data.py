@@ -1,13 +1,14 @@
 """
 Stock Data MCP tool.
 
-Exposes two tools:
+Exposes a single tool:
 
 - ``get_company_data(symbol, sections=[...])`` — a single entry point for
-  per-company data. The caller chooses which sections to fetch:
-  ``quote``, ``profile``, ``financials``, ``earnings``, ``news``, ``insiders``.
-- ``search_symbol(query)`` — look up a ticker by company name (Finnhub when
-  keyed, keyless yfinance fallback otherwise).
+  per-company data. ``symbol`` accepts a ticker (``AAPL``) *or* a company name
+  (``Apple``); a name is resolved to its ticker via symbol search before any
+  data is fetched, so the model never has to make a separate lookup call. The
+  caller chooses which sections to fetch: ``quote``, ``profile``,
+  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``.
 
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
@@ -768,9 +769,9 @@ def _yfinance_history(symbol: str, bars: int) -> dict | None:
 def _yfinance_search(query: str, limit: int) -> list[dict]:
     """Look up tickers by company name via Yahoo's keyless search endpoint.
 
-    Backs the no-key fallback for ``search_symbol``. Returns the same
-    ``{symbol, description, type}`` shape as ``_finnhub_search`` so the tool's
-    output is provider-independent.
+    Backs the no-key fallback for symbol resolution. Returns the same
+    ``{symbol, description, type}`` shape as ``_finnhub_search`` so resolution is
+    provider-independent.
     """
     import yfinance as yf
 
@@ -938,6 +939,116 @@ def _fmp_earnings(symbol: str, limit: int) -> dict | None:
         })
 
     return {"provider": "fmp", "symbol": symbol, "earnings": rows}
+
+
+# ===================================================================
+#                       SYMBOL RESOLUTION
+# ===================================================================
+#
+# `get_company_data` accepts either a ticker ("AAPL") or a company name
+# ("Apple"). Resolution folds the old `search_symbol` tool in: a name is looked
+# up and turned into a ticker before any section is fetched, so the model makes
+# one call instead of two.
+
+# Max search hits to consider when resolving a name (also bounds the
+# alternatives surfaced back to the model).
+_SEARCH_LIMIT = 10
+
+
+def _is_special_symbol(s: str) -> bool:
+    """True for concrete non-equity ticker forms — crypto ("BTC-USD"), FX
+    ("EURUSD=X"), indices ("^GSPC"), exchange-suffixed ("RY.TO"). These carry
+    characters a company name never would, and symbol search handles them
+    poorly, so they're passed straight through without a lookup."""
+    return bool(s) and " " not in s and any(c in s for c in "-=^.")
+
+
+def _is_plain_ticker(s: str) -> bool:
+    """True for a short alphanumeric token (AAPL, MSFT). Used only as a graceful
+    fallback: when a name search returns nothing or its providers all fail, an
+    input shaped like this is tried directly rather than erroring out."""
+    return bool(s) and " " not in s and s.isalnum() and len(s) <= 6
+
+
+def _search_symbols(query: str, limit: int) -> tuple[list[dict], list[str], str | None]:
+    """Run symbol search across providers: Finnhub primary (when keyed), keyless
+    yfinance fallback. Returns ``(results, errors, provider)`` where ``provider``
+    is ``None`` only when every provider hard-failed (vs. answered with zero
+    matches). Each result is ``{symbol, description, type}``."""
+    errors: list[str] = []
+    results: list[dict] = []
+    provider: str | None = None
+
+    if cfg.finnhub_api_key:
+        try:
+            results = _finnhub_search(query, limit)
+            provider = "finnhub"
+        except Exception as e:
+            errors.append(f"finnhub: {type(e).__name__}: {e}")
+
+    if not results and (provider is None or cfg.prefer_yfinance_fallback):
+        try:
+            results = _yfinance_search(query, limit)
+            provider = "yfinance"
+        except Exception as e:
+            errors.append(f"yfinance: {type(e).__name__}: {e}")
+
+    return results, errors, provider
+
+
+def _resolve_symbol(raw: str) -> tuple[str, dict | None]:
+    """Resolve a ticker-or-company-name into a concrete ticker symbol.
+
+    Concrete non-equity forms (BTC-USD, ^GSPC, …) pass straight through. Anything
+    else is run through symbol search; an exact ticker match (the input was
+    already a symbol like "AAPL") short-circuits, otherwise the best-matching hit
+    is used. Returns ``(symbol, match)`` where ``match`` is ``None`` for a
+    pass-through / exact ticker, or a dict describing the resolved hit (and up to
+    four alternatives) so the response can tell the model what a name resolved to.
+
+    Raises ``ToolError`` only when a name search finds nothing (and the input
+    isn't itself ticker-shaped) or every search provider hard-fails.
+    """
+    cleaned = (raw or "").strip()
+    if not cleaned:
+        raise ToolError("A ticker symbol or company name is required.")
+    if _is_special_symbol(cleaned):
+        return cleaned.upper(), None
+
+    results, errors, provider = _search_symbols(cleaned, _SEARCH_LIMIT)
+
+    if provider is None:
+        # Search infrastructure is down. If the input already looks like a
+        # ticker, proceed with it directly rather than failing the whole call.
+        if _is_plain_ticker(cleaned):
+            return cleaned.upper(), None
+        raise ToolError(_retrieval_error("symbol search", cleaned, errors))
+
+    if not results:
+        if _is_plain_ticker(cleaned):
+            return cleaned.upper(), None
+        raise ToolError(
+            f"No matching ticker found for '{cleaned}'. Try a different company "
+            "name, or pass the ticker symbol directly."
+        )
+
+    # Prefer an exact symbol match — the input was already a ticker — so a price
+    # check on "AAPL" doesn't get re-labelled as having been "resolved".
+    upper = cleaned.upper()
+    exact = next((r for r in results if (r.get("symbol") or "").upper() == upper), None)
+    if exact:
+        return upper, None
+
+    chosen = results[0]
+    symbol = (chosen.get("symbol") or "").strip().upper()
+    if not symbol:
+        raise ToolError(f"No usable ticker found for '{cleaned}'.")
+
+    match: dict[str, Any] = {"query": cleaned, "provider": provider, "matched": chosen}
+    alternatives = [r for r in results[1:] if r.get("symbol")][:4]
+    if alternatives:
+        match["alternatives"] = alternatives
+    return symbol, match
 
 
 # ===================================================================
@@ -1116,7 +1227,9 @@ def register(mcp: FastMCP) -> None:
         history_bars: int | None = None,
     ) -> str:
         """
-        Get company data for a ticker, fetching only the sections you ask for.
+        Get company data, fetching only the sections you ask for. `symbol` takes
+        a ticker or a company name ("AAPL" or "Apple") — names are resolved to a
+        ticker automatically.
 
         Sections (each adds a block to the response):
         - "quote" — latest price, day's change, open/high/low/prev close, volume.
@@ -1127,31 +1240,31 @@ def register(mcp: FastMCP) -> None:
         - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
         - "news" — recent articles: headline, source, summary, url, date (`news_items`).
         - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
-        - "price_history" — recent daily price bars (one per trading day: date,
-          open/high/low/close, volume), newest first; `history_bars` sets how many.
+        - "price_history" — recent daily price bars (date, open/high/low/close,
+          volume), newest first; `history_bars` sets how many.
 
         Request only what you need — extra sections and long history are slower and
-        fill your context. A price check is just ["quote"]; "how's the company doing"
-        might be ["quote", "profile", "earnings"]. Start small, ask again for more.
+        fill your context. A price check is just ["quote"]; "how's the company
+        doing" might be ["quote", "profile", "earnings"].
 
         `periods`, `news_items`, `insider_weeks`, `history_bars` are capped by
         server maximums; larger values are clamped, and omitting uses the max.
 
-        :param symbol: Ticker symbol (e.g. "AAPL", "MSFT", "TSLA").
+        :param symbol: Ticker or company name ("AAPL", "Apple"). Also crypto
+            ("BTC-USD"), FX ("EURUSD=X"), or indices ("^GSPC") — for these use
+            sections=["quote"]/["price_history"] only.
         :param sections: Any of: quote, profile, financials, earnings, news,
             insiders, price_history. Defaults to ["quote", "profile"].
         :param statement: "financials" only — "income", "balance", or "cashflow".
         :param period: "financials" only — "annual" or "quarterly".
-        :param periods: Historical periods for "financials"/"earnings" (recent
-            first); capped, omit for max.
-        :param news_items: Articles for "news"; capped, omit for max.
-        :param insider_weeks: Weeks of insider activity for "insiders"; capped,
-            omit for max.
-        :param history_bars: How many trading days of "price_history" to return
-            (one bar each); capped, omit for max.
-        :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``. On
-            partial success an ``"errors"`` map lists sections that returned
-            nothing. If every section fails, the call raises an error.
+        :param periods: Periods for "financials"/"earnings" (recent first).
+        :param news_items: Articles for "news".
+        :param insider_weeks: Weeks of insider activity for "insiders".
+        :param history_bars: Trading days of "price_history" (one bar each).
+        :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``;
+            ``symbol`` is the resolved ticker. A resolved name adds a
+            ``"resolved_from"`` block (matched company + alternatives); partial
+            failure adds an ``"errors"`` map. Raises if every section fails.
         """
         log_call(
             log,
@@ -1165,9 +1278,9 @@ def register(mcp: FastMCP) -> None:
             insider_weeks=insider_weeks,
             history_bars=history_bars,
         )
-        symbol = (symbol or "").strip().upper()
-        if not symbol:
-            raise ToolError("Symbol is required.")
+        raw_query = (symbol or "").strip()
+        if not raw_query:
+            raise ToolError("A ticker symbol or company name is required.")
 
         requested = sections if sections else list(DEFAULT_SECTIONS)
         normalized: list[str] = []
@@ -1193,6 +1306,9 @@ def register(mcp: FastMCP) -> None:
         if period not in ("annual", "quarterly"):
             raise ToolError("period must be 'annual' or 'quarterly'")
 
+        # Turn a ticker-or-name into a concrete ticker before fetching anything.
+        symbol, match = await anyio.to_thread.run_sync(_resolve_symbol, raw_query)
+
         data, errors = await anyio.to_thread.run_sync(
             _gather_sections, symbol, normalized, statement, period,
             periods, news_items, insider_weeks, history_bars,
@@ -1205,58 +1321,11 @@ def register(mcp: FastMCP) -> None:
             raise ToolError(_retrieval_error("company data", symbol, flat))
 
         payload: dict[str, Any] = {"symbol": symbol, "sections": normalized, "data": data}
+        if match:
+            # The input was a name (or otherwise non-exact); tell the model what
+            # it resolved to so it can confirm the right company was used.
+            payload["resolved_from"] = match
         if errors:
             # Partial success: report which sections returned nothing and why.
             payload["errors"] = errors
         return log_result(log, "get_company_data", to_json(payload))
-
-    @mcp.tool()
-    async def search_symbol(query: str) -> str:
-        """
-        Find a stock ticker symbol by company name or partial symbol. Use when the
-        user names a company but you don't know its ticker.
-
-        :param query: Company name or partial ticker (e.g. "apple").
-        :return: JSON with matching tickers and company names.
-        """
-        log_call(log, "search_symbol", query=query)
-        query = (query or "").strip()
-        if not query:
-            raise ToolError("Query is required.")
-
-        # Mirror the section dispatch: Finnhub is primary when keyed, with a
-        # yfinance fallback if it errors or returns nothing; with no key we go
-        # straight to the keyless yfinance lookup.
-        limit = 10
-        errors: list[str] = []
-        results: list[dict] = []
-        provider: str | None = None
-
-        if cfg.finnhub_api_key:
-            try:
-                results = await anyio.to_thread.run_sync(_finnhub_search, query, limit)
-                provider = "finnhub"
-            except Exception as e:
-                errors.append(f"finnhub: {type(e).__name__}: {e}")
-
-        if not results and (provider is None or cfg.prefer_yfinance_fallback):
-            try:
-                results = await anyio.to_thread.run_sync(_yfinance_search, query, limit)
-                provider = "yfinance"
-            except Exception as e:
-                errors.append(f"yfinance: {type(e).__name__}: {e}")
-
-        # Only a hard failure of every provider is an error; an empty result set
-        # from a provider that answered is a valid "no matches" outcome.
-        if provider is None:
-            raise ToolError(_retrieval_error("symbol search", query, errors))
-
-        payload = {
-            "query": query,
-            "provider": provider,
-            "count": len(results),
-            "results": results,
-        }
-        if errors:
-            payload["errors"] = errors
-        return log_result(log, "search_symbol", to_json(payload))
