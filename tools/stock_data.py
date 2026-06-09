@@ -1228,27 +1228,25 @@ def register(mcp: FastMCP) -> None:
     ) -> str:
         """
         Get company data, fetching only the sections you ask for. `symbol` takes
-        a ticker or a company name ("AAPL" or "Apple") — names are resolved to a
-        ticker automatically.
+        a ticker or company name ("AAPL" or "Apple"); names resolve to a ticker
+        automatically.
 
-        Sections (each adds a block to the response):
+        Sections (each adds a block):
         - "quote" — latest price, day's change, open/high/low/prev close, volume.
         - "profile" — name, sector, industry, market cap, employees, exchange, and
           fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
-        - "financials" — income statement, balance sheet, or cash flow (set by
-          `statement` and `period`; `periods` sets how many).
+        - "financials" — income/balance/cashflow (`statement`, `period`, `periods`).
         - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
         - "news" — recent articles: headline, source, summary, url, date (`news_items`).
         - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
-        - "price_history" — recent daily price bars (date, open/high/low/close,
-          volume), newest first; `history_bars` sets how many.
+        - "price_history" — recent daily bars (date, OHLC, volume), newest first
+          (`history_bars`).
 
-        Request only what you need — extra sections and long history are slower and
-        fill your context. A price check is just ["quote"]; "how's the company
-        doing" might be ["quote", "profile", "earnings"].
-
-        `periods`, `news_items`, `insider_weeks`, `history_bars` are capped by
-        server maximums; larger values are clamped, and omitting uses the max.
+        Request only what you need — extra sections fill your context. A price
+        check is just ["quote"]; "how's the company doing" might be ["quote",
+        "profile", "earnings"]. The count params (`periods`/`news_items`/
+        `insider_weeks`/`history_bars`) are capped; larger values clamp, omitting
+        uses the max.
 
         :param symbol: Ticker or company name ("AAPL", "Apple"). Also crypto
             ("BTC-USD"), FX ("EURUSD=X"), or indices ("^GSPC") — for these use

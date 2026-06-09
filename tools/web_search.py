@@ -98,10 +98,47 @@ def _normalize_reddit_url(url: str) -> str:
     return urlunparse((p.scheme or "https", host, path, "", p.query, ""))
 
 
-def _trim(text: str, limit: int) -> str:
+def _trim_flagged(text: str, limit: int) -> tuple[str, bool]:
+    """Trim `text` to `limit` chars, also reporting whether anything was dropped.
+
+    Returns ``(text, truncated)``. ``limit <= 0`` disables trimming. The marker
+    appended on truncation keeps the old visible cue in the text itself; the
+    boolean lets callers also flag it structurally on the payload.
+    """
     if limit <= 0 or len(text) <= limit:
-        return text
-    return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]"
+        return text, False
+    return text[:limit].rstrip() + f"\n\n[... truncated at {limit} chars ...]", True
+
+
+def _trim(text: str, limit: int) -> str:
+    return _trim_flagged(text, limit)[0]
+
+
+# Retry hint appended to a fetch_page result whose content had to be truncated to
+# fit cfg.max_page_chars. It points the model at the two ways to pull just the
+# part it needs instead of silently losing the rest or re-fetching the whole page.
+_TRUNCATION_HINT = (
+    "Content was truncated to fit the size limit; the rest was dropped. To get "
+    "more, retry with `query=` (a keyword/phrase or regex — returns only the "
+    "matching passages) or `section=` (a heading — returns only that section)."
+)
+
+
+def _set_content(payload: dict, content: str, *, hint: bool = True) -> None:
+    """Trim `content` to the page-size cap and store it on `payload`.
+
+    When trimming actually dropped text, set ``payload["truncated"] = True`` and
+    (when `hint`) fold the retry hint into ``payload["note"]`` so the model
+    targets the rest with `query=`/`section=` rather than losing it silently.
+    `hint` is False for formats those params can't narrow (e.g. JSON).
+    """
+    trimmed, truncated = _trim_flagged(content, cfg.max_page_chars)
+    payload["content"] = trimmed
+    if truncated:
+        payload["truncated"] = True
+        if hint:
+            existing = payload.get("note")
+            payload["note"] = f"{existing} {_TRUNCATION_HINT}" if existing else _TRUNCATION_HINT
 
 
 def _clamp_count(
@@ -985,27 +1022,28 @@ def register(mcp: FastMCP) -> None:
         """
         Fetch the contents of a web page (or a URL from search_web).
 
-        YOUTUBE: pass a YouTube video URL (youtube.com/watch, youtu.be, /shorts/,
-        /embed/, /live/) and this returns the video's TRANSCRIPT instead — use it to
-        summarize, quote, or answer questions about a video. No separate tool needed.
+        YOUTUBE: a video URL (youtube.com/watch, youtu.be, /shorts/, /embed/,
+        /live/) returns the TRANSCRIPT instead — to summarize, quote, or answer
+        questions about the video. No separate tool needed.
 
         Modes:
-        - "text": readable page text — best for reading an article or extracting
-          facts. Also auto-used for document links (PDF, Word, Excel, PowerPoint,
-          OpenDocument, RTF, EPUB).
+        - "text": readable page text — for reading an article or extracting facts.
+          Also auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
+          RTF, EPUB).
         - "structured": metadata only — title, description, heading outline, and
-          JSON-LD data (schema.org Recipe, HowTo, Article, etc.).
+          JSON-LD (schema.org Recipe, HowTo, Article, etc.).
 
-        OPTIONAL `section`: if you know which heading you want (e.g. from a
-        search_web outline), pass its text to get back ONLY that section. Matching
-        is case-insensitive. HTML pages only — ignored for documents and JSON.
+        Narrow a long page with either (combinable; HTML/text/docs/transcripts,
+        not JSON):
+        - `section`: a heading's text (e.g. from a search_web outline) — returns
+          ONLY that section. Case-insensitive; HTML only.
+        - `query`: a keyword/phrase or regex — returns ONLY matching passages
+          (case-insensitive) plus context. Multiple hits split by "── match i of
+          N ──"; no match errors. YouTube matches keep [M:SS] timestamps, so use
+          it to find WHERE a topic is discussed.
 
-        OPTIONAL `query`: a keyword/phrase or regex. Returns ONLY matching passages
-        (case-insensitive) plus a little context, not the whole page — pull one
-        topic from a long article, document, or transcript. For YouTube, matches
-        keep their [M:SS] timestamps, so use it to find WHERE a topic is discussed.
-        Multiple hits are split by "── match i of N ──"; no match returns an error.
-        Works on text/documents/transcripts (not JSON); combine with `section`.
+        If too long, content is truncated and the result gets `"truncated": true`
+        plus a note; retry with `query=`/`section=` to read the rest.
 
         :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
@@ -1094,9 +1132,9 @@ def register(mcp: FastMCP) -> None:
             if query:
                 qres = _query_payload(extracted, query, fetch_url, kind="content")
                 doc_payload.update(qres)
-                doc_payload["content"] = _trim(qres["content"], cfg.max_page_chars)
+                _set_content(doc_payload, qres["content"])
             else:
-                doc_payload["content"] = _trim(extracted, cfg.max_page_chars)
+                _set_content(doc_payload, extracted)
             return log_result(log, "fetch_page", to_json(doc_payload))
 
         text = fetched.get("text") or ""
@@ -1106,22 +1144,18 @@ def register(mcp: FastMCP) -> None:
             try:
                 parsed = json.loads(text)
                 compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
-                dumped = _trim(to_json(compact), cfg.max_page_chars)
-                return log_result(
-                    log,
-                    "fetch_page",
-                    to_json(
-                        {
-                            "url": fetch_url,
-                            "original_url": url,
-                            "status": status,
-                            "content_type": ctype or "application/json",
-                            "via": via,
-                            "format": "json",
-                            "content": dumped,
-                        }
-                    ),
-                )
+                json_payload = {
+                    "url": fetch_url,
+                    "original_url": url,
+                    "status": status,
+                    "content_type": ctype or "application/json",
+                    "via": via,
+                    "format": "json",
+                }
+                # query=/section= can't narrow JSON, so flag truncation without
+                # the retry hint that points at them.
+                _set_content(json_payload, to_json(compact), hint=False)
+                return log_result(log, "fetch_page", to_json(json_payload))
             except Exception:
                 pass
 
@@ -1196,7 +1230,7 @@ def register(mcp: FastMCP) -> None:
                 section_body = f"# {section_data['matched_heading']}\n\n{qres['content']}".strip()
             else:
                 section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
-            section_payload["content"] = _trim(section_body, cfg.max_page_chars)
+            _set_content(section_payload, section_body)
             return log_result(log, "fetch_page", to_json(section_payload))
 
         try:
@@ -1225,14 +1259,14 @@ def register(mcp: FastMCP) -> None:
             if soup_title:
                 content = f"{soup_title}\n\n{content}"
             text_payload.update(qres)
-            text_payload["content"] = _trim(content, cfg.max_page_chars)
             # A query-filter note takes precedence over the Cloudflare note, but
-            # keep the block warning if there was no truncation note to report.
+            # keep the block warning if there was no query note to report.
             text_payload["note"] = text_payload.get("note") or note
+            _set_content(text_payload, content)
         else:
             if soup_title:
                 plain = f"{soup_title}\n\n{plain}"
-            text_payload["content"] = _trim(plain, cfg.max_page_chars)
             text_payload["note"] = note
+            _set_content(text_payload, plain)
 
         return log_result(log, "fetch_page", to_json(text_payload))
