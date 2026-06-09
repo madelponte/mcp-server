@@ -14,7 +14,7 @@ network at `http://<host>:8000/mcp`.
 | Tool group             | MCP tools exposed                     |
 | ---------------------- | ------------------------------------- |
 | **Agentic Web Search** | `search_web`, `fetch_page`            |
-| **Stock Data**         | `get_company_data`, `search_symbol`   |
+| **Stock Data**         | `get_company_data`                    |
 | **Wolfram Alpha**      | `query_wolfram_alpha`                 |
 | **Place Search**       | `find_nearby_places`                  |
 
@@ -59,8 +59,11 @@ re-fetches the same URL skips the network round-trip.
 
 ### Stock Data
 
-`get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None)`
-— One ticker, only the sections you ask for. Available `sections`:
+`get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None, history_bars=None)`
+— One company, only the sections you ask for. `symbol` accepts a ticker
+(`AAPL`) **or** a company name (`Apple`); a name is resolved to its ticker via
+symbol search before any data is fetched, so there's no separate lookup step.
+Available `sections`:
 
 - `quote` — latest price, day's change, open/high/low/previous close, volume.
 - `profile` — name, sector, industry, market cap, employees, exchange, and key
@@ -74,22 +77,24 @@ re-fetches the same URL skips the network round-trip.
   `news_items` sets how many to return.
 - `insiders` — insider buying/selling with a buy/sell summary and individual
   transactions. `insider_weeks` sets how far back to look.
+- `price_history` — recent daily OHLC price bars (newest first); `history_bars`
+  sets how many trading days to return.
 
 Defaults to `["quote", "profile"]` when `sections` is omitted. Data is sourced
 across providers (Finnhub / yfinance / FMP) with optional yfinance fallback. On
 partial success the response includes an `errors` map listing sections that
 returned nothing; if every requested section fails, the call raises an error so
-a failure is never mistaken for data.
-
-`search_symbol(query)` — Look up a ticker by company name or partial symbol
-(e.g. `"apple"` → `AAPL`). Uses Finnhub when a key is configured, otherwise
-falls back to a keyless Yahoo Finance lookup.
+a failure is never mistaken for data. When `symbol` was a company name, the
+response includes a `resolved_from` block naming the matched company (and any
+alternatives) so you can confirm the right ticker was used.
 
 > **Note:** earlier versions exposed `get_stock_quote`, `get_company_profile`,
-> `get_financials`, `get_earnings`, and `get_company_news` as separate tools.
-> These are now folded into the single `get_company_data` tool via the
-> `sections` parameter, which keeps the tool count low (better for smaller
-> models' tool selection) and lets one call fetch several sections at once.
+> `get_financials`, `get_earnings`, `get_company_news`, and `search_symbol` as
+> separate tools. These are now folded into the single `get_company_data` tool —
+> the data tools via the `sections` parameter, and `search_symbol` via automatic
+> name→ticker resolution on the `symbol` argument. This keeps the tool count low
+> (better for smaller models' tool selection) and lets one call do what used to
+> take two or more.
 
 ### Wolfram Alpha
 
@@ -149,7 +154,7 @@ See [.env.example](https://github.com/madelponte/mcp-server/blob/main/.env.examp
 for the full list with defaults. Key things to set:
 
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
-- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves `search_symbol` and quote/profile coverage; everything falls back to keyless yfinance).
+- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 

@@ -243,6 +243,27 @@ def _primary_category(tags: dict) -> str | None:
 
 # ------------------------------- Nominatim -------------------------------
 
+# Relative location references a model may pass as `near`, echoing a user's
+# "near me" / "near here". This server has no user location, so these can't be
+# geocoded — Nominatim would just fail to find a place called "me". We catch them
+# up front and return an actionable error instead of that opaque failure.
+_RELATIVE_LOCATION_TERMS = frozenset({
+    "me", "here", "near me", "near here", "nearby", "near by", "around me",
+    "around here", "close to me", "close by", "my location",
+    "my current location", "current location", "this location", "my position",
+    "current position", "where i am", "where i m", "my area", "my city",
+    "you", "your location", "your area",
+})
+
+
+def _is_relative_location(near: str) -> bool:
+    """True if `near` is a relative reference (me/here/nearby/…) rather than an
+    actual place. Strips punctuation and collapses whitespace before matching so
+    quoting and spacing don't slip a variant past the check."""
+    cleaned = " ".join(re.sub(r"[^\w\s]", " ", near.lower()).split())
+    return cleaned in _RELATIVE_LOCATION_TERMS
+
+
 async def _geocode(query: str, limit: int) -> list[dict]:
     """Geocode a free-text query via Nominatim. Returns a (possibly empty) list
     of matches. Raises ToolError only on a real failure (network / bad status)."""
@@ -377,11 +398,14 @@ def register(mcp: FastMCP) -> None:
     ) -> str:
         """
         Find points of interest near a location via OpenStreetMap — e.g. "vegan
-        restaurants in Portland", "pharmacies near me", "museums near here".
+        restaurants in Portland", "pharmacies in Berlin", "museums near the Louvre".
 
         Give the location ONE of two ways:
-        - `near`: a place name or address (geocoded for you), or
+        - `near`: an explicit place name or address (geocoded for you), or
         - `latitude` + `longitude`: explicit coordinates (used if both given).
+
+        This server has no access to the user's location, if the user
+        says "near me", ask them where before calling, or pass coordinates.
 
         `category` is plain language, not OSM tags: restaurant, coffee, bar,
         supermarket, pharmacy, hospital, atm, bank, gas station, hotel, museum,
@@ -390,7 +414,8 @@ def register(mcp: FastMCP) -> None:
         "Starbucks" work too.
 
         :param category: What to look for, in plain language.
-        :param near: Place name/address to search around (geocoded for you).
+        :param near: Explicit place name/address to search around (geocoded for
+            you).
         :param latitude: Search-center latitude (use with longitude).
         :param longitude: Search-center longitude (use with latitude).
         :param radius_m: Search radius in meters (capped); omit for default.
@@ -417,6 +442,13 @@ def register(mcp: FastMCP) -> None:
         if latitude is not None and longitude is not None:
             lat, lon = float(latitude), float(longitude)
         elif near and near.strip():
+            if _is_relative_location(near):
+                raise ToolError(
+                    f"'{near.strip()}' is a relative location, and this server "
+                    "has no access to the user's location. Ask the user which "
+                    "place to search and pass it as `near` (e.g. 'Portland, OR'), "
+                    "or pass `latitude` and `longitude` directly."
+                )
             matches = await _geocode(near, 1)
             if not matches:
                 raise ToolError(
