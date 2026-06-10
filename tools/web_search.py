@@ -1043,7 +1043,7 @@ def register(mcp: FastMCP) -> None:
 
         Each result has url, title, snippet, optional published_date, and (for top
         results) page metadata (description + heading/JSON-LD outline) to help pick
-        which to fetch in full.
+        which to fetch in full using the fetch_page tool.
 
         :param query: Concise keyword query, not a sentence.
         :param time_range: Recency filter: "day" (today/latest), "week", "month",
