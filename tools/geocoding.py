@@ -401,11 +401,11 @@ def register(mcp: FastMCP) -> None:
         restaurants in Portland", "pharmacies in Berlin", "museums near the Louvre".
 
         Give the location ONE of two ways:
-        - `near`: an explicit place name or address (geocoded for you), or
+        - `near`: a place name or address (geocoded for you), or
         - `latitude` + `longitude`: explicit coordinates (used if both given).
 
-        This server has no access to the user's location, if the user
-        says "near me", ask them where before calling, or pass coordinates.
+        This server can't access the user's location. If the user says "near me",
+        ask where before calling, or pass coordinates.
 
         `category` is plain language, not OSM tags: restaurant, coffee, bar,
         supermarket, pharmacy, hospital, atm, bank, gas station, hotel, museum,
@@ -414,8 +414,7 @@ def register(mcp: FastMCP) -> None:
         "Starbucks" work too.
 
         :param category: What to look for, in plain language.
-        :param near: Explicit place name/address to search around (geocoded for
-            you).
+        :param near: Place name/address to search around (geocoded for you).
         :param latitude: Search-center latitude (use with longitude).
         :param longitude: Search-center longitude (use with latitude).
         :param radius_m: Search radius in meters (capped); omit for default.

@@ -1244,7 +1244,7 @@ def register(mcp: FastMCP) -> None:
 
         Request only what you need — extra sections fill your context. A price
         check is just ["quote"]; "how's the company doing" might be ["quote",
-        "profile", "earnings"]. The count params (`periods`/`news_items`/
+        "profile", "earnings"]. Count params (`periods`/`news_items`/
         `insider_weeks`/`history_bars`) are capped; larger values clamp, omitting
         uses the max.
 

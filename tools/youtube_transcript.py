@@ -58,7 +58,9 @@ def _extract_video_id(url_or_id: str) -> str:
         s = "https://" + s
 
     parsed = urlparse(s)
-    host = (parsed.hostname or "").lower().lstrip("www.")
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
     path = parsed.path or ""
 
     if host == "youtu.be":

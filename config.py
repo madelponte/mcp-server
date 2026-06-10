@@ -118,6 +118,15 @@ class WebSearchSettings(BaseSettings):
     http_timeout_seconds: float = Field(25.0, description="HTTP timeout for fetches, in seconds.")
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
     user_agent: str = Field(DEFAULT_UA, description="User-Agent sent with direct fetches.")
+    ssrf_allowlist: str = Field(
+        "",
+        description=(
+            "Comma/space-separated hosts, IPs, or CIDRs that bypass the SSRF guard "
+            "so fetch_page may reach a trusted local/private page you host "
+            "(e.g. 'localhost,127.0.0.1,192.168.1.50,10.0.0.0/8'). Applies to "
+            "redirect targets too. Empty = block all non-public addresses."
+        ),
+    )
 
     cache_ttl_seconds: int = Field(
         300,

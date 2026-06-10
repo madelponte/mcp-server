@@ -57,6 +57,16 @@ Fetching is resilient: a direct `httpx` request first, an automatic
 Cloudflare-blocked pages, and a short page cache so an agent loop that
 re-fetches the same URL skips the network round-trip.
 
+Fetching is also SSRF-guarded. Because a URL can come from search results or page
+content the model just read, it's attacker-influenceable via indirect prompt
+injection — so `fetch_page` resolves the target host and **refuses any non-public
+address** (loopback, private, link-local, etc.), blocking access to `localhost`,
+cloud metadata endpoints like `169.254.169.254`, and LAN hosts. The check is
+applied to the initial URL *and* every redirect hop (a public URL can't `302`
+into an internal one) and gates the FlareSolverr path too. To deliberately allow
+a trusted local/private target you host, list its host, IP, or CIDR in
+`WEB_SEARCH_SSRF_ALLOWLIST` (e.g. `localhost,127.0.0.1,10.0.0.0/8`).
+
 ### Stock Data
 
 `get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None, history_bars=None)`
@@ -134,6 +144,11 @@ unrecognized category falls back to matching place names, so brands like
 plus useful tags (cuisine, address, phone, website, opening hours) when
 available. An empty `results` list means nothing matched in range (not an error).
 
+The server has no access to the user's location, so a relative `near` value
+("near me", "nearby", "around here", etc.) is refused with a message telling the
+model to ask the user where to search or pass explicit coordinates — rather than
+silently guessing a location.
+
 It uses the public OpenStreetMap APIs by default and honors Nominatim's
 [usage policy](https://operations.osmfoundation.org/policies/nominatim/): a
 descriptive `GEO_USER_AGENT` (set this!) and a ~1 req/sec throttle on the public
@@ -157,6 +172,7 @@ for the full list with defaults. Key things to set:
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
+- `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 
 - `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 

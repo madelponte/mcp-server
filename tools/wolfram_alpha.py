@@ -35,13 +35,14 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def query_wolfram_alpha(query: str, assumption: str | None = None) -> str:
         """
-        Compute or look up exact factual data with Wolfram Alpha: math, unit/currency
-        conversions, physics, chemistry, astronomy, geography, demographics, dates &
-        times, finance, nutrition, weather history, and entity comparisons.
+        Compute or look up exact factual data with Wolfram Alpha: math,
+        unit/currency conversions, physics, chemistry, astronomy, geography,
+        demographics, dates & times, finance, nutrition, weather history, entity
+        comparisons.
 
         Query rules:
-        - Use keyword style, not sentences: "France population", not "how many
-          people live in France".
+        - Keyword style, not sentences: "France population", not "how many people
+          live in France".
         - Math: single-letter variables (n, x), exponents like 6*10^14 (not 6e14),
           named constants ("speed of light") not raw numbers.
         - One property per call.
@@ -52,7 +53,7 @@ def register(mcp: FastMCP) -> None:
 
         :param query: Keyword-style query, single line.
         :param assumption: Assumption value from a prior result, to disambiguate
-            (e.g. "mercury" = planet vs. element).
+            (e.g. "mercury" planet vs. element).
         :return: Text result from Wolfram Alpha.
         """
         log_call(log, "query_wolfram_alpha", query=query, assumption=assumption)

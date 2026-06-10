@@ -9,9 +9,12 @@ were removed.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
+import socket
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -22,7 +25,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result
+from .serialize import to_json, log_call, log_result, debug_enabled
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 
 log = logging.getLogger(__name__)
@@ -578,10 +581,100 @@ def _tika_extract(
 # Fetching (with FlareSolverr fallback)
 # ---------------------------------------------------------------------------
 
+# SSRF guard. The model's URLs can come from search results or page content it
+# just read, so an attacker can use indirect prompt injection to steer a fetch at
+# internal targets — cloud metadata (169.254.169.254), localhost, or LAN hosts.
+# We resolve the host and refuse any non-publicly-routable address, on the
+# initial URL AND every redirect hop (follow_redirects can otherwise 302 a public
+# URL into a private one). Cap redirects while we follow them by hand. Operators
+# can opt specific hosts/IPs/CIDRs back in via WEB_SEARCH_SSRF_ALLOWLIST.
+MAX_REDIRECTS = 20
+
+
+class SSRFError(RuntimeError):
+    """A fetch target's host resolved to a non-public (blocked) address."""
+
+
+@lru_cache(maxsize=8)
+def _parse_allowlist(raw: str) -> tuple[frozenset[str], tuple[Any, ...]]:
+    """Parse WEB_SEARCH_SSRF_ALLOWLIST into (hostnames, ip-networks).
+
+    Entries are comma/whitespace-separated; each is either an IP/CIDR (matched
+    against resolved addresses) or a hostname (matched verbatim against the URL
+    host, case-insensitive). Cached since the raw string is a fixed config value.
+    """
+    hosts: set[str] = set()
+    nets: list = []
+    for item in re.split(r"[,\s]+", raw.strip()):
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            hosts.add(item.lower())
+    return frozenset(hosts), tuple(nets)
+
+
+def _ip_of(addr: str):
+    """Parse a resolved address into an ip_address, unwrapping IPv4-mapped IPv6
+    (e.g. ::ffff:169.254.169.254) so the v4 rules apply. None if unparseable."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])  # drop any IPv6 scope id
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def _addr_is_blocked(addr: str, allowed_nets: tuple = ()) -> bool:
+    """True if `addr` is not a globally-routable public IP (loopback, private,
+    link-local, reserved, CGNAT, …) and not covered by an allowlisted network —
+    or unparseable, in which case refuse."""
+    ip = _ip_of(addr)
+    if ip is None:
+        return True
+    if ip.is_global:
+        return False
+    return not any(ip.version == n.version and ip in n for n in allowed_nets)
+
+
+async def _assert_url_allowed(url: str) -> None:
+    """Raise SSRFError unless `url` is http(s) and its host is allowed: either
+    explicitly allowlisted, or resolving only to public addresses. Resolution is
+    offloaded so the event loop isn't blocked."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFError(f"Refusing non-http(s) URL: {url!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise SSRFError(f"Refusing URL with no host: {url!r}")
+    allowed_hosts, allowed_nets = _parse_allowlist(cfg.ssrf_allowlist)
+    if host.lower() in allowed_hosts:
+        return
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except socket.gaierror as e:
+        raise SSRFError(f"Could not resolve host {host!r}: {e}")
+    blocked = sorted(
+        {info[4][0] for info in infos if _addr_is_blocked(info[4][0], allowed_nets)}
+    )
+    if blocked:
+        raise SSRFError(
+            f"Refusing to fetch {host!r}: resolves to non-public address(es) "
+            f"{', '.join(blocked)} (allowlist via WEB_SEARCH_SSRF_ALLOWLIST)"
+        )
+
+
 async def _httpx_fetch(
     url: str, timeout: float, user_agent: str, verify_ssl: bool
 ) -> tuple[int, dict, bytes, str]:
-    """Direct fetch via httpx. Returns (status, headers, body_bytes, content_type)."""
+    """Direct fetch via httpx. Returns (status, headers, body_bytes, content_type).
+
+    Redirects are followed by hand (not httpx's follow_redirects) so each hop's
+    target passes the SSRF guard before we connect to it. The caller validates
+    the initial URL; here we re-validate every redirect destination.
+    """
     headers = {
         "User-Agent": user_agent,
         "Accept": (
@@ -591,11 +684,19 @@ async def _httpx_fetch(
         "Accept-Language": "en-US,en;q=0.9",
     }
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=timeout, verify=verify_ssl, headers=headers
+        follow_redirects=False, timeout=timeout, verify=verify_ssl, headers=headers
     ) as client:
-        resp = await client.get(url)
-        ctype = resp.headers.get("content-type", "")
-        return resp.status_code, dict(resp.headers), resp.content, ctype
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            resp = await client.get(current)
+            location = resp.headers.get("location")
+            if resp.is_redirect and location:
+                current = str(resp.url.join(location))
+                await _assert_url_allowed(current)
+                continue
+            ctype = resp.headers.get("content-type", "")
+            return resp.status_code, dict(resp.headers), resp.content, ctype
+    raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
 async def _flaresolverr_fetch(
@@ -630,10 +731,18 @@ async def _resilient_fetch(
     flaresolverr_timeout_ms: int,
 ) -> dict:
     """Try direct httpx; on a Cloudflare wall, retry through FlareSolverr if configured."""
+    # SSRF guard the initial URL before EITHER fetch path. FlareSolverr is the
+    # more dangerous one (it renders in real Chrome and runs JS), so the check
+    # must gate it too — hence here, not inside _httpx_fetch.
+    await _assert_url_allowed(url)
     try:
         status, headers, body, ctype = await _httpx_fetch(
             url, timeout=timeout, user_agent=user_agent, verify_ssl=verify_ssl
         )
+    except SSRFError:
+        # A redirect hop resolved to a blocked host — refuse outright rather than
+        # handing the same URL to FlareSolverr, which would follow it in-browser.
+        raise
     except Exception as e:
         if flaresolverr_url:
             try:
@@ -886,6 +995,36 @@ async def _enrich_result(url: str | None) -> dict | None:
     return _structured_from_html(text, url)
 
 
+def _provenance(
+    url: str,
+    fetch_url: str,
+    status: int | None,
+    ctype: str | None,
+    via: str | None,
+) -> dict:
+    """Diagnostic fetch fields (original_url / status / content_type / via) to
+    splice into a fetch_page payload.
+
+    On the happy path — HTTP 200, a direct fetch, and an un-rewritten URL — these
+    just burn the model's context window, so they're omitted. They reappear only
+    when something the model should know about deviated from that path (a non-200
+    status, a FlareSolverr fallback, a rewritten URL), or when MCP_DEBUG forces
+    the full picture for troubleshooting.
+    """
+    debug = debug_enabled()
+    out: dict = {}
+    if debug or fetch_url != url:
+        out["original_url"] = url
+    error = status is not None and status != 200
+    if debug or error:
+        out["status"] = status
+        if ctype is not None:
+            out["content_type"] = ctype
+    if via is not None and (debug or via != "direct"):
+        out["via"] = via
+    return out
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def search_web(
@@ -896,28 +1035,27 @@ def register(mcp: FastMCP) -> None:
         enrich_results: int | None = None,
     ) -> str:
         """
-        Search the web and return a ranked list of results.
+        Search the web; returns ranked results.
 
         Use when you don't know the answer, need current events, or want to verify
-        a fact. Use a few focused keywords — don't echo the whole prompt. Retry with
-        a refined query if the first isn't useful.
+        a fact. Pass a few focused keywords, not the whole prompt; refine and retry
+        if results aren't useful.
 
         Each result has url, title, snippet, optional published_date, and (for top
-        results) page metadata — a description and heading/JSON-LD outline — so you
-        can pick which links to fetch in full.
+        results) page metadata (description + heading/JSON-LD outline) to help pick
+        which to fetch in full using the fetch_page tool.
 
-        :param query: Concise keyword query, not a full sentence.
-        :param time_range: Recency filter: "day" (use for today/latest), "week",
-            "month", "year", or "all"/omit for no limit.
-        :param category: SearXNG category: "general" (default), "news" (current
-            events), "science", "it", "social media", "videos", "images", "music",
-            "files", or "map". Comma-separate to combine. NOTE: "map" returns web
-            pages about places, NOT nearby businesses — to find places near a
-            location ("X near me"), use find_nearby_places instead.
-        :param num_results: Max results to return; omit for server default. Capped.
-        :param enrich_results: How many top results to fetch page metadata
-            (description + outline) for. Each outline costs context — pass a small
-            number, 0 to skip (url/title/snippet only), or omit for default. Capped.
+        :param query: Concise keyword query, not a sentence.
+        :param time_range: Recency filter: "day" (today/latest), "week", "month",
+            "year", or "all"/omit for no limit.
+        :param category: SearXNG category: "general" (default), "news", "science",
+            "it", "social media", "videos", "images", "music", "files", "map".
+            Comma-separate to combine. NOTE: "map" returns web pages ABOUT places,
+            not nearby businesses — for "X near me" use find_nearby_places.
+        :param num_results: Max results; omit for server default. Capped.
+        :param enrich_results: How many top results to fetch page metadata for.
+            Each outline costs context — pass a small number, 0 to skip
+            (url/title/snippet only), or omit for default. Capped.
         :return: JSON string of results.
         """
         log_call(
@@ -1049,7 +1187,7 @@ def register(mcp: FastMCP) -> None:
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract just that section.
         :param query: Optional keyword/phrase/regex to return only matching passages.
-        :return: JSON string with the result.
+        :return: JSON string with the result
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
         if not url or not isinstance(url, str):
@@ -1070,8 +1208,7 @@ def register(mcp: FastMCP) -> None:
             transcript = await fetch_transcript(url, force_timestamps=bool(query))
             payload = {
                 "url": url,
-                "original_url": url,
-                "status": 200,
+                **_provenance(url, url, 200, None, None),
                 "format": "youtube_transcript",
                 "content": transcript,
             }
@@ -1123,10 +1260,7 @@ def register(mcp: FastMCP) -> None:
             )
             doc_payload = {
                 "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype or "application/octet-stream",
-                "via": via,
+                **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),
                 "format": "document_text",
             }
             if query:
@@ -1146,10 +1280,7 @@ def register(mcp: FastMCP) -> None:
                 compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
                 json_payload = {
                     "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype or "application/json",
-                    "via": via,
+                    **_provenance(url, fetch_url, status, ctype or "application/json", via),
                     "format": "json",
                 }
                 # query=/section= can't narrow JSON, so flag truncation without
@@ -1175,10 +1306,7 @@ def register(mcp: FastMCP) -> None:
                 to_json(
                     {
                         "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype,
-                        "via": via,
+                        **_provenance(url, fetch_url, status, ctype, via),
                         "format": "structured",
                         "content": structured,
                     }
@@ -1211,10 +1339,7 @@ def register(mcp: FastMCP) -> None:
 
             section_payload = {
                 "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype,
-                "via": via,
+                **_provenance(url, fetch_url, status, ctype, via),
                 "format": "section",
                 "title": soup_title,
                 "matched_heading": section_data["matched_heading"],
@@ -1245,10 +1370,7 @@ def register(mcp: FastMCP) -> None:
 
         text_payload = {
             "url": fetch_url,
-            "original_url": url,
-            "status": status,
-            "content_type": ctype,
-            "via": via,
+            **_provenance(url, fetch_url, status, ctype, via),
             "format": "text",
             "title": soup_title,
         }
