@@ -10,7 +10,7 @@ httpx>=0.28
 anyio>=4.13
 
 # Agentic Web Search
-beautifulsoup4>=4.14
+beautifulsoup4>=4.15
 lxml>=6.1
 
 # Stock Data
