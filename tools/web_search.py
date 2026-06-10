@@ -9,9 +9,12 @@ were removed.
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
+import socket
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -578,10 +581,100 @@ def _tika_extract(
 # Fetching (with FlareSolverr fallback)
 # ---------------------------------------------------------------------------
 
+# SSRF guard. The model's URLs can come from search results or page content it
+# just read, so an attacker can use indirect prompt injection to steer a fetch at
+# internal targets — cloud metadata (169.254.169.254), localhost, or LAN hosts.
+# We resolve the host and refuse any non-publicly-routable address, on the
+# initial URL AND every redirect hop (follow_redirects can otherwise 302 a public
+# URL into a private one). Cap redirects while we follow them by hand. Operators
+# can opt specific hosts/IPs/CIDRs back in via WEB_SEARCH_SSRF_ALLOWLIST.
+MAX_REDIRECTS = 20
+
+
+class SSRFError(RuntimeError):
+    """A fetch target's host resolved to a non-public (blocked) address."""
+
+
+@lru_cache(maxsize=8)
+def _parse_allowlist(raw: str) -> tuple[frozenset[str], tuple[Any, ...]]:
+    """Parse WEB_SEARCH_SSRF_ALLOWLIST into (hostnames, ip-networks).
+
+    Entries are comma/whitespace-separated; each is either an IP/CIDR (matched
+    against resolved addresses) or a hostname (matched verbatim against the URL
+    host, case-insensitive). Cached since the raw string is a fixed config value.
+    """
+    hosts: set[str] = set()
+    nets: list = []
+    for item in re.split(r"[,\s]+", raw.strip()):
+        if not item:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            hosts.add(item.lower())
+    return frozenset(hosts), tuple(nets)
+
+
+def _ip_of(addr: str):
+    """Parse a resolved address into an ip_address, unwrapping IPv4-mapped IPv6
+    (e.g. ::ffff:169.254.169.254) so the v4 rules apply. None if unparseable."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])  # drop any IPv6 scope id
+    except ValueError:
+        return None
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def _addr_is_blocked(addr: str, allowed_nets: tuple = ()) -> bool:
+    """True if `addr` is not a globally-routable public IP (loopback, private,
+    link-local, reserved, CGNAT, …) and not covered by an allowlisted network —
+    or unparseable, in which case refuse."""
+    ip = _ip_of(addr)
+    if ip is None:
+        return True
+    if ip.is_global:
+        return False
+    return not any(ip.version == n.version and ip in n for n in allowed_nets)
+
+
+async def _assert_url_allowed(url: str) -> None:
+    """Raise SSRFError unless `url` is http(s) and its host is allowed: either
+    explicitly allowlisted, or resolving only to public addresses. Resolution is
+    offloaded so the event loop isn't blocked."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise SSRFError(f"Refusing non-http(s) URL: {url!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise SSRFError(f"Refusing URL with no host: {url!r}")
+    allowed_hosts, allowed_nets = _parse_allowlist(cfg.ssrf_allowlist)
+    if host.lower() in allowed_hosts:
+        return
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except socket.gaierror as e:
+        raise SSRFError(f"Could not resolve host {host!r}: {e}")
+    blocked = sorted(
+        {info[4][0] for info in infos if _addr_is_blocked(info[4][0], allowed_nets)}
+    )
+    if blocked:
+        raise SSRFError(
+            f"Refusing to fetch {host!r}: resolves to non-public address(es) "
+            f"{', '.join(blocked)} (allowlist via WEB_SEARCH_SSRF_ALLOWLIST)"
+        )
+
+
 async def _httpx_fetch(
     url: str, timeout: float, user_agent: str, verify_ssl: bool
 ) -> tuple[int, dict, bytes, str]:
-    """Direct fetch via httpx. Returns (status, headers, body_bytes, content_type)."""
+    """Direct fetch via httpx. Returns (status, headers, body_bytes, content_type).
+
+    Redirects are followed by hand (not httpx's follow_redirects) so each hop's
+    target passes the SSRF guard before we connect to it. The caller validates
+    the initial URL; here we re-validate every redirect destination.
+    """
     headers = {
         "User-Agent": user_agent,
         "Accept": (
@@ -591,11 +684,19 @@ async def _httpx_fetch(
         "Accept-Language": "en-US,en;q=0.9",
     }
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=timeout, verify=verify_ssl, headers=headers
+        follow_redirects=False, timeout=timeout, verify=verify_ssl, headers=headers
     ) as client:
-        resp = await client.get(url)
-        ctype = resp.headers.get("content-type", "")
-        return resp.status_code, dict(resp.headers), resp.content, ctype
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            resp = await client.get(current)
+            location = resp.headers.get("location")
+            if resp.is_redirect and location:
+                current = str(resp.url.join(location))
+                await _assert_url_allowed(current)
+                continue
+            ctype = resp.headers.get("content-type", "")
+            return resp.status_code, dict(resp.headers), resp.content, ctype
+    raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
 async def _flaresolverr_fetch(
@@ -630,10 +731,18 @@ async def _resilient_fetch(
     flaresolverr_timeout_ms: int,
 ) -> dict:
     """Try direct httpx; on a Cloudflare wall, retry through FlareSolverr if configured."""
+    # SSRF guard the initial URL before EITHER fetch path. FlareSolverr is the
+    # more dangerous one (it renders in real Chrome and runs JS), so the check
+    # must gate it too — hence here, not inside _httpx_fetch.
+    await _assert_url_allowed(url)
     try:
         status, headers, body, ctype = await _httpx_fetch(
             url, timeout=timeout, user_agent=user_agent, verify_ssl=verify_ssl
         )
+    except SSRFError:
+        # A redirect hop resolved to a blocked host — refuse outright rather than
+        # handing the same URL to FlareSolverr, which would follow it in-browser.
+        raise
     except Exception as e:
         if flaresolverr_url:
             try:
