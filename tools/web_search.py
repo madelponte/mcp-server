@@ -22,7 +22,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result
+from .serialize import to_json, log_call, log_result, debug_enabled
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 
 log = logging.getLogger(__name__)
@@ -886,6 +886,36 @@ async def _enrich_result(url: str | None) -> dict | None:
     return _structured_from_html(text, url)
 
 
+def _provenance(
+    url: str,
+    fetch_url: str,
+    status: int | None,
+    ctype: str | None,
+    via: str | None,
+) -> dict:
+    """Diagnostic fetch fields (original_url / status / content_type / via) to
+    splice into a fetch_page payload.
+
+    On the happy path — HTTP 200, a direct fetch, and an un-rewritten URL — these
+    just burn the model's context window, so they're omitted. They reappear only
+    when something the model should know about deviated from that path (a non-200
+    status, a FlareSolverr fallback, a rewritten URL), or when MCP_DEBUG forces
+    the full picture for troubleshooting.
+    """
+    debug = debug_enabled()
+    out: dict = {}
+    if debug or fetch_url != url:
+        out["original_url"] = url
+    error = status is not None and status != 200
+    if debug or error:
+        out["status"] = status
+        if ctype is not None:
+            out["content_type"] = ctype
+    if via is not None and (debug or via != "direct"):
+        out["via"] = via
+    return out
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def search_web(
@@ -896,28 +926,27 @@ def register(mcp: FastMCP) -> None:
         enrich_results: int | None = None,
     ) -> str:
         """
-        Search the web and return a ranked list of results.
+        Search the web; returns ranked results.
 
         Use when you don't know the answer, need current events, or want to verify
-        a fact. Use a few focused keywords — don't echo the whole prompt. Retry with
-        a refined query if the first isn't useful.
+        a fact. Pass a few focused keywords, not the whole prompt; refine and retry
+        if results aren't useful.
 
         Each result has url, title, snippet, optional published_date, and (for top
-        results) page metadata — a description and heading/JSON-LD outline — so you
-        can pick which links to fetch in full.
+        results) page metadata (description + heading/JSON-LD outline) to help pick
+        which to fetch in full.
 
-        :param query: Concise keyword query, not a full sentence.
-        :param time_range: Recency filter: "day" (use for today/latest), "week",
-            "month", "year", or "all"/omit for no limit.
-        :param category: SearXNG category: "general" (default), "news" (current
-            events), "science", "it", "social media", "videos", "images", "music",
-            "files", or "map". Comma-separate to combine. NOTE: "map" returns web
-            pages about places, NOT nearby businesses — to find places near a
-            location ("X near me"), use find_nearby_places instead.
-        :param num_results: Max results to return; omit for server default. Capped.
-        :param enrich_results: How many top results to fetch page metadata
-            (description + outline) for. Each outline costs context — pass a small
-            number, 0 to skip (url/title/snippet only), or omit for default. Capped.
+        :param query: Concise keyword query, not a sentence.
+        :param time_range: Recency filter: "day" (today/latest), "week", "month",
+            "year", or "all"/omit for no limit.
+        :param category: SearXNG category: "general" (default), "news", "science",
+            "it", "social media", "videos", "images", "music", "files", "map".
+            Comma-separate to combine. NOTE: "map" returns web pages ABOUT places,
+            not nearby businesses — for "X near me" use find_nearby_places.
+        :param num_results: Max results; omit for server default. Capped.
+        :param enrich_results: How many top results to fetch page metadata for.
+            Each outline costs context — pass a small number, 0 to skip
+            (url/title/snippet only), or omit for default. Capped.
         :return: JSON string of results.
         """
         log_call(
@@ -1027,28 +1056,27 @@ def register(mcp: FastMCP) -> None:
         questions about the video. No separate tool needed.
 
         Modes:
-        - "text": readable page text — for reading an article or extracting facts.
-          Also auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
+        - "text": readable page text — to read an article or extract facts.
+          Auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
           RTF, EPUB).
-        - "structured": metadata only — title, description, heading outline, and
+        - "structured": metadata only — title, description, heading outline,
           JSON-LD (schema.org Recipe, HowTo, Article, etc.).
 
-        Narrow a long page with either (combinable; HTML/text/docs/transcripts,
-        not JSON):
-        - `section`: a heading's text (e.g. from a search_web outline) — returns
-          ONLY that section. Case-insensitive; HTML only.
+        Narrow a long page (combinable; HTML/text/docs/transcripts, not JSON):
+        - `section`: a heading's text — returns ONLY that section.
+          Case-insensitive, HTML only.
         - `query`: a keyword/phrase or regex — returns ONLY matching passages
-          (case-insensitive) plus context. Multiple hits split by "── match i of
-          N ──"; no match errors. YouTube matches keep [M:SS] timestamps, so use
-          it to find WHERE a topic is discussed.
+          plus context. Multiple hits split by "── match i of N ──"; no match
+          errors. YouTube matches keep [M:SS] timestamps, so use it to find WHERE
+          a topic is discussed.
 
-        If too long, content is truncated and the result gets `"truncated": true`
-        plus a note; retry with `query=`/`section=` to read the rest.
+        If too long, content is truncated with `"truncated": true` and a note;
+        retry with `query=`/`section=` for the rest.
 
         :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
-        :param section: Optional heading text to extract just that section.
-        :param query: Optional keyword/phrase/regex to return only matching passages.
+        :param section: Heading text to extract just that section.
+        :param query: Keyword/phrase/regex to return only matching passages.
         :return: JSON string with the result.
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
@@ -1070,8 +1098,7 @@ def register(mcp: FastMCP) -> None:
             transcript = await fetch_transcript(url, force_timestamps=bool(query))
             payload = {
                 "url": url,
-                "original_url": url,
-                "status": 200,
+                **_provenance(url, url, 200, None, None),
                 "format": "youtube_transcript",
                 "content": transcript,
             }
@@ -1123,10 +1150,7 @@ def register(mcp: FastMCP) -> None:
             )
             doc_payload = {
                 "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype or "application/octet-stream",
-                "via": via,
+                **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),
                 "format": "document_text",
             }
             if query:
@@ -1146,10 +1170,7 @@ def register(mcp: FastMCP) -> None:
                 compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
                 json_payload = {
                     "url": fetch_url,
-                    "original_url": url,
-                    "status": status,
-                    "content_type": ctype or "application/json",
-                    "via": via,
+                    **_provenance(url, fetch_url, status, ctype or "application/json", via),
                     "format": "json",
                 }
                 # query=/section= can't narrow JSON, so flag truncation without
@@ -1175,10 +1196,7 @@ def register(mcp: FastMCP) -> None:
                 to_json(
                     {
                         "url": fetch_url,
-                        "original_url": url,
-                        "status": status,
-                        "content_type": ctype,
-                        "via": via,
+                        **_provenance(url, fetch_url, status, ctype, via),
                         "format": "structured",
                         "content": structured,
                     }
@@ -1211,10 +1229,7 @@ def register(mcp: FastMCP) -> None:
 
             section_payload = {
                 "url": fetch_url,
-                "original_url": url,
-                "status": status,
-                "content_type": ctype,
-                "via": via,
+                **_provenance(url, fetch_url, status, ctype, via),
                 "format": "section",
                 "title": soup_title,
                 "matched_heading": section_data["matched_heading"],
@@ -1245,10 +1260,7 @@ def register(mcp: FastMCP) -> None:
 
         text_payload = {
             "url": fetch_url,
-            "original_url": url,
-            "status": status,
-            "content_type": ctype,
-            "via": via,
+            **_provenance(url, fetch_url, status, ctype, via),
             "format": "text",
             "title": soup_title,
         }
