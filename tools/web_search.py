@@ -1165,28 +1165,29 @@ def register(mcp: FastMCP) -> None:
         questions about the video. No separate tool needed.
 
         Modes:
-        - "text": readable page text — to read an article or extract facts.
-          Auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
+        - "text": readable page text — for reading an article or extracting facts.
+          Also auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
           RTF, EPUB).
-        - "structured": metadata only — title, description, heading outline,
+        - "structured": metadata only — title, description, heading outline, and
           JSON-LD (schema.org Recipe, HowTo, Article, etc.).
 
-        Narrow a long page (combinable; HTML/text/docs/transcripts, not JSON):
-        - `section`: a heading's text — returns ONLY that section.
-          Case-insensitive, HTML only.
+        Narrow a long page with either (combinable; HTML/text/docs/transcripts,
+        not JSON):
+        - `section`: a heading's text (e.g. from a search_web outline) — returns
+          ONLY that section. Case-insensitive; HTML only.
         - `query`: a keyword/phrase or regex — returns ONLY matching passages
-          plus context. Multiple hits split by "── match i of N ──"; no match
-          errors. YouTube matches keep [M:SS] timestamps, so use it to find WHERE
-          a topic is discussed.
+          (case-insensitive) plus context. Multiple hits split by "── match i of
+          N ──"; no match errors. YouTube matches keep [M:SS] timestamps, so use
+          it to find WHERE a topic is discussed.
 
-        If too long, content is truncated with `"truncated": true` and a note;
-        retry with `query=`/`section=` for the rest.
+        If too long, content is truncated and the result gets `"truncated": true`
+        plus a note; retry with `query=`/`section=` to read the rest.
 
         :param url: Absolute http/https URL.
         :param mode: "text" or "structured".
-        :param section: Heading text to extract just that section.
-        :param query: Keyword/phrase/regex to return only matching passages.
-        :return: JSON string with the result.
+        :param section: Optional heading text to extract just that section.
+        :param query: Optional keyword/phrase/regex to return only matching passages.
+        :return: JSON string with the result
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
         if not url or not isinstance(url, str):
