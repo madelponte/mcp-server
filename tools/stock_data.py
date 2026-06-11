@@ -1226,43 +1226,27 @@ def register(mcp: FastMCP) -> None:
         insider_weeks: int | None = None,
         history_bars: int | None = None,
     ) -> str:
-        """
-        Get company data, fetching only the sections you ask for. `symbol` takes
-        a ticker or company name ("AAPL" or "Apple"); names resolve to a ticker
-        automatically.
+        """Get stock/company data. symbol=ticker or name (auto-resolved).
 
-        Sections (each adds a block):
-        - "quote" — latest price, day's change, open/high/low/prev close, volume.
-        - "profile" — name, sector, industry, market cap, employees, exchange, and
-          fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
-        - "financials" — income/balance/cashflow (`statement`, `period`, `periods`).
-        - "earnings" — actual vs. estimated EPS, surprise %, revenue (`periods`).
-        - "news" — recent articles: headline, source, summary, url, date (`news_items`).
-        - "insiders" — insider buy/sell summary and transactions (`insider_weeks`).
-        - "price_history" — recent daily bars (date, OHLC, volume), newest first
-          (`history_bars`).
+        sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
+        "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
+        "insiders"(buy/sell txns)|"price_history"(daily OHLC bars). Params:
+        statement(income|balance|cashflow), period(annual|quarterly), periods,
+        news_items, insider_weeks, history_bars (all capped; omit=max).
 
-        Request only what you need — extra sections fill your context. A price
-        check is just ["quote"]; "how's the company doing" might be ["quote",
-        "profile", "earnings"]. Count params (`periods`/`news_items`/
-        `insider_weeks`/`history_bars`) are capped; larger values clamp, omitting
-        uses the max.
+        Use for: current price, company fundamentals, financial statements,
+        earnings reports, recent news, insider trading, price charts. Crypto/
+        FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
 
-        :param symbol: Ticker or company name ("AAPL", "Apple"). Also crypto
-            ("BTC-USD"), FX ("EURUSD=X"), or indices ("^GSPC") — for these use
-            sections=["quote"]/["price_history"] only.
-        :param sections: Any of: quote, profile, financials, earnings, news,
-            insiders, price_history. Defaults to ["quote", "profile"].
-        :param statement: "financials" only — "income", "balance", or "cashflow".
-        :param period: "financials" only — "annual" or "quarterly".
-        :param periods: Periods for "financials"/"earnings" (recent first).
-        :param news_items: Articles for "news".
-        :param insider_weeks: Weeks of insider activity for "insiders".
-        :param history_bars: Trading days of "price_history" (one bar each).
-        :return: JSON ``{"symbol", "sections", "data": {<section>: {...}}}``;
-            ``symbol`` is the resolved ticker. A resolved name adds a
-            ``"resolved_from"`` block (matched company + alternatives); partial
-            failure adds an ``"errors"`` map. Raises if every section fails.
+        :param symbol: Ticker or company name.
+        :param sections: Sections to fetch (default: quote,profile).
+        :param statement: Financials statement type.
+        :param period: Annual or quarterly.
+        :param periods: Count for financials/earnings.
+        :param news_items: Article count.
+        :param insider_weeks: Lookback weeks.
+        :param history_bars: Daily bars count.
+        :return: JSON {symbol,sections,data:{...},resolved_from?,errors?}.
         """
         log_call(
             log,

@@ -396,32 +396,24 @@ def register(mcp: FastMCP) -> None:
         radius_m: int | None = None,
         limit: int | None = None,
     ) -> str:
-        """
-        Find points of interest near a location via OpenStreetMap — e.g. "vegan
-        restaurants in Portland", "pharmacies in Berlin", "museums near the Louvre".
+        """Find nearby places via OpenStreetMap (Overpass + Nominatim).
 
-        Give the location ONE of two ways:
-        - `near`: a place name or address (geocoded for you), or
-        - `latitude` + `longitude`: explicit coordinates (used if both given).
+        Location: near="city/address" (auto-geocoded) OR latitude+longitude.
+        NO "near me" access—ask user for location if needed. category: plain
+        language (restaurant/coffee/bar/supermarket/pharmacy/hospital/atm/
+        bank/gas station/hotel/museum/park/gym/etc). Prefix food with diet
+        (vegan/vegetarian/halal/kosher/gluten-free). Unknown categories match
+        names (e.g., "Starbucks"). radius_m/limit: capped; omit=default.
 
-        This server can't access the user's location. If the user says "near me",
-        ask where before calling, or pass coordinates.
-
-        `category` is plain language, not OSM tags: restaurant, coffee, bar,
-        supermarket, pharmacy, hospital, atm, bank, gas station, hotel, museum,
-        park, gym, etc. Prefix food with a diet (vegan, vegetarian, halal, kosher,
-        gluten free). Unknown categories match place names, so brands like
-        "Starbucks" work too.
-
-        :param category: What to look for, in plain language.
-        :param near: Place name/address to search around (geocoded for you).
-        :param latitude: Search-center latitude (use with longitude).
-        :param longitude: Search-center longitude (use with latitude).
-        :param radius_m: Search radius in meters (capped); omit for default.
-        :param limit: Max places to return (capped); sorted nearest-first.
-        :return: JSON with resolved `center`, `radius_m`, and a nearest-first
-            `results` list (name, coordinates, distance_m, category, and
-            cuisine/address/phone/website/opening_hours when available).
+        :param category: What to find (plain language).
+        :param near: Place/address (geocoded).
+        :param latitude: Coords (with longitude).
+        :param longitude: Coords (with latitude).
+        :param radius_m: Search radius (meters, capped).
+        :param limit: Max results (capped, nearest-first).
+        :return: JSON {query_category,center:{latitude,longitude,name?},
+            radius_m,count,results:[{name,latitude,longitude,distance_m,
+            category,cuisine?,address?,opening_hours?,phone?,website?}]}
         """
         log_call(
             log,
