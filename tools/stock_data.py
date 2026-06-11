@@ -8,7 +8,9 @@ Exposes a single tool:
   (``Apple``); a name is resolved to its ticker via symbol search before any
   data is fetched, so the model never has to make a separate lookup call. The
   caller chooses which sections to fetch: ``quote``, ``profile``,
-  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``.
+  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``,
+  ``sector_comparison`` (the last compares the company's P/E to its sector and
+  industry averages and is FMP-only).
 
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
@@ -793,37 +795,47 @@ def _yfinance_search(query: str, limit: int) -> list[dict]:
 #                       PROVIDER: FMP
 # ===================================================================
 
+# FMP retired its legacy `/api/v3` and `/api/v4` endpoints for API keys issued
+# after 2025-08-31; `/stable` is the current API. All FMP access goes through
+# `_fmp_get` so the base URL and key injection live in one place.
+_FMP_STABLE = "https://financialmodelingprep.com/stable"
+
+
 def _fmp_require_key() -> str:
     if not cfg.fmp_api_key:
         raise RuntimeError("FMP API key not configured.")
     return cfg.fmp_api_key
 
 
+def _fmp_get(path: str, params: dict | None = None) -> Any:
+    """GET an FMP `/stable` endpoint with the API key injected."""
+    merged = dict(params or {})
+    merged["apikey"] = _fmp_require_key()
+    return _http_get_json(f"{_FMP_STABLE}/{path}", merged)
+
+
 def _fmp_quote(symbol: str) -> dict | None:
-    key = _fmp_require_key()
-    data = _http_get_json(
-        f"https://financialmodelingprep.com/api/v3/quote/{symbol}", {"apikey": key}
-    )
+    data = _fmp_get("quote", {"symbol": symbol})
     if not data or not isinstance(data, list):
         return None
     q = data[0]
+    market_cap = _safe_float(q.get("marketCap"))
     return {
         "provider": "fmp",
         "symbol": symbol,
         "name": q.get("name"),
         "price": _safe_float(q.get("price")),
         "change": _safe_float(q.get("change")),
-        "change_percent": _safe_float(q.get("changesPercentage")),
+        "change_percent": _safe_float(q.get("changePercentage")),
         "open": _safe_float(q.get("open")),
         "high": _safe_float(q.get("dayHigh")),
         "low": _safe_float(q.get("dayLow")),
         "previous_close": _safe_float(q.get("previousClose")),
         "volume": _safe_int(q.get("volume")),
-        "avg_volume": _safe_int(q.get("avgVolume")),
-        "market_cap": _safe_float(q.get("marketCap")),
-        "market_cap_formatted": _format_large_number(_safe_float(q.get("marketCap"))),
-        "pe": _safe_float(q.get("pe")),
-        "eps": _safe_float(q.get("eps")),
+        "market_cap": market_cap,
+        "market_cap_formatted": _format_large_number(market_cap),
+        "50_day_avg": _safe_float(q.get("priceAvg50")),
+        "200_day_avg": _safe_float(q.get("priceAvg200")),
         "52_week_high": _safe_float(q.get("yearHigh")),
         "52_week_low": _safe_float(q.get("yearLow")),
         "exchange": q.get("exchange"),
@@ -832,19 +844,16 @@ def _fmp_quote(symbol: str) -> dict | None:
 
 
 def _fmp_profile(symbol: str) -> dict | None:
-    key = _fmp_require_key()
-    data = _http_get_json(
-        f"https://financialmodelingprep.com/api/v3/profile/{symbol}", {"apikey": key}
-    )
+    data = _fmp_get("profile", {"symbol": symbol})
     if not data or not isinstance(data, list):
         return None
     p = data[0]
-    market_cap = _safe_float(p.get("mktCap"))
+    market_cap = _safe_float(p.get("marketCap"))
     return {
         "provider": "fmp",
         "symbol": symbol,
         "name": p.get("companyName"),
-        "exchange": p.get("exchangeShortName"),
+        "exchange": p.get("exchange"),
         "country": p.get("country"),
         "currency": p.get("currency"),
         "sector": p.get("sector"),
@@ -859,42 +868,35 @@ def _fmp_profile(symbol: str) -> dict | None:
         "key_metrics": {
             "price": _safe_float(p.get("price")),
             "beta": _safe_float(p.get("beta")),
-            "volume_avg": _safe_int(p.get("volAvg")),
-            "last_dividend": _safe_float(p.get("lastDiv")),
+            "volume_avg": _safe_int(p.get("averageVolume")),
+            "last_dividend": _safe_float(p.get("lastDividend")),
             "range": p.get("range"),
-            "dcf": _safe_float(p.get("dcf")),
-            "dcf_diff": _safe_float(p.get("dcfDiff")),
         },
     }
 
 
 def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> dict | None:
-    key = _fmp_require_key()
     endpoint = {
         "income": "income-statement",
         "balance": "balance-sheet-statement",
         "cashflow": "cash-flow-statement",
     }[statement]
-    params = {"apikey": key, "limit": limit}
+    params: dict[str, Any] = {"symbol": symbol, "limit": limit}
     if period == "quarterly":
         params["period"] = "quarter"
-    data = _http_get_json(
-        f"https://financialmodelingprep.com/api/v3/{endpoint}/{symbol}", params
-    )
+    data = _fmp_get(endpoint, params)
     if not data or not isinstance(data, list):
         return None
 
+    # Bookkeeping fields are surfaced as period metadata, not repeated in `data`.
+    _meta = {"symbol", "date", "reportedCurrency", "cik", "filingDate",
+             "acceptedDate", "fiscalYear", "period"}
     periods = []
     for entry in data[:limit]:
-        cleaned = {
-            k: v
-            for k, v in entry.items()
-            if k not in ("symbol", "reportedCurrency", "cik", "fillingDate",
-                         "acceptedDate", "calendarYear", "link", "finalLink")
-        }
+        cleaned = {k: v for k, v in entry.items() if k not in _meta}
         periods.append({
             "period_end": entry.get("date"),
-            "fiscal_year": entry.get("calendarYear"),
+            "fiscal_year": entry.get("fiscalYear"),
             "period_label": entry.get("period"),
             "currency": entry.get("reportedCurrency"),
             "data": cleaned,
@@ -910,17 +912,13 @@ def _fmp_financials(symbol: str, statement: str, period: str, limit: int) -> dic
 
 
 def _fmp_earnings(symbol: str, limit: int) -> dict | None:
-    key = _fmp_require_key()
-    data = _http_get_json(
-        f"https://financialmodelingprep.com/api/v3/historical/earning_calendar/{symbol}",
-        {"apikey": key, "limit": limit},
-    )
+    data = _fmp_get("earnings", {"symbol": symbol, "limit": limit})
     if not data or not isinstance(data, list):
         return None
 
     rows = []
     for row in data[:limit]:
-        actual = _safe_float(row.get("eps"))
+        actual = _safe_float(row.get("epsActual"))
         estimate = _safe_float(row.get("epsEstimated"))
         surprise = (actual - estimate) if (actual is not None and estimate is not None) else None
         surprise_pct = (
@@ -934,11 +932,96 @@ def _fmp_earnings(symbol: str, limit: int) -> dict | None:
             "estimated_eps": estimate,
             "surprise": round(surprise, 4) if surprise is not None else None,
             "surprise_percent": round(surprise_pct, 4) if surprise_pct is not None else None,
-            "revenue_actual": _safe_float(row.get("revenue")),
+            "revenue_actual": _safe_float(row.get("revenueActual")),
             "revenue_estimated": _safe_float(row.get("revenueEstimated")),
         })
 
     return {"provider": "fmp", "symbol": symbol, "earnings": rows}
+
+
+def _fmp_pe_snapshot(kind: str, exchange: str, date: str) -> dict[str, float]:
+    """Return ``{label: pe}`` for one exchange's sector- or industry-level P/E
+    snapshot. ``kind`` is ``"sector"`` or ``"industry"`` (also the row field
+    holding the label)."""
+    rows = _fmp_get(f"{kind}-pe-snapshot", {"date": date, "exchange": exchange})
+    out: dict[str, float] = {}
+    if isinstance(rows, list):
+        for r in rows:
+            label = r.get(kind)
+            pe = _safe_float(r.get("pe"))
+            if label and pe is not None:
+                out[label] = pe
+    return out
+
+
+def _fmp_pe_dimension(name: str, average_pe: float | None, company_pe: float | None) -> dict:
+    """Build one comparison dimension (sector or industry): the group average P/E
+    and, when the company's own P/E is known, how it stacks up against it."""
+    dim: dict[str, Any] = {"name": name, "average_pe": round(average_pe, 4) if average_pe is not None else None}
+    if average_pe is None:
+        dim["note"] = "no P/E snapshot available for this exchange"
+        return dim
+    if company_pe is not None and average_pe:
+        diff = company_pe - average_pe
+        dim["company_vs_average"] = round(diff, 4)
+        dim["premium_percent"] = round((company_pe / average_pe - 1) * 100, 2)
+        # 5% band around the average counts as in-line rather than over/under-valued.
+        dim["valuation"] = (
+            "in_line" if abs(diff) / average_pe < 0.05
+            else "above_average" if diff > 0 else "below_average"
+        )
+    return dim
+
+
+def _fmp_sector_comparison(symbol: str) -> dict | None:
+    """Compare a company's trailing P/E against its sector and industry averages.
+
+    FMP-only: the per-exchange sector/industry P/E snapshots have no free
+    yfinance/Finnhub equivalent. Returns ``None`` when the symbol has no FMP
+    profile (e.g. a non-equity ticker) or when neither its sector nor its
+    industry has a P/E for its exchange (e.g. an exchange the snapshot omits).
+    """
+    profile = _fmp_get("profile", {"symbol": symbol})
+    if not isinstance(profile, list) or not profile:
+        return None
+    p = profile[0]
+    sector = p.get("sector")
+    industry = p.get("industry")
+    exchange = p.get("exchange")
+    if not exchange or not (sector or industry):
+        return None
+
+    # The company's own trailing P/E — the value the averages are compared to.
+    company_pe = None
+    try:
+        ratios = _fmp_get("ratios-ttm", {"symbol": symbol})
+        if isinstance(ratios, list) and ratios:
+            company_pe = _safe_float(ratios[0].get("priceToEarningsRatioTTM"))
+    except Exception:
+        company_pe = None
+
+    date = datetime.now(tz=timezone.utc).date().isoformat()
+    sector_pes = _fmp_pe_snapshot("sector", exchange, date) if sector else {}
+    industry_pes = _fmp_pe_snapshot("industry", exchange, date) if industry else {}
+
+    sector_pe = sector_pes.get(sector) if sector else None
+    industry_pe = industry_pes.get(industry) if industry else None
+    if sector_pe is None and industry_pe is None:
+        return None
+
+    result: dict[str, Any] = {
+        "provider": "fmp",
+        "symbol": symbol,
+        "as_of": date,
+        "exchange": exchange,
+        "metric": "pe_ttm",
+        "company_pe": company_pe,
+    }
+    if sector:
+        result["sector"] = _fmp_pe_dimension(sector, sector_pe, company_pe)
+    if industry:
+        result["industry"] = _fmp_pe_dimension(industry, industry_pe, company_pe)
+    return result
 
 
 # ===================================================================
@@ -1060,7 +1143,7 @@ def _resolve_symbol(raw: str) -> tuple[str, dict | None]:
 # replaced each repeated that pattern; it now lives in one helper so the
 # consolidated `get_company_data` tool can fetch any mix of sections.
 
-VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history")
+VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history", "sector_comparison")
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
@@ -1147,6 +1230,19 @@ def _section_insiders(symbol: str, opts: dict):
     )
 
 
+def _section_sector_comparison(symbol: str, opts: dict):
+    # FMP-only: the sector/industry P/E snapshots have no free yfinance/Finnhub
+    # equivalent, so (unlike the other sections) there is no fallback. Without an
+    # FMP key configured the section reports the data is unavailable rather than
+    # silently returning nothing.
+    if not cfg.fmp_api_key:
+        return None, ["sector_comparison requires an FMP API key (set STOCK_FMP_API_KEY)"]
+    try:
+        return _fmp_sector_comparison(symbol), []
+    except Exception as e:
+        return None, [f"fmp: {type(e).__name__}: {e}"]
+
+
 def _section_history(symbol: str, opts: dict):
     # Price history is yfinance-only (Finnhub/FMP have no cheap OHLC bars); the
     # empty primary map routes every resolved provider to the yfinance fetcher.
@@ -1165,6 +1261,7 @@ _SECTION_FETCHERS = {
     "news": _section_news,
     "insiders": _section_insiders,
     "price_history": _section_history,
+    "sector_comparison": _section_sector_comparison,
 }
 
 
@@ -1230,13 +1327,15 @@ def register(mcp: FastMCP) -> None:
 
         sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
         "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
-        "insiders"(buy/sell txns)|"price_history"(daily OHLC bars). Params:
-        statement(income|balance|cashflow), period(annual|quarterly), periods,
-        news_items, insider_weeks, history_bars (all capped; omit=max).
+        "insiders"(buy/sell txns)|"price_history"(daily OHLC bars)|
+        "sector_comparison"(company P/E vs its sector & industry average P/E).
+        Params: statement(income|balance|cashflow), period(annual|quarterly),
+        periods, news_items, insider_weeks, history_bars (all capped; omit=max).
 
         Use for: current price, company fundamentals, financial statements,
-        earnings reports, recent news, insider trading, price charts. Crypto/
-        FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
+        earnings reports, recent news, insider trading, price charts, valuation
+        vs sector/industry peers. Crypto/FX/indices (BTC-USD, ^GSPC) only
+        support quote/price_history. "sector_comparison" is equities-only.
 
         :param symbol: Ticker or company name.
         :param sections: Sections to fetch (default: quote,profile).

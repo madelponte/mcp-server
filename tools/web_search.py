@@ -1037,7 +1037,7 @@ def register(mcp: FastMCP) -> None:
         """Search the web. Use for unknown facts, current events, or verification.
 
         Results include url/title/snippet + optional page metadata (headings,
-        description) for top results. Then use fetch_page(url) to read full content.
+        description) for top results. Then use mcp_fetch_page to read full content.
 
         Query: short keywords only (not sentences). time_range: "day"/"week"/
         "month"/"year"/"all". category: "general"|"news"|"science"|"it"|"social
@@ -1157,13 +1157,13 @@ def register(mcp: FastMCP) -> None:
         [M:SS] timestamps). mode="text" (default): readable text/docs. mode=
         "structured": metadata (title, description, headings, JSON-LD). section=
         extracts one heading's content. query= extracts matching passages only
-        (keyword/regex, case-insensitive). Use when search_web result needs
+        (keyword/regex, case-insensitive). Use when mcp_search_web result needs
         deeper reading or to read documents (PDF/Word/Excel/RTF/EPUB).
 
         :param url: http/https URL.
         :param mode: "text" or "structured".
-        :param section: Heading text to extract.
-        :param query: Keyword/regex to filter content.
+        :param section: Optional heading text to extract.
+        :param query: Optional keyword/regex to filter content.
         :return: JSON {url,format,provenance?,content,query?,match_count?,
             sections?,truncated?,note?}. format: "youtube_transcript"|"text"|"
             structured"|"section"|"document_text"|"json".
