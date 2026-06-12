@@ -16,10 +16,11 @@ import re
 import socket
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
+from markdownify import MarkdownConverter
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -277,6 +278,44 @@ def _plain_text_from_html(html: str) -> str:
     text = root.get_text("\n", strip=True)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
+
+
+def _markdown_from_html(html: str, base_url: str) -> str:
+    """Convert page HTML to markdown, keeping the structure plain text loses.
+
+    Headings, lists, tables, and hyperlinks survive the conversion, so the model
+    sees the page the way a reader does — and can follow a link it found in the
+    content with another fetch_page call. Link hrefs are resolved against
+    `base_url` to absolute URLs for exactly that reason. Non-content elements
+    (scripts, nav, site header/footer chrome, forms) and images are dropped;
+    `escape_*` are off because the output feeds a model, not a markdown renderer.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for t in soup(["script", "style", "noscript", "template", "iframe", "svg",
+                   "nav", "aside", "form", "button"]):
+        t.decompose()
+    # Site-chrome headers/footers are noise, but a header *inside* the article
+    # carries its headline — drop only the ones outside any article/main.
+    for t in soup(["header", "footer"]):
+        if t.find_parent(["article", "main"]) is None:
+            t.decompose()
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+
+    for a in root.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "javascript:", "data:")):
+            a.unwrap()  # keep the text, drop the unfollowable link
+        else:
+            a["href"] = urljoin(base_url, href)
+
+    md = MarkdownConverter(
+        heading_style="atx",
+        bullets="-",
+        strip=["img"],
+        escape_asterisks=False,
+        escape_underscores=False,
+    ).convert_soup(root)
+    return re.sub(r"\n{3,}", "\n\n", md).strip()
 
 
 def _norm_heading(s: str) -> str:
@@ -1163,7 +1202,8 @@ def register(mcp: FastMCP) -> None:
         Pass several URLs as a list (up to 3) to read them; 
         URLs past the first 3 are skipped. YouTube auto-detects: returns transcript
         (use query= to find topics with [M:SS] timestamps). mode="text"
-        (default): readable text/docs. mode="structured": metadata (title,
+        (default): page as markdown — headings/lists/tables/links kept, link
+        URLs absolute (fetchable). mode="structured": metadata (title,
         description, headings, JSON-LD). section= extracts one heading's
         content. query= extracts matching passages only (keyword/regex,
         case-insensitive). mode/section/query apply to every URL. Use when
@@ -1176,8 +1216,9 @@ def register(mcp: FastMCP) -> None:
         :param query: Optional keyword/regex to filter content.
         :return: For one URL: JSON {url,format,provenance?,content,query?,
             match_count?,sections?,truncated?,note?} (format:
-            "youtube_transcript"|"text"|"structured"|"section"|"document_text"|
-            "json"). For a list: JSON {results:[<that object|{url,error}>, ...],
+            "youtube_transcript"|"markdown"|"text"|"structured"|"section"|
+            "document_text"|"json"). For a list: JSON {results:[<that object|
+            {url,error}>, ...],
             note?}, one entry per URL in order.
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
@@ -1420,7 +1461,12 @@ def register(mcp: FastMCP) -> None:
             return section_payload
 
         try:
-            plain = _plain_text_from_html(text)
+            if cfg.markdown:
+                plain = _markdown_from_html(text, fetch_url)
+                text_format = "markdown"
+            else:
+                plain = _plain_text_from_html(text)
+                text_format = "text"
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
@@ -1432,7 +1478,7 @@ def register(mcp: FastMCP) -> None:
         text_payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype, via),
-            "format": "text",
+            "format": text_format,
             "title": soup_title,
         }
 
