@@ -1034,29 +1034,23 @@ def register(mcp: FastMCP) -> None:
         num_results: int | None = None,
         enrich_results: int | None = None,
     ) -> str:
-        """
-        Search the web; returns ranked results.
+        """Search the web. Use for unknown facts, current events, or verification.
 
-        Use when you don't know the answer, need current events, or want to verify
-        a fact. Pass a few focused keywords, not the whole prompt; refine and retry
-        if results aren't useful.
+        Results include url/title/snippet + optional page metadata (headings,
+        description) for top results. Then use mcp_fetch_page to read full content.
 
-        Each result has url, title, snippet, optional published_date, and (for top
-        results) page metadata (description + heading/JSON-LD outline) to help pick
-        which to fetch in full using the fetch_page tool.
+        Query: short keywords only (not sentences). time_range: "day"/"week"/
+        "month"/"year"/"all". category: "general"|"news"|"science"|"it"|"social
+        media"|"videos"|"images"|"music"|"files"|"map" (comma-separate).
+        num_results/enrich_results: max counts (capped; enrich fetches metadata).
 
-        :param query: Concise keyword query, not a sentence.
-        :param time_range: Recency filter: "day" (today/latest), "week", "month",
-            "year", or "all"/omit for no limit.
-        :param category: SearXNG category: "general" (default), "news", "science",
-            "it", "social media", "videos", "images", "music", "files", "map".
-            Comma-separate to combine. NOTE: "map" returns web pages ABOUT places,
-            not nearby businesses — for "X near me" use find_nearby_places.
-        :param num_results: Max results; omit for server default. Capped.
-        :param enrich_results: How many top results to fetch page metadata for.
-            Each outline costs context — pass a small number, 0 to skip
-            (url/title/snippet only), or omit for default. Capped.
-        :return: JSON string of results.
+        :param query: Keywords.
+        :param time_range: Recency filter.
+        :param category: Category (comma-separate).
+        :param num_results: Max results (capped).
+        :param enrich_results: Top N to enrich with metadata (capped).
+        :return: JSON {query, time_range, category, results:[{url,title,snippet,
+            published_date?,page_title?,page_description?,page_headings?,page_toc?}]}
         """
         log_call(
             log,
@@ -1157,37 +1151,22 @@ def register(mcp: FastMCP) -> None:
         section: str | None = None,
         query: str | None = None,
     ) -> str:
-        """
-        Fetch the contents of a web page (or a URL from search_web).
+        """Fetch a web page URL or YouTube video transcript.
 
-        YOUTUBE: a video URL (youtube.com/watch, youtu.be, /shorts/, /embed/,
-        /live/) returns the TRANSCRIPT instead — to summarize, quote, or answer
-        questions about the video. No separate tool needed.
+        YouTube auto-detects: returns transcript (use query= to find topics with
+        [M:SS] timestamps). mode="text" (default): readable text/docs. mode=
+        "structured": metadata (title, description, headings, JSON-LD). section=
+        extracts one heading's content. query= extracts matching passages only
+        (keyword/regex, case-insensitive). Use when mcp_search_web result needs
+        deeper reading or to read documents (PDF/Word/Excel/RTF/EPUB).
 
-        Modes:
-        - "text": readable page text — for reading an article or extracting facts.
-          Also auto-used for documents (PDF, Word, Excel, PowerPoint, OpenDocument,
-          RTF, EPUB).
-        - "structured": metadata only — title, description, heading outline, and
-          JSON-LD (schema.org Recipe, HowTo, Article, etc.).
-
-        Narrow a long page with either (combinable; HTML/text/docs/transcripts,
-        not JSON):
-        - `section`: a heading's text (e.g. from a search_web outline) — returns
-          ONLY that section. Case-insensitive; HTML only.
-        - `query`: a keyword/phrase or regex — returns ONLY matching passages
-          (case-insensitive) plus context. Multiple hits split by "── match i of
-          N ──"; no match errors. YouTube matches keep [M:SS] timestamps, so use
-          it to find WHERE a topic is discussed.
-
-        If too long, content is truncated and the result gets `"truncated": true`
-        plus a note; retry with `query=`/`section=` to read the rest.
-
-        :param url: Absolute http/https URL.
+        :param url: http/https URL.
         :param mode: "text" or "structured".
-        :param section: Optional heading text to extract just that section.
-        :param query: Optional keyword/phrase/regex to return only matching passages.
-        :return: JSON string with the result
+        :param section: Optional heading text to extract.
+        :param query: Optional keyword/regex to filter content.
+        :return: JSON {url,format,provenance?,content,query?,match_count?,
+            sections?,truncated?,note?}. format: "youtube_transcript"|"text"|"
+            structured"|"section"|"document_text"|"json".
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
         if not url or not isinstance(url, str):

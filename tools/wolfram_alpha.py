@@ -34,27 +34,18 @@ _result_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def query_wolfram_alpha(query: str, assumption: str | None = None) -> str:
-        """
-        Compute or look up exact factual data with Wolfram Alpha: math,
-        unit/currency conversions, physics, chemistry, astronomy, geography,
-        demographics, dates & times, finance, nutrition, weather history, entity
-        comparisons.
+        """Compute/lookup exact facts: math, units, physics, chemistry, finance,
+        geography, demographics, dates, nutrition, weather, astronomy.
 
-        Query rules:
-        - Keyword style, not sentences: "France population", not "how many people
-          live in France".
-        - Math: single-letter variables (n, x), exponents like 6*10^14 (not 6e14),
-          named constants ("speed of light") not raw numbers.
-        - One property per call.
-        - If a result lists 'Assumptions', re-send the SAME query with `assumption`
-          set to that value — don't rephrase.
+        Query: keyword style only ("France population", "convert 5 miles to km",
+        "derivative of x^2", "speed of light"). No sentences. Math: use * for
+        multiply, ^ for exponent (6*10^14, not 6e14). One property per call.
+        If result shows "Assumptions", retry SAME query with assumption=<value>.
+        NOT for opinions, news, code, or known facts.
 
-        Don't use for opinions, current news, code, or things you already know.
-
-        :param query: Keyword-style query, single line.
-        :param assumption: Assumption value from a prior result, to disambiguate
-            (e.g. "mercury" planet vs. element).
-        :return: Text result from Wolfram Alpha.
+        :param query: Keyword query.
+        :param assumption: Disambiguation from prior result (if any).
+        :return: Plain text answer.
         """
         log_call(log, "query_wolfram_alpha", query=query, assumption=assumption)
         app_id = (cfg.app_id or "").strip()
