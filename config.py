@@ -177,7 +177,6 @@ class StockSettings(BaseSettings):
 
     finnhub_api_key: str = Field("", description="Finnhub API key (free at finnhub.io).")
     fmp_api_key: str = Field("", description="Financial Modeling Prep API key (optional).")
-    alpha_vantage_api_key: str = Field("", description="Alpha Vantage API key (reserved/optional).")
 
     default_provider: str = Field(
         "auto", description="Default provider: 'auto', 'finnhub', 'yfinance', or 'fmp'."

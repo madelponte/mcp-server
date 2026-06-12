@@ -37,7 +37,10 @@ SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
 skips enrichment).
 
 `fetch_page(url, mode="text", section=None, query=None)` — Fetch the contents
-of a page (or a URL returned by `search_web`). `mode="text"` returns readable
+of a page (or a URL returned by `search_web`). `url` accepts a single URL or a
+list of them (up to 3); a list fetches all of them in one call and returns
+`{"results": [...]}` (one entry per URL, with a per-URL `error` for any that
+fail). URLs past the first 3 are skipped. `mode="text"` returns readable
 plain text; `mode="structured"` returns metadata only (title, description,
 heading outline, JSON-LD). Document links (PDF, Word, Excel, PowerPoint,
 OpenDocument, RTF, EPUB) are extracted via Apache Tika and always returned as

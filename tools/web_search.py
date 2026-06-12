@@ -47,6 +47,13 @@ _TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
 # alone is a sufficient key. See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
+# Hard cap on how many URLs a single fetch_page call will fetch when passed a
+# list. A context-budget guard: more than a few full pages in one response blows
+# a small model's window. Kept as a literal (not a config valve) so the exact
+# number can be stated in the tool docstring the model reads — keep the "3" in
+# that docstring in sync if you change this.
+MAX_FETCH_URLS = 3
+
 # ---------------------------------------------------------------------------
 # Cloudflare detection
 # ---------------------------------------------------------------------------
@@ -1146,29 +1153,110 @@ def register(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def fetch_page(
-        url: str,
+        url: str | list[str],
         mode: str = "text",
         section: str | None = None,
         query: str | None = None,
     ) -> str:
-        """Fetch a web page URL or YouTube video transcript.
+        """Fetch one or more web page URLs or YouTube video transcripts.
 
-        YouTube auto-detects: returns transcript (use query= to find topics with
-        [M:SS] timestamps). mode="text" (default): readable text/docs. mode=
-        "structured": metadata (title, description, headings, JSON-LD). section=
-        extracts one heading's content. query= extracts matching passages only
-        (keyword/regex, case-insensitive). Use when mcp_search_web result needs
-        deeper reading or to read documents (PDF/Word/Excel/RTF/EPUB).
+        Pass several URLs as a list (up to 3) to read them; 
+        URLs past the first 3 are skipped. YouTube auto-detects: returns transcript
+        (use query= to find topics with [M:SS] timestamps). mode="text"
+        (default): readable text/docs. mode="structured": metadata (title,
+        description, headings, JSON-LD). section= extracts one heading's
+        content. query= extracts matching passages only (keyword/regex,
+        case-insensitive). mode/section/query apply to every URL. Use when
+        mcp_search_web result needs deeper reading or to read documents
+        (PDF/Word/Excel/RTF/EPUB).
 
-        :param url: http/https URL.
+        :param url: One http/https URL, or a list of them.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract.
         :param query: Optional keyword/regex to filter content.
-        :return: JSON {url,format,provenance?,content,query?,match_count?,
-            sections?,truncated?,note?}. format: "youtube_transcript"|"text"|"
-            structured"|"section"|"document_text"|"json".
+        :return: For one URL: JSON {url,format,provenance?,content,query?,
+            match_count?,sections?,truncated?,note?} (format:
+            "youtube_transcript"|"text"|"structured"|"section"|"document_text"|
+            "json"). For a list: JSON {results:[<that object|{url,error}>, ...],
+            note?}, one entry per URL in order.
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
+
+        # Accept a single URL (string) or several (list). A bare string returns
+        # one page object unchanged; a list returns {"results": [...]} so a
+        # small model can read several pages in one call instead of chaining
+        # fetches and risking a derail.
+        single_input = isinstance(url, str)
+        raw = [url] if single_input else url if isinstance(url, list) else None
+        if raw is None:
+            raise ToolError("Missing url.")
+
+        # Clean: stringify-guard, strip, drop blanks, de-dupe (preserve order).
+        urls: list[str] = []
+        seen: set[str] = set()
+        for u in raw:
+            if not isinstance(u, str):
+                continue
+            u = u.strip()
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+        if not urls:
+            raise ToolError("Missing url.")
+
+        # Context-budget cap: clamp how many URLs we fetch in one call. Extra
+        # URLs are reported as skipped rather than silently dropped.
+        total = len(urls)
+        skipped = urls[MAX_FETCH_URLS:]
+        urls = urls[:MAX_FETCH_URLS]
+
+        if single_input and not skipped:
+            payload = await _fetch_one(urls[0], mode, section, query)
+            return log_result(log, "fetch_page", to_json(payload))
+
+        # Multiple URLs: fetch concurrently, capturing each URL's failure so one
+        # bad URL doesn't sink the batch (partial-success contract).
+        settled = await asyncio.gather(
+            *(_fetch_one(u, mode, section, query) for u in urls),
+            return_exceptions=True,
+        )
+        results: list[dict] = []
+        failures = 0
+        for u, res in zip(urls, settled):
+            if isinstance(res, Exception):
+                failures += 1
+                results.append({"url": u, "error": str(res)})
+            else:
+                results.append(res)
+        for u in skipped:
+            results.append(
+                {"url": u, "error": f"Skipped: exceeded the {MAX_FETCH_URLS}-URL per-call limit."}
+            )
+
+        # Only a total failure is a ToolError; any success is a normal result.
+        if failures == len(urls):
+            joined = "; ".join(f"{r['url']}: {r['error']}" for r in results if "error" in r)
+            raise ToolError(f"All fetches failed: {joined}")
+
+        batch: dict = {"results": results}
+        if skipped:
+            batch["note"] = (
+                f"Fetched the first {MAX_FETCH_URLS} of {total} URLs; "
+                f"{len(skipped)} skipped (per-call limit)."
+            )
+        return log_result(log, "fetch_page", to_json(batch))
+
+    async def _fetch_one(
+        url: str,
+        mode: str = "text",
+        section: str | None = None,
+        query: str | None = None,
+    ) -> dict:
+        """Fetch a single URL and return its result payload dict.
+
+        Shared by fetch_page for both the one-URL and list-of-URLs paths. Raises
+        ToolError on a genuine failure (caught per-URL in the batch path).
+        """
         if not url or not isinstance(url, str):
             raise ToolError("Missing url.")
         url = url.strip()
@@ -1201,7 +1289,7 @@ def register(mcp: FastMCP) -> None:
                 filtered = f"{header}{sep}{qres.pop('content')}" if sep else qres.pop("content")
                 payload.update(qres)
                 payload["content"] = filtered
-            return log_result(log, "fetch_page", to_json(payload))
+            return payload
 
         mode = (mode or "text").lower().strip()
         if mode not in ("text", "structured"):
@@ -1248,7 +1336,7 @@ def register(mcp: FastMCP) -> None:
                 _set_content(doc_payload, qres["content"])
             else:
                 _set_content(doc_payload, extracted)
-            return log_result(log, "fetch_page", to_json(doc_payload))
+            return doc_payload
 
         text = fetched.get("text") or ""
 
@@ -1265,7 +1353,7 @@ def register(mcp: FastMCP) -> None:
                 # query=/section= can't narrow JSON, so flag truncation without
                 # the retry hint that points at them.
                 _set_content(json_payload, to_json(compact), hint=False)
-                return log_result(log, "fetch_page", to_json(json_payload))
+                return json_payload
             except Exception:
                 pass
 
@@ -1279,18 +1367,12 @@ def register(mcp: FastMCP) -> None:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
             if structured.get("headings"):
                 structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
-            return log_result(
-                log,
-                "fetch_page",
-                to_json(
-                    {
-                        "url": fetch_url,
-                        **_provenance(url, fetch_url, status, ctype, via),
-                        "format": "structured",
-                        "content": structured,
-                    }
-                ),
-            )
+            return {
+                "url": fetch_url,
+                **_provenance(url, fetch_url, status, ctype, via),
+                "format": "structured",
+                "content": structured,
+            }
 
         # mode == "text"
         try:
@@ -1335,7 +1417,7 @@ def register(mcp: FastMCP) -> None:
             else:
                 section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
             _set_content(section_payload, section_body)
-            return log_result(log, "fetch_page", to_json(section_payload))
+            return section_payload
 
         try:
             plain = _plain_text_from_html(text)
@@ -1370,4 +1452,4 @@ def register(mcp: FastMCP) -> None:
             text_payload["note"] = note
             _set_content(text_payload, plain)
 
-        return log_result(log, "fetch_page", to_json(text_payload))
+        return text_payload
