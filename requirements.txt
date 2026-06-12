@@ -12,6 +12,7 @@ anyio>=4.13
 # Agentic Web Search
 beautifulsoup4>=4.15
 lxml>=6.1
+markdownify>=1.2
 
 # Stock Data
 requests>=2.34
