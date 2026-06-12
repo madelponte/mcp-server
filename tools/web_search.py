@@ -16,7 +16,7 @@ import re
 import socket
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -498,6 +498,58 @@ def _structured_from_html(html: str, url: str) -> dict:
         "jsonld": jsonld if jsonld else None,
         "toc": _toc_from_jsonld(jsonld),
     }
+
+
+# Link href targets that aren't navigable destinations for multi-hop browsing.
+_NON_NAV_SCHEMES = ("javascript:", "mailto:", "tel:", "data:", "blob:")
+
+
+def _same_site(host_a: str, host_b: str) -> bool:
+    """Heuristic 'same website' test: equal registrable domain (last two labels),
+    so example.com, www.example.com and blog.example.com all count as one site.
+    Good enough to flag internal vs. external links; it is not a
+    public-suffix-accurate check (e.g. it treats *.co.uk as one site)."""
+    a = (host_a or "").lower().split(".")
+    b = (host_b or "").lower().split(".")
+    return len(a) >= 2 and len(b) >= 2 and a[-2:] == b[-2:]
+
+
+def _extract_links(soup: BeautifulSoup, page_url: str) -> list[dict]:
+    """Extract deduplicated outbound http(s) links with their anchor text.
+
+    Relative hrefs are resolved to absolute URLs against the page (honoring a
+    ``<base href>``). Same-page (#fragment-only), mailto/tel/javascript and other
+    non-http(s) links are skipped, and the URL fragment is dropped so ``#a``/``#b``
+    variants of one page collapse to a single entry. Returns ``{url, text,
+    internal}`` dicts in document order (first occurrence's anchor text kept);
+    ``internal`` flags a same-site destination so the model can prioritise.
+    """
+    base = page_url
+    base_tag = soup.find("base", href=True)
+    if base_tag and base_tag.get("href"):
+        base = urljoin(page_url, base_tag["href"].strip())
+    page_host = urlparse(page_url).hostname or ""
+
+    seen: set[str] = set()
+    links: list[dict] = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith(_NON_NAV_SCHEMES):
+            continue
+        parsed = urlparse(urljoin(base, href))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            continue
+        absu = urlunparse(parsed._replace(fragment=""))
+        if absu in seen:
+            continue
+        seen.add(absu)
+        text = " ".join(a.get_text(" ", strip=True).split())
+        links.append({
+            "url": absu,
+            "text": _trim(text, cfg.max_snippet_chars) or None,
+            "internal": _same_site(parsed.hostname, page_host),
+        })
+    return links
 
 
 # Document types Apache Tika can extract that are NOT served as text/html.
@@ -1155,18 +1207,22 @@ def register(mcp: FastMCP) -> None:
 
         YouTube auto-detects: returns transcript (use query= to find topics with
         [M:SS] timestamps). mode="text" (default): readable text/docs. mode=
-        "structured": metadata (title, description, headings, JSON-LD). section=
-        extracts one heading's content. query= extracts matching passages only
-        (keyword/regex, case-insensitive). Use when mcp_search_web result needs
-        deeper reading or to read documents (PDF/Word/Excel/RTF/EPUB).
+        "structured": metadata (title, description, headings, JSON-LD). mode=
+        "links": outbound links (absolute url + anchor text, deduped, internal
+        flagged) for multi-hop browsing — read a page, see where it links, fetch
+        the next. section= extracts one heading's content. query= extracts
+        matching passages only (keyword/regex, case-insensitive); with
+        mode="links" it instead filters links by url/anchor text. Use when
+        mcp_search_web result needs deeper reading or to read documents (PDF/
+        Word/Excel/RTF/EPUB).
 
         :param url: http/https URL.
-        :param mode: "text" or "structured".
+        :param mode: "text", "structured", or "links".
         :param section: Optional heading text to extract.
-        :param query: Optional keyword/regex to filter content.
-        :return: JSON {url,format,provenance?,content,query?,match_count?,
-            sections?,truncated?,note?}. format: "youtube_transcript"|"text"|"
-            structured"|"section"|"document_text"|"json".
+        :param query: Optional keyword/regex to filter content (or links).
+        :return: JSON {url,format,provenance?,content|links,query?,match_count?,
+            sections?,count?,truncated?,note?}. format: "youtube_transcript"|
+            "text"|"structured"|"section"|"document_text"|"json"|"links".
         """
         log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
         if not url or not isinstance(url, str):
@@ -1204,8 +1260,8 @@ def register(mcp: FastMCP) -> None:
             return log_result(log, "fetch_page", to_json(payload))
 
         mode = (mode or "text").lower().strip()
-        if mode not in ("text", "structured"):
-            raise ToolError(f"Invalid mode '{mode}'. Use 'text' or 'structured'.")
+        if mode not in ("text", "structured", "links"):
+            raise ToolError(f"Invalid mode '{mode}'. Use 'text', 'structured', or 'links'.")
 
         section = (section or "").strip() or None
 
@@ -1270,6 +1326,47 @@ def register(mcp: FastMCP) -> None:
                 pass
 
         # HTML / text
+        # Outbound link extraction for multi-hop browsing: list where the page
+        # links so the model can pick the next hop. `query=` here filters the
+        # links (by URL or anchor text) rather than the page body.
+        if mode == "links":
+            try:
+                link_soup = BeautifulSoup(text, "lxml")
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+            links = _extract_links(link_soup, fetch_url)
+
+            links_payload = {
+                "url": fetch_url,
+                **_provenance(url, fetch_url, status, ctype, via),
+                "format": "links",
+            }
+            if query:
+                pattern = _compile_query(query)
+                links = [
+                    ln for ln in links
+                    if pattern.search(ln["url"]) or (ln["text"] and pattern.search(ln["text"]))
+                ]
+                if not links:
+                    raise ToolError(
+                        f"No links matching query {query!r} found on {fetch_url}. "
+                        "Try a simpler keyword, loosen the regex, or omit `query` "
+                        "to list all links."
+                    )
+                links_payload["query"] = query
+
+            total = len(links)
+            shown = links[: cfg.max_links]
+            links_payload["count"] = len(shown)
+            if total > len(shown):
+                links_payload["total_links"] = total
+                links_payload["note"] = (
+                    f"{total} links found; showing the first {len(shown)}. "
+                    "Use `query=` to filter to the links you need."
+                )
+            links_payload["links"] = shown
+            return log_result(log, "fetch_page", to_json(links_payload))
+
         # `query` is a content search, so it overrides "structured" (which would
         # return only metadata); structured mode applies only without a query.
         if mode == "structured" and not query:

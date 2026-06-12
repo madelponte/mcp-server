@@ -142,6 +142,17 @@ class WebSearchSettings(BaseSettings):
     max_page_chars: int = Field(15000, description="Max characters of page content before truncation.")
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
+    # MAXIMUM, not a fixed amount: a context-budget cap on how many outbound
+    # links fetch_page returns in mode="links". Anything above this is dropped
+    # with a note; the model can narrow the set with `query=` instead.
+    max_links: int = Field(
+        50,
+        description=(
+            "Maximum outbound links fetch_page returns in mode='links' (a "
+            "context-budget cap; the rest are dropped with a note). Use the "
+            "`query=` filter to surface the specific links you need."
+        ),
+    )
 
     # `fetch_page`'s optional `query` does server-side extractive filtering:
     # it returns only the segments (paragraphs / transcript caption lines) that
