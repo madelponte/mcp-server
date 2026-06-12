@@ -139,6 +139,15 @@ class WebSearchSettings(BaseSettings):
         128, description="Max number of cached pages before the oldest is evicted (0 = unbounded)."
     )
 
+    markdown: bool = Field(
+        True,
+        description=(
+            "Return fetch_page text-mode content as markdown — headings, lists, "
+            "tables, and hyperlinks (resolved to absolute URLs) are preserved, so "
+            "the model sees the page's structure and can follow links. Set false "
+            "for the old structure-free plain-text extraction."
+        ),
+    )
     max_page_chars: int = Field(15000, description="Max characters of page content before truncation.")
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")
@@ -177,7 +186,6 @@ class StockSettings(BaseSettings):
 
     finnhub_api_key: str = Field("", description="Finnhub API key (free at finnhub.io).")
     fmp_api_key: str = Field("", description="Financial Modeling Prep API key (optional).")
-    alpha_vantage_api_key: str = Field("", description="Alpha Vantage API key (reserved/optional).")
 
     default_provider: str = Field(
         "auto", description="Default provider: 'auto', 'finnhub', 'yfinance', or 'fmp'."
