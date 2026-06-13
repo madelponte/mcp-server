@@ -99,6 +99,17 @@ class WebSearchSettings(BaseSettings):
         60000, description="maxTimeout passed to FlareSolverr, in milliseconds."
     )
 
+    wayback_fallback: bool = Field(
+        True,
+        description=(
+            "As a last resort, when fetch_page's live fetch (even after a "
+            "FlareSolverr render) yields no readable text, try the Internet "
+            "Archive's Wayback Machine for an archived snapshot of the page. The "
+            "snapshot may be out of date — it is clearly flagged as archived in "
+            "the result. Set false to disable the archive.org fallback."
+        ),
+    )
+
     tika_url: str = Field(
         "http://tika:9998",
         description="Base URL of an Apache Tika server used for document text extraction.",

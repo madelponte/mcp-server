@@ -4,7 +4,7 @@ YouTube transcript helper.
 Fetches the transcript/captions of a YouTube video using the open-source
 youtube-transcript-api library (no API key required). This is no longer a
 standalone MCP tool — its logic is exposed as `fetch_transcript` and called by
-web_search.fetch_page when it's handed a YouTube video URL, so a model has one
+the `fetch_page` tool when it's handed a YouTube video URL, so a model has one
 fewer tool to choose between. `is_youtube_video_url` is the detection predicate
 fetch_page uses to route to it.
 """
@@ -88,7 +88,7 @@ def _extract_video_id(url_or_id: str) -> str:
 def is_youtube_video_url(url: str) -> bool:
     """True if `url` is a YouTube video URL this tool can transcribe.
 
-    Shared with other tools (notably web_search.fetch_page) so a YouTube URL
+    Shared with other tools (notably the fetch_page tool) so a YouTube URL
     handed to the wrong tool can be redirected here instead of being scraped as
     a generic web page. Returns False for non-video YouTube pages (channels,
     playlists, the homepage) and bare video IDs — only a URL we can pull a video
@@ -139,7 +139,7 @@ async def fetch_transcript(
 ) -> str:
     """Fetch a YouTube video's transcript as plain text (metadata header + body).
 
-    This is the shared logic behind web_search.fetch_page's YouTube handling;
+    This is the shared logic behind the fetch_page tool's YouTube handling;
     it is not registered as its own MCP tool. Raises ToolError on any genuine
     failure (no captions, blocked IP, unavailable/private video, etc.).
 
