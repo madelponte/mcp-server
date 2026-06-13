@@ -429,6 +429,19 @@ def _render_text_body(html: str, base_url: str) -> tuple[str, str]:
     return _plain_text_from_html(html), "text"
 
 
+# A run of two or more letters — i.e. an actual word. A rendered body without
+# even one has no readable text and is an empty shell, even when it isn't
+# strictly whitespace: a JS page that only partly rendered (a direct fetch of a
+# client-side app, or a FlareSolverr snapshot taken before a lazy XHR resolved)
+# can leave stray punctuation like "; ;" that defeats a bare `.strip()` test.
+_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+
+
+def _is_contentless(body: str) -> bool:
+    """True if `body` has no readable text (not one word of 2+ letters)."""
+    return not _WORD_RE.search(body)
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -651,7 +664,7 @@ async def _fetch_one(
     # returns. (Checked before the query/title paths so an empty page reports as
     # empty rather than as "query matched nothing".)
     tried_render = False
-    if not plain.strip() and via != "flaresolverr" and cfg.flaresolverr_url:
+    if _is_contentless(plain) and via != "flaresolverr" and cfg.flaresolverr_url:
         tried_render = True
         try:
             rendered = await _render_with_flaresolverr(fetch_url)
@@ -668,21 +681,24 @@ async def _fetch_one(
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-    # Still nothing after the render attempt (or none was possible): returning the
-    # bare <title> as `content` would look like a real-but-empty article, so
-    # signal the retrieval failure instead, per the error convention.
-    if not plain.strip():
+    # Still no readable text after the render attempt (or none was possible):
+    # returning the bare <title> or stray render noise ("; ;") as `content` would
+    # look like a real-but-empty article, so signal the retrieval failure instead,
+    # per the error convention. The recovered title (if any) is surfaced as a
+    # breadcrumb so the model at least knows what the page was about.
+    if _is_contentless(plain):
         hint = (
             "Even rendering it through the FlareSolverr browser fallback produced "
-            "no text, so the body is likely loaded by a script the fallback didn't "
-            "wait for. Try fetching the article from another source."
+            "no readable text, so the body is likely loaded by a script the "
+            "fallback didn't wait for. Try fetching the article from another source."
             if tried_render else
             "Configure the FlareSolverr fallback (WEB_SEARCH_FLARESOLVERR_URL) to "
             "render JavaScript pages, or fetch the article from another source."
         )
+        titled = f" (page title: {soup_title!r})" if soup_title else ""
         raise ToolError(
             f"{fetch_url} returned HTTP {status} but no extractable text content — "
-            f"the page renders its content client-side with JavaScript. {hint}"
+            f"the page renders its content client-side with JavaScript.{titled} {hint}"
         )
 
     # An undetected/bypassed block can't reach here: a detected wall on the
