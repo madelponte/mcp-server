@@ -40,7 +40,7 @@ def register(mcp: FastMCP) -> None:
         units: Literal["metric", "nonmetric"] | None = None,
     ) -> str:
         """Compute/lookup exact facts: math, units, physics, chemistry, finance,
-        geography, demographics, dates, nutrition, weather, astronomy.
+        geography, demographics, nutrition, weather, astronomy.
 
         Query: keyword style only ("France population", "convert 5 miles to km",
         "derivative of x^2", "speed of light"). No sentences. Math: use * for
