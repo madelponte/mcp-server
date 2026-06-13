@@ -450,6 +450,76 @@ def _format_wayback_date(ts: str) -> str:
     return ts or "an unknown date"
 
 
+def _strip_wayback_chrome(html: str) -> str:
+    """Remove the Wayback Machine's injected toolbar/banner from a replay DOM.
+
+    Rendering a Wayback *replay* URL yields the page plus archive.org's own
+    navigation chrome (``#wm-ipp-base`` etc.). The extractor prefers an
+    ``<article>``/``<main>`` and usually ignores the chrome anyway, but strip it
+    so it can't pollute content on pages whose body falls back to ``<body>``.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    for el_id in ("wm-ipp-base", "wm-ipp", "donato"):
+        el = soup.find(id=el_id)
+        if el:
+            el.decompose()
+    return str(soup)
+
+
+async def _wayback_content(fetch_url: str) -> dict | None:
+    """Recover readable text for `fetch_url` from the Wayback Machine, or None.
+
+    Tries the archived page's static HTML first (cheap; works when the snapshot
+    captured server-rendered text). If that snapshot is *itself* a JavaScript
+    shell — as a client-side-rendered SPA's archived main document is — and
+    FlareSolverr is configured, it renders the Wayback *replay* URL in a real
+    browser: Wayback serves the page's archived sub-resources/XHRs to that
+    browser, so the JS-built body can materialize from the archive (and without
+    the live site's API latency that defeated the live render). Returns
+    ``{text, plain, format, status, content_type, meta}`` on success, else None.
+    """
+    archived = await _fetch_from_wayback(fetch_url)
+    if not archived or not archived.get("text"):
+        return None
+
+    text = archived["text"]
+    status = archived.get("status")
+    ctype = (archived.get("content_type") or "text/html").lower()
+    try:
+        plain, fmt = _render_text_body(text, fetch_url)
+    except Exception:
+        plain, fmt = "", "markdown"
+
+    # Archived main document is a JS shell — render the replay in a real browser.
+    if _is_contentless(plain) and cfg.flaresolverr_url and archived.get("wayback_url"):
+        try:
+            rr = await _render_with_flaresolverr(archived["wayback_url"])
+        except Exception:
+            rr = None
+        if rr and rr.get("text"):
+            stripped = _strip_wayback_chrome(rr["text"])
+            try:
+                p2, f2 = _render_text_body(stripped, fetch_url)
+            except Exception:
+                p2, f2 = "", fmt
+            if not _is_contentless(p2):
+                text, plain, fmt = stripped, p2, f2
+                status = rr.get("status", status)
+                ctype = (rr.get("content_type") or ctype).lower()
+
+    if _is_contentless(plain):
+        return None
+    ts = archived.get("wayback_timestamp", "")
+    return {
+        "text": text,
+        "plain": plain,
+        "format": fmt,
+        "status": status,
+        "content_type": ctype,
+        "meta": {"timestamp": ts, "date": _format_wayback_date(ts), "url": archived.get("wayback_url")},
+    }
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -699,25 +769,15 @@ async def _fetch_one(
     tried_wayback = False
     if _is_contentless(plain) and cfg.wayback_fallback:
         tried_wayback = True
-        archived = await _fetch_from_wayback(fetch_url)
-        if archived and archived.get("text"):
-            try:
-                arc_plain, arc_format = _render_text_body(archived["text"], fetch_url)
-            except Exception:
-                arc_plain, arc_format = "", text_format
-            if not _is_contentless(arc_plain):
-                text = archived["text"]
-                plain, text_format = arc_plain, arc_format
-                status = archived.get("status", status)
-                ctype = (archived.get("content_type") or ctype).lower()
-                via = archived.get("via")  # "archive.org"
-                soup_title = _page_title(BeautifulSoup(text, "lxml"))
-                ts = archived.get("wayback_timestamp", "")
-                wayback_meta = {
-                    "timestamp": ts,
-                    "date": _format_wayback_date(ts),
-                    "url": archived.get("wayback_url"),
-                }
+        wb = await _wayback_content(fetch_url)
+        if wb:
+            text = wb["text"]
+            plain, text_format = wb["plain"], wb["format"]
+            status = wb["status"] or status
+            ctype = (wb["content_type"] or ctype).lower()
+            via = "archive.org"
+            soup_title = _page_title(BeautifulSoup(text, "lxml"))
+            wayback_meta = wb["meta"]
 
     # Still no readable text after every fallback (or none was possible):
     # returning the bare <title> or stray render noise ("; ;") as `content` would
