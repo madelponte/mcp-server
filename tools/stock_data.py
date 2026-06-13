@@ -1339,6 +1339,49 @@ async def _gather_sections(
     return data, errors
 
 
+async def _fetch_company(
+    raw_query: str,
+    sections: list[str],
+    statement: str,
+    period: str,
+    periods: int | None,
+    news_items: int | None,
+    insider_weeks: int | None,
+    history_bars: int | None,
+    news_days: int | None,
+    history_interval: str,
+) -> dict:
+    """Resolve one ticker-or-name and fetch its requested sections.
+
+    Returns the per-company payload ({symbol, sections, data, resolved_from?,
+    errors?}). Raises ToolError when the symbol can't be resolved or every
+    requested section produced nothing — caught per-symbol in the multi-symbol
+    path so one bad ticker doesn't sink a comparison. The amount knobs are passed
+    through raw; `_gather_sections` clamps each to its configured cap.
+    """
+    symbol, match = await anyio.to_thread.run_sync(_resolve_symbol, raw_query)
+    data, errors = await _gather_sections(
+        symbol, sections, statement, period,
+        periods, news_items, insider_weeks, history_bars,
+        news_days, history_interval,
+    )
+    if not data:
+        # Every requested section failed — surface as a ToolError so the failure
+        # can't be mistaken for data (see the README error convention).
+        flat = [f"{sec}: {'; '.join(errs)}" for sec, errs in errors.items() if errs]
+        raise ToolError(_retrieval_error("company data", symbol, flat))
+
+    payload: dict[str, Any] = {"symbol": symbol, "sections": sections, "data": data}
+    if match:
+        # The input was a name (or otherwise non-exact); tell the model what it
+        # resolved to so it can confirm the right company was used.
+        payload["resolved_from"] = match
+    if errors:
+        # Partial success: report which sections returned nothing and why.
+        payload["errors"] = errors
+    return payload
+
+
 # ===================================================================
 #                       TOOL REGISTRATION
 # ===================================================================
@@ -1346,7 +1389,14 @@ async def _gather_sections(
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def get_company_data(
-        symbol: str,
+        symbol: Annotated[
+            str | list[str],
+            Field(
+                description="A ticker or company name (auto-resolved), or a list "
+                f"of them to compare in one call — up to {cfg.max_symbols} (extras "
+                "skipped). Pass an actual array, not the array written as a string."
+            ),
+        ],
         sections: list[str] | None = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
@@ -1388,7 +1438,8 @@ def register(mcp: FastMCP) -> None:
         ] = None,
         history_interval: Literal["1d", "1wk", "1mo"] = "1d",
     ) -> str:
-        """Get stock/company data. symbol=ticker or name (auto-resolved).
+        """Get stock/company data. symbol=ticker or name (auto-resolved); pass a
+        list of tickers/names to compare several companies in one call.
 
         sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
         "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
@@ -1404,12 +1455,13 @@ def register(mcp: FastMCP) -> None:
         vs sector/industry peers. Crypto/FX/indices (BTC-USD, ^GSPC) only
         support quote/price_history. "sector_comparison" is equities-only.
 
-        :param symbol: Ticker or company name.
         :param sections: Sections to fetch (default: quote,profile).
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
-        :return: JSON {symbol,sections,data:{...},resolved_from?,errors?}.
+        :return: For one symbol: JSON {symbol,sections,data:{...},resolved_from?,
+            errors?}. For a list: JSON {results:[<that object|{symbol,error}>,...],
+            note?}, one entry per symbol in order.
         """
         log_call(
             log,
@@ -1425,10 +1477,44 @@ def register(mcp: FastMCP) -> None:
             news_days=news_days,
             history_interval=history_interval,
         )
-        raw_query = (symbol or "").strip()
-        if not raw_query:
+        # Accept a single ticker/name (string) or several (list). A bare string
+        # returns one company object unchanged; a list returns {"results": [...]}
+        # so the model can compare several companies in one call.
+        #
+        # Like fetch_page, models often pass the list *JSON-encoded as a string*
+        # (e.g. '["AAPL","MSFT"]'), which validly matches the string branch and
+        # would otherwise be resolved as one bogus ticker. Detect that shape and
+        # decode it back into a list so the call succeeds.
+        if isinstance(symbol, str):
+            stripped = symbol.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    decoded = json.loads(stripped)
+                except (ValueError, TypeError):
+                    decoded = None
+                if isinstance(decoded, list):
+                    symbol = decoded
+
+        single_input = isinstance(symbol, str)
+        raw_symbols = [symbol] if single_input else symbol if isinstance(symbol, list) else None
+        if raw_symbols is None:
             raise ToolError("A ticker symbol or company name is required.")
 
+        # Clean: stringify-guard, strip, drop blanks, de-dupe (case-insensitive,
+        # preserve order).
+        queries: list[str] = []
+        seen: set[str] = set()
+        for s in raw_symbols:
+            if not isinstance(s, str):
+                continue
+            s = s.strip()
+            if s and s.lower() not in seen:
+                seen.add(s.lower())
+                queries.append(s)
+        if not queries:
+            raise ToolError("A ticker symbol or company name is required.")
+
+        # Validate the call-level params once — they apply to every symbol.
         requested = sections if sections else list(DEFAULT_SECTIONS)
         normalized: list[str] = []
         for s in requested:
@@ -1455,27 +1541,50 @@ def register(mcp: FastMCP) -> None:
         if history_interval not in ("1d", "1wk", "1mo"):
             raise ToolError("history_interval must be one of: 1d, 1wk, 1mo")
 
-        # Turn a ticker-or-name into a concrete ticker before fetching anything.
-        symbol, match = await anyio.to_thread.run_sync(_resolve_symbol, raw_query)
+        # Context-budget cap on how many companies per call. Extra symbols are
+        # reported as skipped rather than silently dropped.
+        total = len(queries)
+        skipped = queries[cfg.max_symbols:]
+        queries = queries[:cfg.max_symbols]
 
-        data, errors = await _gather_sections(
-            symbol, normalized, statement, period,
+        args = (
+            normalized, statement, period,
             periods, news_items, insider_weeks, history_bars,
             news_days, history_interval,
         )
 
-        if not data:
-            # Every requested section failed — surface as a ToolError so the
-            # failure can't be mistaken for data (see the README error convention).
-            flat = [f"{sec}: {'; '.join(errs)}" for sec, errs in errors.items() if errs]
-            raise ToolError(_retrieval_error("company data", symbol, flat))
+        if single_input and not skipped:
+            payload = await _fetch_company(queries[0], *args)
+            return log_result(log, "get_company_data", to_json(payload))
 
-        payload: dict[str, Any] = {"symbol": symbol, "sections": normalized, "data": data}
-        if match:
-            # The input was a name (or otherwise non-exact); tell the model what
-            # it resolved to so it can confirm the right company was used.
-            payload["resolved_from"] = match
-        if errors:
-            # Partial success: report which sections returned nothing and why.
-            payload["errors"] = errors
-        return log_result(log, "get_company_data", to_json(payload))
+        # Multiple symbols: fetch concurrently, capturing each symbol's failure so
+        # one bad ticker doesn't sink the comparison (partial-success contract).
+        settled = await asyncio.gather(
+            *(_fetch_company(q, *args) for q in queries),
+            return_exceptions=True,
+        )
+        results: list[dict] = []
+        failures = 0
+        for q, res in zip(queries, settled):
+            if isinstance(res, Exception):
+                failures += 1
+                results.append({"symbol": q, "error": str(res)})
+            else:
+                results.append(res)
+        for q in skipped:
+            results.append(
+                {"symbol": q, "error": f"Skipped: exceeded the {cfg.max_symbols}-symbol per-call limit."}
+            )
+
+        # Only a total failure is a ToolError; any success is a normal result.
+        if failures == len(queries):
+            joined = "; ".join(f"{r['symbol']}: {r['error']}" for r in results if "error" in r)
+            raise ToolError(f"All company lookups failed: {joined}")
+
+        batch: dict = {"results": results}
+        if skipped:
+            batch["note"] = (
+                f"Fetched the first {cfg.max_symbols} of {total} symbols; "
+                f"{len(skipped)} skipped (per-call limit)."
+            )
+        return log_result(log, "get_company_data", to_json(batch))
