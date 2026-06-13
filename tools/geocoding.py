@@ -241,6 +241,23 @@ def _primary_category(tags: dict) -> str | None:
     return None
 
 
+# OSM place values treated as a "town" worth re-centering a follow-up search on.
+# Suburbs/hamlets are excluded: a suburb isn't a separate municipality, and a
+# hamlet is usually too small to host the kind of POI a model is hunting for.
+_TOWN_PLACE_TYPES = "city|town|village"
+
+
+def _parse_population(value) -> int | None:
+    """Coerce an OSM population tag (a string, sometimes comma-grouped) to an int.
+    Returns None for missing/unparseable values so the field is simply omitted."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
 # ------------------------------- Nominatim -------------------------------
 
 # Relative location references a model may pass as `near`, echoing a user's
@@ -386,6 +403,60 @@ async def _overpass(query_ql: str) -> list[dict]:
     return elements
 
 
+async def _nearby_towns(
+    lat: float, lon: float, n: int, exclude: str | None
+) -> list[dict]:
+    """Find populated places (city/town/village) within nearby_towns_radius_m of
+    the center, nearest first, so a model can launch follow-up searches centered on
+    neighboring towns. Each carries its distance from the original center so the
+    model can judge relevance. `exclude` (the center's display name) drops the
+    origin place itself, which would otherwise appear at ~0 m as its own neighbor.
+    """
+    radius = cfg.nearby_towns_radius_m
+    query_ql = (
+        f"[out:json][timeout:{int(cfg.overpass_timeout_seconds)}];\n"
+        f'node["place"~"^({_TOWN_PLACE_TYPES})$"]'
+        f"(around:{radius},{lat:.7f},{lon:.7f});\n"
+        f"out center tags {cfg.overpass_max_elements};"
+    )
+    elements = await _overpass(query_ql)
+
+    # `town in display_name` only excludes names that are substrings of the center
+    # label (e.g. "Sacramento" out of "Sacramento, …"), so a distinct neighbor like
+    # "West Sacramento" — not a substring — is correctly kept.
+    exclude_l = (exclude or "").lower()
+    towns = []
+    for el in elements:
+        if el.get("type") == "node":
+            e_lat, e_lon = el.get("lat"), el.get("lon")
+        else:
+            center = el.get("center") or {}
+            e_lat, e_lon = center.get("lat"), center.get("lon")
+        if e_lat is None or e_lon is None:
+            continue
+
+        tags = el.get("tags") or {}
+        name = tags.get("name")
+        if not name:
+            continue
+        if exclude_l and name.lower() in exclude_l:
+            continue
+
+        dist = _haversine_m(lat, lon, e_lat, e_lon)
+        town = {
+            "name": name,
+            "latitude": e_lat,
+            "longitude": e_lon,
+            "distance_m": int(round(dist)),
+            "place_type": tags.get("place"),
+            "population": _parse_population(tags.get("population")),
+        }
+        towns.append({k: v for k, v in town.items() if v is not None})
+
+    towns.sort(key=lambda t: t["distance_m"])
+    return towns[:n]
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
     async def find_nearby_places(
@@ -395,6 +466,8 @@ def register(mcp: FastMCP) -> None:
         longitude: float | None = None,
         radius_m: int | None = None,
         limit: int | None = None,
+        include_nearby_towns: bool = False,
+        nearby_towns_limit: int | None = None,
     ) -> str:
         """Find nearby places via OpenStreetMap (Overpass + Nominatim).
 
@@ -405,15 +478,23 @@ def register(mcp: FastMCP) -> None:
         (vegan/vegetarian/halal/kosher/gluten-free). Unknown categories match
         names (e.g., "Starbucks"). radius_m/limit: capped; omit=default.
 
+        include_nearby_towns=true adds a `nearby_towns` list (surrounding
+        cities/towns/villages, nearest-first, with distance+population) to widen
+        the search: pick one and recall with near=<town>.
+
         :param category: What to find (plain language).
         :param near: Place/address (geocoded).
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
         :param radius_m: Search radius (meters, capped).
         :param limit: Max results (capped, nearest-first).
+        :param include_nearby_towns: Also return surrounding towns to recenter on.
+        :param nearby_towns_limit: Max nearby towns (capped, nearest-first).
         :return: JSON {query_category,center:{latitude,longitude,name?},
             radius_m,count,results:[{name,latitude,longitude,distance_m,
-            category,cuisine?,address?,opening_hours?,phone?,website?}]}
+            category,cuisine?,address?,opening_hours?,phone?,website?}],
+            nearby_towns_radius_m?,nearby_towns?:[{name,latitude,longitude,
+            distance_m,place_type?,population?}]}
         """
         log_call(
             log,
@@ -424,6 +505,8 @@ def register(mcp: FastMCP) -> None:
             longitude=longitude,
             radius_m=radius_m,
             limit=limit,
+            include_nearby_towns=include_nearby_towns,
+            nearby_towns_limit=nearby_towns_limit,
         )
         if not (category or "").strip():
             raise ToolError("Empty category. Say what to look for, e.g. 'pharmacy'.")
@@ -506,20 +589,28 @@ def register(mcp: FastMCP) -> None:
         results.sort(key=lambda p: p["distance_m"])
         results = results[:n]
 
-        return log_result(
-            log,
-            "find_nearby_places",
-            to_json(
-                {
-                    "query_category": category.strip(),
-                    "center": {
-                        "latitude": lat,
-                        "longitude": lon,
-                        "name": center_name,
-                    },
-                    "radius_m": radius,
-                    "count": len(results),
-                    "results": results,
-                }
-            ),
-        )
+        payload = {
+            "query_category": category.strip(),
+            "center": {
+                "latitude": lat,
+                "longitude": lon,
+                "name": center_name,
+            },
+            "radius_m": radius,
+            "count": len(results),
+            "results": results,
+        }
+
+        # Optional companion list of surrounding towns to seed follow-up searches.
+        # Only added when asked, so the common case stays lean. max_nearby_towns
+        # doubles as the default (omitting the count returns up to the cap).
+        if include_nearby_towns:
+            towns_n = _clamp(
+                nearby_towns_limit, cfg.max_nearby_towns, cfg.max_nearby_towns
+            )
+            payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
+            payload["nearby_towns"] = await _nearby_towns(
+                lat, lon, towns_n, center_name
+            )
+
+        return log_result(log, "find_nearby_places", to_json(payload))
