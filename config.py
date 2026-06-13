@@ -372,6 +372,24 @@ class GeocodingSettings(BaseSettings):
     max_radius_m: int = Field(
         20000, description="Maximum search radius (meters) for a nearby query."
     )
+
+    # Optional "nearby towns" companion list (city/town/village around the center)
+    # the model can request to seed follow-up searches in neighboring municipalities.
+    # MAX is also the default, so omitting the count returns up to this many.
+    max_nearby_towns: int = Field(
+        10,
+        description=(
+            "Maximum (and default) number of nearby towns returned when the model "
+            "sets include_nearby_towns. Caps the optional companion list."
+        ),
+    )
+    nearby_towns_radius_m: int = Field(
+        40000,
+        description=(
+            "Radius (meters) for the optional nearby-towns search. Larger than the "
+            "POI radius because satellite towns sit well outside a city's core."
+        ),
+    )
     overpass_max_elements: int = Field(
         120,
         description=(
