@@ -484,3 +484,42 @@ async def _cached_resilient_fetch(url: str) -> dict:
     )
     _page_cache.set(url, fetched)
     return fetched
+
+
+async def _render_with_flaresolverr(url: str) -> dict:
+    """Force a FlareSolverr (real-browser, JS-executing) render of `url`.
+
+    Unlike `_resilient_fetch`, this skips the direct httpx attempt and renders
+    straight through FlareSolverr. It's the second attempt a caller makes when a
+    direct fetch *succeeded* but came back with no extractable content — the
+    signature of a client-side-rendered SPA whose body the static fetch can't
+    see. Returns the same raw-fetch dict shape as `_resilient_fetch`.
+
+    The URL is SSRF-guarded first (FlareSolverr runs a real browser, so it must
+    be gated like any other fetch path). On a usable render (text present and not
+    itself a wall) the result replaces any cached direct fetch for this URL, so
+    later fetches and search enrichment reuse the rendered page. Raises if
+    FlareSolverr isn't configured or the render call fails.
+    """
+    flaresolverr_url = cfg.flaresolverr_url or None
+    if not flaresolverr_url:
+        raise RuntimeError("FlareSolverr is not configured (WEB_SEARCH_FLARESOLVERR_URL).")
+    await _assert_url_allowed(url)
+    fs_status, fs_headers, fs_html = await _flaresolverr_fetch(
+        url,
+        flaresolverr_url=flaresolverr_url,
+        max_timeout_ms=cfg.flaresolverr_timeout_ms,
+        http_timeout=max(cfg.http_timeout_seconds, cfg.flaresolverr_timeout_ms / 1000 + 10),
+    )
+    result = {
+        "url": url,
+        "status": fs_status,
+        "content_type": "text/html",
+        "text": fs_html,
+        "bytes": None,
+        "via": "flaresolverr",
+        "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
+    }
+    if fs_html and not result["blocked_detected"]:
+        _page_cache.set(url, result)
+    return result

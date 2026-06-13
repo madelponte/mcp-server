@@ -32,7 +32,12 @@ from mcp.server.fastmcp.exceptions import ToolError
 from config import web_search_settings as cfg
 from .serialize import to_json, log_call, log_result, debug_enabled
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
-from .web_fetch import _cached_resilient_fetch, _is_tika_document, _tika_extract
+from .web_fetch import (
+    _cached_resilient_fetch,
+    _is_tika_document,
+    _render_with_flaresolverr,
+    _tika_extract,
+)
 from .web_extract import (
     _find_section,
     _markdown_from_html,
@@ -413,6 +418,17 @@ def _provenance(
 # Single-URL fetch
 # ---------------------------------------------------------------------------
 
+def _render_text_body(html: str, base_url: str) -> tuple[str, str]:
+    """Render page HTML to ``(body, format)`` for text mode.
+
+    `format` is "markdown" or "text" per the WEB_SEARCH_MARKDOWN valve. Shared by
+    the initial extraction and the FlareSolverr re-render retry in `_fetch_one`.
+    """
+    if cfg.markdown:
+        return _markdown_from_html(html, base_url), "markdown"
+    return _plain_text_from_html(html), "text"
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -621,14 +637,53 @@ async def _fetch_one(
         return section_payload
 
     try:
-        if cfg.markdown:
-            plain = _markdown_from_html(text, fetch_url)
-            text_format = "markdown"
-        else:
-            plain = _plain_text_from_html(text)
-            text_format = "text"
+        plain, text_format = _render_text_body(text, fetch_url)
     except Exception as e:
         raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+
+    # Empty-shell handling. A 200 whose HTML renders to no text is the signature
+    # of a client-side-rendered (JavaScript) page — e.g. MSN, many news SPAs —
+    # whose article body is loaded by an XHR after page load, so the static HTML
+    # this tool fetched is an empty shell. It isn't a bot wall (no challenge for
+    # _is_blocked_response to catch). When FlareSolverr is configured and we
+    # fetched directly, retry through it: it renders in a real browser that runs
+    # the page's JS, which often materializes the body. Re-render from whatever it
+    # returns. (Checked before the query/title paths so an empty page reports as
+    # empty rather than as "query matched nothing".)
+    tried_render = False
+    if not plain.strip() and via != "flaresolverr" and cfg.flaresolverr_url:
+        tried_render = True
+        try:
+            rendered = await _render_with_flaresolverr(fetch_url)
+        except Exception:
+            rendered = None
+        if rendered and rendered.get("text") and not rendered.get("blocked_detected"):
+            text = rendered["text"]
+            status = rendered["status"]
+            ctype = (rendered.get("content_type") or ctype).lower()
+            via = rendered.get("via")
+            soup_title = _page_title(BeautifulSoup(text, "lxml"))
+            try:
+                plain, text_format = _render_text_body(text, fetch_url)
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+
+    # Still nothing after the render attempt (or none was possible): returning the
+    # bare <title> as `content` would look like a real-but-empty article, so
+    # signal the retrieval failure instead, per the error convention.
+    if not plain.strip():
+        hint = (
+            "Even rendering it through the FlareSolverr browser fallback produced "
+            "no text, so the body is likely loaded by a script the fallback didn't "
+            "wait for. Try fetching the article from another source."
+            if tried_render else
+            "Configure the FlareSolverr fallback (WEB_SEARCH_FLARESOLVERR_URL) to "
+            "render JavaScript pages, or fetch the article from another source."
+        )
+        raise ToolError(
+            f"{fetch_url} returned HTTP {status} but no extractable text content — "
+            f"the page renders its content client-side with JavaScript. {hint}"
+        )
 
     # An undetected/bypassed block can't reach here: a detected wall on the
     # direct response already raised above, and a FlareSolverr success has
