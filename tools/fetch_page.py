@@ -56,11 +56,35 @@ log = logging.getLogger(__name__)
 # JSON. See the README "Error handling" section.
 
 # Hard cap on how many URLs a single fetch_page call will fetch when passed a
-# list. A context-budget guard: more than a few full pages in one response blows
-# a small model's window. Kept as a literal (not a config valve) so the exact
-# number can be stated in the tool docstring the model reads — keep the "3" in
-# that docstring in sync if you change this.
-MAX_FETCH_URLS = 3
+# list (the WEB_SEARCH_MAX_FETCH_URLS valve). A context-budget guard: more than a
+# few full pages in one response blows a small model's window. The tool
+# description below is built from it (interpolated, not hardcoded), so the number
+# the model reads always matches the configured cap.
+MAX_FETCH_URLS = cfg.max_fetch_urls
+
+# The model-facing tool description, built once at import so MAX_FETCH_URLS is
+# stated as a concrete number the model can target. The return-shape part is a
+# plain (non-f) string to avoid brace-escaping the JSON shape.
+_FETCH_PAGE_DESC = (
+    "Fetch one or more web page URLs or YouTube video transcripts.\n\n"
+    f"Pass several URLs as a list (up to {MAX_FETCH_URLS}) to read them; URLs "
+    f"past the first {MAX_FETCH_URLS} are skipped. YouTube auto-detects: returns "
+    'transcript (use query= to find topics with [M:SS] timestamps). mode="text" '
+    "(default): page as markdown — headings/lists/tables/links kept, link URLs "
+    'absolute (fetchable). mode="structured": metadata (title, description, '
+    "headings, JSON-LD). section= extracts one heading's content. query= extracts "
+    "matching passages only (keyword/regex, case-insensitive). offset= (char "
+    "position) reads the next chunk of content that was truncated — pass the "
+    "next_offset value from a truncated result to continue reading; works for any "
+    "format incl. JSON/long docs. mode/section/query/offset apply to every URL. "
+    "Use when mcp_search_web result needs deeper reading or to read documents "
+    "(PDF/Word/Excel/RTF/EPUB).\n\n"
+    "Returns — for one URL: JSON {url,format,provenance?,content,query?,"
+    "match_count?,sections?,truncated?,offset?,next_offset?,note?} (format: "
+    '"youtube_transcript"|"markdown"|"text"|"structured"|"section"|'
+    '"document_text"|"json"). For a list: JSON {results:[<that object|'
+    "{url,error}>, ...], note?}, one entry per URL in order."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -892,7 +916,7 @@ async def _fetch_one(
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(description=_FETCH_PAGE_DESC)
     async def fetch_page(
         url: str | list[str],
         mode: str = "text",
@@ -900,21 +924,8 @@ def register(mcp: FastMCP) -> None:
         query: str | None = None,
         offset: int | None = None,
     ) -> str:
-        """Fetch one or more web page URLs or YouTube video transcripts.
-
-        Pass several URLs as a list (up to 3) to read them;
-        URLs past the first 3 are skipped. YouTube auto-detects: returns transcript
-        (use query= to find topics with [M:SS] timestamps). mode="text"
-        (default): page as markdown — headings/lists/tables/links kept, link
-        URLs absolute (fetchable). mode="structured": metadata (title,
-        description, headings, JSON-LD). section= extracts one heading's
-        content. query= extracts matching passages only (keyword/regex,
-        case-insensitive). offset= (char position) reads the next chunk of
-        content that was truncated — pass the next_offset value from a truncated
-        result to continue reading; works for any format incl. JSON/long docs.
-        mode/section/query/offset apply to every URL. Use when mcp_search_web
-        result needs deeper reading or to read documents
-        (PDF/Word/Excel/RTF/EPUB).
+        """Fetch web pages / YouTube transcripts. The model-facing guidance lives
+        in the @mcp.tool(description=...) above (built with the live URL cap).
 
         :param url: One http/https URL as a string, or several as a JSON array
             of strings (e.g. ["https://a.com", "https://b.com"]) — pass an actual
@@ -923,12 +934,6 @@ def register(mcp: FastMCP) -> None:
         :param section: Optional heading text to extract.
         :param query: Optional keyword/regex to filter content.
         :param offset: Character offset to resume reading truncated content from.
-        :return: For one URL: JSON {url,format,provenance?,content,query?,
-            match_count?,sections?,truncated?,offset?,next_offset?,note?} (format:
-            "youtube_transcript"|"markdown"|"text"|"structured"|"section"|
-            "document_text"|"json"). For a list: JSON {results:[<that object|
-            {url,error}>, ...],
-            note?}, one entry per URL in order.
         """
         log_call(
             log, "fetch_page", url=url, mode=mode, section=section, query=query,

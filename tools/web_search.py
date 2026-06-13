@@ -13,10 +13,12 @@ Translated from the Open WebUI tool; status/citation event emitters were removed
 
 import asyncio
 import logging
+from typing import Annotated
 
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 
 from config import web_search_settings as cfg
 from .serialize import to_json, log_call, log_result
@@ -145,8 +147,21 @@ def register(mcp: FastMCP) -> None:
         query: str,
         time_range: str | None = None,
         category: str | None = None,
-        num_results: int | None = None,
-        enrich_results: int | None = None,
+        num_results: Annotated[
+            int | None,
+            Field(
+                description=f"Max results to return, up to {cfg.max_num_results} "
+                "(larger is clamped); omit for the max."
+            ),
+        ] = None,
+        enrich_results: Annotated[
+            int | None,
+            Field(
+                description=f"Top N results to enrich with page metadata, up to "
+                f"{cfg.max_enrich_results} (larger is clamped); default "
+                f"{cfg.default_enrich_results}, 0 disables enrichment."
+            ),
+        ] = None,
         page: int | None = None,
     ) -> str:
         """Search the web. Use for unknown facts, current events, or verification.
@@ -157,16 +172,14 @@ def register(mcp: FastMCP) -> None:
         Query: short keywords only (not sentences). time_range: "day"/"week"/
         "month"/"year"/"all". category: "general"|"news"|"science"|"it"|"social
         media"|"videos"|"images"|"music"|"files"|"map" (comma-separate).
-        num_results/enrich_results: max counts (capped; enrich fetches metadata).
-        page: result page (1-based, default 1) — set page=2 to get the next batch
-        of results for the SAME query when the first page wasn't useful, instead
-        of reformulating.
+        num_results/enrich_results: max counts (see per-arg caps; enrich fetches
+        metadata). page: result page (1-based, default 1) — set page=2 to get the
+        next batch of results for the SAME query when the first page wasn't
+        useful, instead of reformulating.
 
         :param query: Keywords.
         :param time_range: Recency filter.
         :param category: Category (comma-separate).
-        :param num_results: Max results (capped).
-        :param enrich_results: Top N to enrich with metadata (capped).
         :param page: Result page number (1-based; default 1).
         :return: JSON {query, time_range, category, page, results:[{url,title,
             snippet,published_date?,page_title?,page_description?,page_headings?,
