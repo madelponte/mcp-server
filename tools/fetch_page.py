@@ -520,6 +520,49 @@ async def _wayback_content(fetch_url: str) -> dict | None:
     }
 
 
+async def _archived_text_payload(
+    url: str, fetch_url: str, wb: dict, *, query: str | None, offset: int, reason: str
+) -> dict:
+    """Build a fetch_page text payload from a `_wayback_content` result.
+
+    Shared by both fallbacks that substitute an archived copy for an unreadable
+    live page (a blocked/throttled page, or a JS empty shell). Honors `query` and
+    `offset` like the live text path, and tags the result as archived
+    (``via="archive.org"`` + an ``archived_snapshot`` field + a staleness note
+    prefixed by `reason`, e.g. "The live page is rate-limited (HTTP 429)") so the
+    model treats it as possibly out of date rather than live.
+    """
+    text, plain, text_format = wb["text"], wb["plain"], wb["format"]
+    meta = wb["meta"]
+    soup_title = _page_title(BeautifulSoup(text, "lxml"))
+    payload = {
+        "url": fetch_url,
+        **_provenance(url, fetch_url, wb["status"], wb["content_type"], "archive.org"),
+        "format": text_format,
+        "title": soup_title,
+    }
+    if query:
+        qres = await _query_payload(plain, query, fetch_url, kind="content")
+        content = qres.pop("content")
+        if soup_title:
+            content = f"{soup_title}\n\n{content}"
+        payload.update(qres)
+        _set_content(payload, content, offset=offset)
+    else:
+        if soup_title:
+            plain = f"{soup_title}\n\n{plain}"
+        _set_content(payload, plain, offset=offset)
+    # Tag after content is set, so it survives the query path's `update()` and
+    # merges onto (not under) any truncation note from `_set_content`.
+    payload["archived_snapshot"] = meta
+    payload["note"] = _join_note(
+        payload.get("note"),
+        f"{reason}; this is an archived snapshot from {meta['date']} via the "
+        "Wayback Machine and may be out of date.",
+    )
+    return payload
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -594,6 +637,21 @@ async def _fetch_one(
     # convention guards against), so raise instead — telling the model the
     # page is protected, and the operator what (if anything) is left to try.
     if fetched.get("blocked_detected"):
+        # FlareSolverr (already attempted inside _resilient_fetch on a block/429)
+        # couldn't clear the wall. The page itself exists, so try the Wayback
+        # Machine — the same archived-snapshot rescue used for empty shells —
+        # before giving up. Returned content is clearly flagged as archived.
+        if cfg.wayback_fallback:
+            wb = await _wayback_content(fetch_url)
+            if wb:
+                reason = (
+                    f"The live page is rate-limited (HTTP {status})"
+                    if status == 429
+                    else f"The live page is blocked (HTTP {status})"
+                )
+                return await _archived_text_payload(
+                    url, fetch_url, wb, query=query, offset=offset, reason=reason
+                )
         if via == "flaresolverr":
             detail = (
                 "the FlareSolverr fallback rendered it in a real browser but "
@@ -612,8 +670,9 @@ async def _fetch_one(
                 "no FlareSolverr fallback is configured "
                 "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
             )
+        wall = "rate limit" if status == 429 else "bot/CAPTCHA wall"
         raise ToolError(
-            f"{fetch_url} is behind a bot/CAPTCHA wall (HTTP {status}) and "
+            f"{fetch_url} is behind a {wall} (HTTP {status}) and "
             f"{detail}. The page content could not be retrieved."
         )
 
@@ -765,19 +824,15 @@ async def _fetch_one(
     # content is potentially stale, so it's used only after the live attempts
     # failed, only when it actually has content, and is clearly flagged below
     # (via="archive.org" + archived_snapshot + a staleness note).
-    wayback_meta = None
     tried_wayback = False
     if _is_contentless(plain) and cfg.wayback_fallback:
         tried_wayback = True
         wb = await _wayback_content(fetch_url)
         if wb:
-            text = wb["text"]
-            plain, text_format = wb["plain"], wb["format"]
-            status = wb["status"] or status
-            ctype = (wb["content_type"] or ctype).lower()
-            via = "archive.org"
-            soup_title = _page_title(BeautifulSoup(text, "lxml"))
-            wayback_meta = wb["meta"]
+            return await _archived_text_payload(
+                url, fetch_url, wb, query=query, offset=offset,
+                reason="The live page had no readable content",
+            )
 
     # Still no readable text after every fallback (or none was possible):
     # returning the bare <title> or stray render noise ("; ;") as `content` would
@@ -832,17 +887,6 @@ async def _fetch_one(
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
         _set_content(text_payload, plain, offset=offset)
-
-    # Flag archived content so the model treats it as potentially stale, not live.
-    # Done after content is set so it survives the query path's `update()` and is
-    # merged onto (not clobbered by) any truncation note from `_set_content`.
-    if wayback_meta:
-        text_payload["archived_snapshot"] = wayback_meta
-        text_payload["note"] = _join_note(
-            text_payload.get("note"),
-            f"The live page had no readable content; this is an archived snapshot "
-            f"from {wayback_meta['date']} via the Wayback Machine and may be out of date.",
-        )
 
     return text_payload
 

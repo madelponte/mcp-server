@@ -85,8 +85,17 @@ def _is_blocked_response(status: int, text: str, headers: dict) -> bool:
 
     Covers Cloudflare plus PerimeterX/HUMAN, DataDome, and Akamai Bot Manager —
     each of which serves a challenge under one of ``BLOCK_STATUS_CODES`` (or a
-    bare 200) carrying its own marker rather than the page's real content.
+    bare 200) carrying its own marker rather than the page's real content — and
+    any HTTP 429, which is definitionally a throttle and never real content.
     """
+    # A 429 ("Too Many Requests") is always a rate-limit/throttle: it never
+    # carries the page's real content, and is frequently fingerprint-based bot
+    # detection that a real browser (FlareSolverr) — different TLS/JS fingerprint
+    # — clears, even when a plain client is throttled. Always treat it as a block
+    # so the fallback fires, and so a still-throttled 429 surfaces as an error
+    # rather than its "Too Many Requests" page being returned as data.
+    if status == 429:
+        return True
     hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
     server = hdr_lower.get("server", "")
     set_cookie = hdr_lower.get("set-cookie", "")
