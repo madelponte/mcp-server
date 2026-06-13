@@ -58,10 +58,17 @@ _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 MAX_FETCH_URLS = 3
 
 # ---------------------------------------------------------------------------
-# Cloudflare detection
+# Bot-wall / CAPTCHA detection
+#
+# Detecting a challenge page is what routes a fetch to FlareSolverr (which
+# renders in a real browser) instead of returning the challenge itself as if it
+# were content. Cloudflare is the common case, but it is not the only one:
+# PerimeterX/HUMAN, DataDome, and Akamai Bot Manager all serve a 403 (sometimes a
+# 200) whose body is a JS/CAPTCHA challenge bearing none of the Cloudflare
+# markers — so they must be matched explicitly or the fallback never fires.
 # ---------------------------------------------------------------------------
 
-CLOUDFLARE_STATUS_CODES = {403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
+BLOCK_STATUS_CODES = {403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
 CLOUDFLARE_MARKERS = (
     "cf-ray",
     "cf-chl",
@@ -73,21 +80,44 @@ CLOUDFLARE_MARKERS = (
     "please enable cookies",
     "/cdn-cgi/challenge-platform",
 )
+# Markers for the other major bot walls. Kept separate from the Cloudflare set
+# only for clarity; detection treats them the same way.
+CHALLENGE_MARKERS = (
+    "px-cloud.net",            # PerimeterX / HUMAN (e.g. captcha.px-cloud.net)
+    "/captcha/captcha.js",     # PerimeterX block script path
+    "px-captcha",
+    "perimeterx",
+    "_pxhd",                   # PerimeterX cookie
+    "datadome",                # DataDome
+    "geo.captcha-delivery.com",
+    "ak_bmsc",                 # Akamai Bot Manager
+    "/_sec/cp_challenge",
+)
+ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
 
 
-def _is_cloudflare_block(status: int, text: str, headers: dict) -> bool:
-    """Best-effort detection that a response is a Cloudflare/CAPTCHA wall."""
+def _is_blocked_response(status: int, text: str, headers: dict) -> bool:
+    """Best-effort detection that a response is a bot wall / CAPTCHA challenge.
+
+    Covers Cloudflare plus PerimeterX/HUMAN, DataDome, and Akamai Bot Manager —
+    each of which serves a challenge under one of ``BLOCK_STATUS_CODES`` (or a
+    bare 200) carrying its own marker rather than the page's real content.
+    """
     hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
     server = hdr_lower.get("server", "")
-    if "cloudflare" in server and status in CLOUDFLARE_STATUS_CODES:
+    set_cookie = hdr_lower.get("set-cookie", "")
+    if "cloudflare" in server and status in BLOCK_STATUS_CODES:
         return True
-    if status in CLOUDFLARE_STATUS_CODES:
+    if status in BLOCK_STATUS_CODES:
+        # Some walls signal in headers even when the body is opaque/minified.
+        if "x-datadome" in hdr_lower or "datadome" in set_cookie or "_px" in set_cookie:
+            return True
         t = (text or "")[:8000].lower()
-        if any(m in t for m in CLOUDFLARE_MARKERS):
+        if any(m in t for m in ALL_BLOCK_MARKERS):
             return True
     if status == 200 and text:
         t = text[:4000].lower()
-        hits = sum(1 for m in CLOUDFLARE_MARKERS if m in t)
+        hits = sum(1 for m in ALL_BLOCK_MARKERS if m in t)
         if hits >= 2:
             return True
     return False
@@ -925,7 +955,7 @@ async def _resilient_fetch(
     except Exception:
         text = body.decode("latin-1", errors="replace")
 
-    blocked = _is_cloudflare_block(status, text, headers)
+    blocked = _is_blocked_response(status, text, headers)
     if blocked and flaresolverr_url:
         try:
             fs_status, _, fs_html = await _flaresolverr_fetch(
@@ -1464,6 +1494,31 @@ def register(mcp: FastMCP) -> None:
         ctype = (fetched.get("content_type") or "").lower()
         via = fetched.get("via")
 
+        # Bot wall we couldn't get past: a challenge was detected and we're still
+        # on the direct response (FlareSolverr either wasn't configured, or ran
+        # and failed — when it succeeds, `via` is "flaresolverr"). The body here
+        # is the CAPTCHA/JS challenge, not the page, so returning it would dress a
+        # failure up as data (the very thing the error convention guards against).
+        # Raise instead, telling the model the page is protected — and the
+        # operator how to enable the bypass.
+        if fetched.get("blocked_detected") and via == "direct":
+            if fetched.get("flaresolverr_error"):
+                detail = (
+                    "the FlareSolverr fallback ran but could not solve it "
+                    f"({fetched['flaresolverr_error']})"
+                )
+            elif cfg.flaresolverr_url:
+                detail = "the FlareSolverr fallback did not resolve it"
+            else:
+                detail = (
+                    "no FlareSolverr fallback is configured "
+                    "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
+                )
+            raise ToolError(
+                f"{fetch_url} is behind a bot/CAPTCHA wall (HTTP {status}) and "
+                f"{detail}. The page content could not be retrieved."
+            )
+
         # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
         # routed to Apache Tika and returned as plain text, regardless of the
         # requested mode.
@@ -1584,11 +1639,9 @@ def register(mcp: FastMCP) -> None:
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-        if fetched.get("blocked_detected") and via == "direct":
-            note = "NOTE: page appeared to be Cloudflare-blocked and FlareSolverr fallback did not succeed."
-        else:
-            note = None
-
+        # An undetected/bypassed block can't reach here: a detected wall on the
+        # direct response already raised above, and a FlareSolverr success has
+        # via="flaresolverr". So no block note is needed on this path.
         text_payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype, via),
@@ -1602,14 +1655,10 @@ def register(mcp: FastMCP) -> None:
             if soup_title:
                 content = f"{soup_title}\n\n{content}"
             text_payload.update(qres)
-            # A query-filter note takes precedence over the Cloudflare note, but
-            # keep the block warning if there was no query note to report.
-            text_payload["note"] = text_payload.get("note") or note
             _set_content(text_payload, content, offset=offset)
         else:
             if soup_title:
                 plain = f"{soup_title}\n\n{plain}"
-            text_payload["note"] = note
             _set_content(text_payload, plain, offset=offset)
 
         return text_payload
