@@ -916,7 +916,9 @@ def register(mcp: FastMCP) -> None:
         result needs deeper reading or to read documents
         (PDF/Word/Excel/RTF/EPUB).
 
-        :param url: One http/https URL, or a list of them.
+        :param url: One http/https URL as a string, or several as a JSON array
+            of strings (e.g. ["https://a.com", "https://b.com"]) — pass an actual
+            array, not the array written as a single string.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract.
         :param query: Optional keyword/regex to filter content.
@@ -937,6 +939,22 @@ def register(mcp: FastMCP) -> None:
         # one page object unchanged; a list returns {"results": [...]} so a
         # small model can read several pages in one call instead of chaining
         # fetches and risking a derail.
+        #
+        # Models frequently mishandle the `str | list[str]` union by passing the
+        # list *JSON-encoded as a string* (e.g. '["https://a", "https://b"]'),
+        # which validly matches the string branch and would otherwise be treated
+        # as one bogus URL. Detect that shape and decode it back into a list so
+        # the call succeeds instead of failing with "Invalid URL".
+        if isinstance(url, str):
+            stripped = url.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                try:
+                    decoded = json.loads(stripped)
+                except (ValueError, TypeError):
+                    decoded = None
+                if isinstance(decoded, list):
+                    url = decoded
+
         single_input = isinstance(url, str)
         raw = [url] if single_input else url if isinstance(url, list) else None
         if raw is None:
