@@ -3,7 +3,7 @@ MCP server entrypoint.
 
 Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, and Geocoding &
 Place Search tools into a single MCP server. (YouTube video transcripts are
-served by web_search's fetch_page rather than a standalone tool.) Configuration
+served by the fetch_page tool rather than a standalone tool.) Configuration
 comes entirely from environment variables — see config.py and .env.example.
 
 Run locally:
@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
 from config import server_settings
-from tools import web_search, stock_data, wolfram_alpha, geocoding
+from tools import web_search, fetch_page, stock_data, wolfram_alpha, geocoding
 
 
 def build_server() -> FastMCP:
@@ -46,9 +46,10 @@ def build_server() -> FastMCP:
         port=server_settings.port,
     )
 
-    # Register every tool group. (YouTube transcripts are handled inside
-    # web_search.fetch_page, not as a separate tool — see tools/youtube_transcript.py.)
+    # Register every tool group. (YouTube transcripts are handled inside the
+    # fetch_page tool, not as a separate tool — see tools/youtube_transcript.py.)
     web_search.register(mcp)
+    fetch_page.register(mcp)
     stock_data.register(mcp)
     wolfram_alpha.register(mcp)
     geocoding.register(mcp)
