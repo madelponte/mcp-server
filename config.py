@@ -224,6 +224,15 @@ class StockSettings(BaseSettings):
     # model request a smaller range per call; anything above these caps is
     # clamped down so an oversized response can't overwhelm the model's context
     # window. When the model doesn't specify, the cap is used (the prior behavior).
+    max_symbols: int = Field(
+        2,
+        description=(
+            "Maximum number of tickers/names a single get_company_data call will "
+            "process when passed a list; extras are skipped. Lets the model compare "
+            "a few companies in one call without blowing its context window. The "
+            "tool description states this number to the model."
+        ),
+    )
     max_news_items: int = Field(5, description="Maximum news articles returned per query.")
     max_news_lookback_days: int = Field(
         30, description="Maximum days of company news to look back on."
