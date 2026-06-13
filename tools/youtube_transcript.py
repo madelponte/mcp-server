@@ -15,7 +15,7 @@ import re
 from urllib.parse import urlparse, parse_qs
 
 import anyio
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ToolError
 
 # Compatible with youtube-transcript-api >= 1.0.0
 from youtube_transcript_api import YouTubeTranscriptApi
