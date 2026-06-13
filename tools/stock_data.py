@@ -8,9 +8,7 @@ Exposes a single tool:
   (``Apple``); a name is resolved to its ticker via symbol search before any
   data is fetched, so the model never has to make a separate lookup call. The
   caller chooses which sections to fetch: ``quote``, ``profile``,
-  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``,
-  ``sector_comparison`` (the last compares the company's P/E to its sector and
-  industry averages and is FMP-only).
+  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``.
 
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
@@ -958,91 +956,6 @@ def _fmp_earnings(symbol: str, limit: int) -> dict | None:
     return {"provider": "fmp", "symbol": symbol, "earnings": rows}
 
 
-def _fmp_pe_snapshot(kind: str, exchange: str, date: str) -> dict[str, float]:
-    """Return ``{label: pe}`` for one exchange's sector- or industry-level P/E
-    snapshot. ``kind`` is ``"sector"`` or ``"industry"`` (also the row field
-    holding the label)."""
-    rows = _fmp_get(f"{kind}-pe-snapshot", {"date": date, "exchange": exchange})
-    out: dict[str, float] = {}
-    if isinstance(rows, list):
-        for r in rows:
-            label = r.get(kind)
-            pe = _safe_float(r.get("pe"))
-            if label and pe is not None:
-                out[label] = pe
-    return out
-
-
-def _fmp_pe_dimension(name: str, average_pe: float | None, company_pe: float | None) -> dict:
-    """Build one comparison dimension (sector or industry): the group average P/E
-    and, when the company's own P/E is known, how it stacks up against it."""
-    dim: dict[str, Any] = {"name": name, "average_pe": round(average_pe, 4) if average_pe is not None else None}
-    if average_pe is None:
-        dim["note"] = "no P/E snapshot available for this exchange"
-        return dim
-    if company_pe is not None and average_pe:
-        diff = company_pe - average_pe
-        dim["company_vs_average"] = round(diff, 4)
-        dim["premium_percent"] = round((company_pe / average_pe - 1) * 100, 2)
-        # 5% band around the average counts as in-line rather than over/under-valued.
-        dim["valuation"] = (
-            "in_line" if abs(diff) / average_pe < 0.05
-            else "above_average" if diff > 0 else "below_average"
-        )
-    return dim
-
-
-def _fmp_sector_comparison(symbol: str) -> dict | None:
-    """Compare a company's trailing P/E against its sector and industry averages.
-
-    FMP-only: the per-exchange sector/industry P/E snapshots have no free
-    yfinance/Finnhub equivalent. Returns ``None`` when the symbol has no FMP
-    profile (e.g. a non-equity ticker) or when neither its sector nor its
-    industry has a P/E for its exchange (e.g. an exchange the snapshot omits).
-    """
-    profile = _fmp_get("profile", {"symbol": symbol})
-    if not isinstance(profile, list) or not profile:
-        return None
-    p = profile[0]
-    sector = p.get("sector")
-    industry = p.get("industry")
-    exchange = p.get("exchange")
-    if not exchange or not (sector or industry):
-        return None
-
-    # The company's own trailing P/E — the value the averages are compared to.
-    company_pe = None
-    try:
-        ratios = _fmp_get("ratios-ttm", {"symbol": symbol})
-        if isinstance(ratios, list) and ratios:
-            company_pe = _safe_float(ratios[0].get("priceToEarningsRatioTTM"))
-    except Exception:
-        company_pe = None
-
-    date = datetime.now(tz=timezone.utc).date().isoformat()
-    sector_pes = _fmp_pe_snapshot("sector", exchange, date) if sector else {}
-    industry_pes = _fmp_pe_snapshot("industry", exchange, date) if industry else {}
-
-    sector_pe = sector_pes.get(sector) if sector else None
-    industry_pe = industry_pes.get(industry) if industry else None
-    if sector_pe is None and industry_pe is None:
-        return None
-
-    result: dict[str, Any] = {
-        "provider": "fmp",
-        "symbol": symbol,
-        "as_of": date,
-        "exchange": exchange,
-        "metric": "pe_ttm",
-        "company_pe": company_pe,
-    }
-    if sector:
-        result["sector"] = _fmp_pe_dimension(sector, sector_pe, company_pe)
-    if industry:
-        result["industry"] = _fmp_pe_dimension(industry, industry_pe, company_pe)
-    return result
-
-
 # ===================================================================
 #                       SYMBOL RESOLUTION
 # ===================================================================
@@ -1162,7 +1075,7 @@ def _resolve_symbol(raw: str) -> tuple[str, dict | None]:
 # replaced each repeated that pattern; it now lives in one helper so the
 # consolidated `get_company_data` tool can fetch any mix of sections.
 
-VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history", "sector_comparison")
+VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history")
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
@@ -1249,19 +1162,6 @@ def _section_insiders(symbol: str, opts: dict):
     )
 
 
-def _section_sector_comparison(symbol: str, opts: dict):
-    # FMP-only: the sector/industry P/E snapshots have no free yfinance/Finnhub
-    # equivalent, so (unlike the other sections) there is no fallback. Without an
-    # FMP key configured the section reports the data is unavailable rather than
-    # silently returning nothing.
-    if not cfg.fmp_api_key:
-        return None, ["sector_comparison requires an FMP API key (set STOCK_FMP_API_KEY)"]
-    try:
-        return _fmp_sector_comparison(symbol), []
-    except Exception as e:
-        return None, [f"fmp: {type(e).__name__}: {e}"]
-
-
 def _section_history(symbol: str, opts: dict):
     # Price history is yfinance-only (Finnhub/FMP have no cheap OHLC bars); the
     # empty primary map routes every resolved provider to the yfinance fetcher.
@@ -1280,7 +1180,6 @@ _SECTION_FETCHERS = {
     "news": _section_news,
     "insiders": _section_insiders,
     "price_history": _section_history,
-    "sector_comparison": _section_sector_comparison,
 }
 
 
@@ -1443,17 +1342,15 @@ def register(mcp: FastMCP) -> None:
 
         sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
         "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
-        "insiders"(buy/sell txns)|"price_history"(OHLC bars)|
-        "sector_comparison"(company P/E vs its sector & industry average P/E).
+        "insiders"(buy/sell txns)|"price_history"(OHLC bars).
         Params: statement(income|balance|cashflow), period(annual|quarterly),
         periods, news_items, insider_weeks, history_bars, news_days (all capped;
         omit=max). history_interval(1d|1wk|1mo): bar size for price_history —
         use 1wk/1mo to cover months/years within the same bar budget.
 
         Use for: current price, company fundamentals, financial statements,
-        earnings reports, recent news, insider trading, price charts, valuation
-        vs sector/industry peers. Crypto/FX/indices (BTC-USD, ^GSPC) only
-        support quote/price_history. "sector_comparison" is equities-only.
+        earnings reports, recent news, insider trading, price charts. Crypto/FX/
+        indices (BTC-USD, ^GSPC) only support quote/price_history.
 
         :param sections: Sections to fetch (default: quote,profile).
         :param statement: Financials statement type.
