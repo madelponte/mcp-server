@@ -17,6 +17,7 @@ Financial Modeling Prep for deep financial statements. Translated from the Open
 WebUI tool; per-user valves and status emitters were removed.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -299,11 +300,11 @@ def _finnhub_earnings(symbol: str, limit: int) -> dict | None:
     return {"provider": "finnhub", "symbol": symbol, "earnings": rows}
 
 
-def _finnhub_news(symbol: str, limit: int) -> dict | None:
+def _finnhub_news(symbol: str, limit: int, days: int = 7) -> dict | None:
     token = _finnhub_require_key()
     from datetime import date, timedelta
     today = date.today()
-    from_date = (today - timedelta(days=7)).isoformat()
+    from_date = (today - timedelta(days=days)).isoformat()
     to_date = today.isoformat()
     data = _http_get_json(
         "https://finnhub.io/api/v1/company-news",
@@ -619,7 +620,10 @@ def _yfinance_earnings(symbol: str, limit: int) -> dict | None:
     return {"provider": "yfinance", "symbol": symbol, "earnings": rows}
 
 
-def _yfinance_news(symbol: str, limit: int) -> dict | None:
+def _yfinance_news(symbol: str, limit: int, days: int | None = None) -> dict | None:
+    # `days` is accepted for a uniform section signature with _finnhub_news but
+    # unused: yfinance's news endpoint returns only a recent window with no
+    # server-side date range to pass through.
     ticker = _yfinance_ticker(symbol)
     try:
         news = ticker.news or []
@@ -724,21 +728,35 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
     }
 
 
-def _yfinance_history(symbol: str, bars: int) -> dict | None:
-    """Daily OHLC price history (the lone non-point-in-time section).
+# Approximate calendar days each interval's bar spans, used to size the fetch
+# window so it holds `bars` rows. Daily uses ~5 trading days per 7 calendar days;
+# weekly/monthly bars span the obvious calendar spacing. Generous slack (a
+# multiplier + a constant) covers holidays/closures so we don't come up short.
+_HISTORY_INTERVAL_DAYS = {"1d": 1.5, "1wk": 7, "1mo": 31}
+
+
+def _yfinance_history(symbol: str, bars: int, interval: str = "1d") -> dict | None:
+    """OHLC price history at a daily/weekly/monthly interval (the lone
+    non-point-in-time section).
 
     yfinance's ``.history()`` is the cheap source of a price time series;
     Finnhub/FMP don't offer comparable OHLC bars on their free tiers, so this
-    section is yfinance-only. We request a calendar window wide enough to hold
-    ``bars`` trading days (~5 per 7 calendar days, plus slack for holidays) and
-    keep the most recent ``bars`` rows.
+    section is yfinance-only. `interval` is "1d", "1wk", or "1mo": the same
+    ``bars`` budget then covers a wider span (e.g. 30 weekly or monthly bars =
+    ~7 months or ~2.5 years) without enlarging the response. We request a
+    calendar window wide enough to hold ``bars`` of the chosen interval (plus
+    slack for closures) and keep the most recent ``bars`` rows.
     """
     from datetime import date, timedelta
 
+    if interval not in _HISTORY_INTERVAL_DAYS:
+        interval = "1d"
+    span_days = int(bars * _HISTORY_INTERVAL_DAYS[interval]) + 10
+
     ticker = _yfinance_ticker(symbol)
-    start = (date.today() - timedelta(days=bars * 2 + 10)).isoformat()
+    start = (date.today() - timedelta(days=span_days)).isoformat()
     try:
-        df = ticker.history(start=start, interval="1d", auto_adjust=False)
+        df = ticker.history(start=start, interval=interval, auto_adjust=False)
     except Exception:
         return None
     if df is None or df.empty:
@@ -762,7 +780,7 @@ def _yfinance_history(symbol: str, bars: int) -> dict | None:
     return {
         "provider": "yfinance",
         "symbol": symbol,
-        "interval": "1d",
+        "interval": interval,
         "count": len(rows),
         "bars": rows,
     }
@@ -1218,7 +1236,7 @@ def _section_news(symbol: str, opts: dict):
     return _fetch_section(
         _resolve_provider(cfg.default_provider),
         {"finnhub": _finnhub_news, "yfinance": _yfinance_news},
-        _yfinance_news, (symbol, opts["news_items"]),
+        _yfinance_news, (symbol, opts["news_items"], opts["news_days"]),
     )
 
 
@@ -1249,7 +1267,7 @@ def _section_history(symbol: str, opts: dict):
     return _fetch_section(
         _resolve_provider(cfg.default_provider),
         {},
-        _yfinance_history, (symbol, opts["history_bars"]),
+        _yfinance_history, (symbol, opts["history_bars"], opts["history_interval"]),
     )
 
 
@@ -1265,7 +1283,7 @@ _SECTION_FETCHERS = {
 }
 
 
-def _gather_sections(
+async def _gather_sections(
     symbol: str,
     sections: list[str],
     statement: str,
@@ -1274,14 +1292,20 @@ def _gather_sections(
     news_items: int | None,
     insider_weeks: int | None,
     history_bars: int | None,
+    news_days: int | None,
+    history_interval: str,
 ):
-    """Fetch every requested section in one worker thread.
+    """Fetch every requested section concurrently.
 
-    The amount knobs (``periods``/``news_items``/``insider_weeks``) are the raw
-    values the model requested (or ``None`` for "use the configured maximum").
-    Each is clamped to its env-configured cap here before any fetcher runs, so a
-    section can never return more than its maximum. ``periods`` drives both the
-    financials and earnings sections, each clamped to its own cap.
+    The amount knobs (``periods``/``news_items``/``insider_weeks``/``news_days``)
+    are the raw values the model requested (or ``None`` for "use the configured
+    maximum"). Each is clamped to its env-configured cap here before any fetcher
+    runs, so a section can never return more than its maximum. ``periods`` drives
+    both the financials and earnings sections, each clamped to its own cap.
+
+    Each section's blocking provider calls run in their own worker thread and the
+    sections are awaited together, so a multi-section call pays the slowest
+    provider's latency rather than the sum of all of them.
 
     Returns ``(data, errors)`` where ``data`` maps a section name to its payload
     and ``errors`` maps a section name to why it produced nothing (a provider
@@ -1293,13 +1317,20 @@ def _gather_sections(
         "financial_periods": _clamp_amount(periods, cfg.max_financial_periods),
         "earnings_periods": _clamp_amount(periods, cfg.max_earnings_periods),
         "news_items": _clamp_amount(news_items, cfg.max_news_items),
+        "news_days": _clamp_amount(news_days, cfg.max_news_lookback_days),
         "insider_weeks": _clamp_amount(insider_weeks, cfg.max_insider_lookback_weeks),
         "history_bars": _clamp_amount(history_bars, cfg.max_history_bars),
+        "history_interval": history_interval,
     }
+    settled = await asyncio.gather(
+        *(
+            anyio.to_thread.run_sync(_SECTION_FETCHERS[section], symbol, opts)
+            for section in sections
+        )
+    )
     data: dict[str, Any] = {}
     errors: dict[str, list[str]] = {}
-    for section in sections:
-        result, errs = _SECTION_FETCHERS[section](symbol, opts)
+    for section, (result, errs) in zip(sections, settled):
         if result:
             data[section] = result
         else:
@@ -1322,15 +1353,19 @@ def register(mcp: FastMCP) -> None:
         news_items: int | None = None,
         insider_weeks: int | None = None,
         history_bars: int | None = None,
+        news_days: int | None = None,
+        history_interval: Literal["1d", "1wk", "1mo"] = "1d",
     ) -> str:
         """Get stock/company data. symbol=ticker or name (auto-resolved).
 
         sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
         "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
-        "insiders"(buy/sell txns)|"price_history"(daily OHLC bars)|
+        "insiders"(buy/sell txns)|"price_history"(OHLC bars)|
         "sector_comparison"(company P/E vs its sector & industry average P/E).
         Params: statement(income|balance|cashflow), period(annual|quarterly),
-        periods, news_items, insider_weeks, history_bars (all capped; omit=max).
+        periods, news_items, insider_weeks, history_bars, news_days (all capped;
+        omit=max). history_interval(1d|1wk|1mo): bar size for price_history —
+        use 1wk/1mo to cover months/years within the same bar budget.
 
         Use for: current price, company fundamentals, financial statements,
         earnings reports, recent news, insider trading, price charts, valuation
@@ -1344,7 +1379,9 @@ def register(mcp: FastMCP) -> None:
         :param periods: Count for financials/earnings.
         :param news_items: Article count.
         :param insider_weeks: Lookback weeks.
-        :param history_bars: Daily bars count.
+        :param history_bars: Price-history bar count.
+        :param news_days: News lookback window in days (capped).
+        :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
         :return: JSON {symbol,sections,data:{...},resolved_from?,errors?}.
         """
         log_call(
@@ -1358,6 +1395,8 @@ def register(mcp: FastMCP) -> None:
             news_items=news_items,
             insider_weeks=insider_weeks,
             history_bars=history_bars,
+            news_days=news_days,
+            history_interval=history_interval,
         )
         raw_query = (symbol or "").strip()
         if not raw_query:
@@ -1386,13 +1425,16 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("statement must be one of: income, balance, cashflow")
         if period not in ("annual", "quarterly"):
             raise ToolError("period must be 'annual' or 'quarterly'")
+        if history_interval not in ("1d", "1wk", "1mo"):
+            raise ToolError("history_interval must be one of: 1d, 1wk, 1mo")
 
         # Turn a ticker-or-name into a concrete ticker before fetching anything.
         symbol, match = await anyio.to_thread.run_sync(_resolve_symbol, raw_query)
 
-        data, errors = await anyio.to_thread.run_sync(
-            _gather_sections, symbol, normalized, statement, period,
+        data, errors = await _gather_sections(
+            symbol, normalized, statement, period,
             periods, news_items, insider_weeks, history_bars,
+            news_days, history_interval,
         )
 
         if not data:

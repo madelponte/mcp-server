@@ -205,6 +205,9 @@ class StockSettings(BaseSettings):
     # clamped down so an oversized response can't overwhelm the model's context
     # window. When the model doesn't specify, the cap is used (the prior behavior).
     max_news_items: int = Field(5, description="Maximum news articles returned per query.")
+    max_news_lookback_days: int = Field(
+        30, description="Maximum days of company news to look back on."
+    )
     max_financial_periods: int = Field(
         4, description="Maximum historical financial periods (income/balance/cashflow) returned."
     )

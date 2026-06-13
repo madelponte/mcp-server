@@ -14,10 +14,12 @@ import json
 import logging
 import re
 import socket
-from functools import lru_cache
+import time
+from functools import lru_cache, partial
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
+import anyio
 import httpx
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -125,31 +127,65 @@ def _trim(text: str, limit: int) -> str:
     return _trim_flagged(text, limit)[0]
 
 
-# Retry hint appended to a fetch_page result whose content had to be truncated to
-# fit cfg.max_page_chars. It points the model at the two ways to pull just the
-# part it needs instead of silently losing the rest or re-fetching the whole page.
-_TRUNCATION_HINT = (
-    "Content was truncated to fit the size limit; the rest was dropped. To get "
-    "more, retry with `query=` (a keyword/phrase or regex — returns only the "
-    "matching passages) or `section=` (a heading — returns only that section)."
+# Hints appended to a fetch_page result whose content had to be truncated to fit
+# cfg.max_page_chars. `_OFFSET_HINT` always applies: `offset=` is the guaranteed
+# way to read the rest of *any* truncated content (it works on JSON and on a
+# headingless document, which `query=`/`section=` can't narrow). `_NARROW_HINT`
+# is added only for formats those two params can target, so the model can jump
+# straight to what it needs instead of paging.
+_OFFSET_HINT = (
+    "Content was truncated to fit the size limit; the rest was dropped. To read "
+    "the next chunk, retry with `offset=<next_offset>` (the value echoed below)."
+)
+_NARROW_HINT = (
+    " To jump straight to the relevant part instead, retry with `query=` (a "
+    "keyword/phrase or regex — returns only the matching passages) or `section=` "
+    "(a heading — returns only that section)."
 )
 
 
-def _set_content(payload: dict, content: str, *, hint: bool = True) -> None:
-    """Trim `content` to the page-size cap and store it on `payload`.
+def _join_note(existing: str | None, extra: str) -> str:
+    """Append `extra` to an existing note (space-separated), or return it alone."""
+    return f"{existing} {extra}" if existing else extra
 
-    When trimming actually dropped text, set ``payload["truncated"] = True`` and
-    (when `hint`) fold the retry hint into ``payload["note"]`` so the model
-    targets the rest with `query=`/`section=` rather than losing it silently.
-    `hint` is False for formats those params can't narrow (e.g. JSON).
+
+def _set_content(
+    payload: dict, content: str, *, hint: bool = True, offset: int = 0
+) -> None:
+    """Slice `content` from `offset`, trim to the page-size cap, store on `payload`.
+
+    `offset` (a character position, default 0) lets the model page through
+    content too long to return at once: the rest of a truncated response is
+    reachable by re-fetching with ``offset=`` set to the ``next_offset`` echoed
+    here. When trimming actually dropped text, set ``payload["truncated"] = True``
+    and ``payload["next_offset"]`` to where the next chunk begins, and fold the
+    offset hint into ``payload["note"]``. When `hint`, also add the
+    `query=`/`section=` narrowing hint — those can't narrow some formats (e.g.
+    JSON), so `hint` is False there, but `offset=` still works.
     """
-    trimmed, truncated = _trim_flagged(content, cfg.max_page_chars)
+    total = len(content)
+    start = offset if offset > 0 else 0
+    if start and start >= total:
+        # The model paged past the end — return empty content and say so rather
+        # than silently looking like a successful empty fetch.
+        payload["content"] = ""
+        payload["note"] = _join_note(
+            payload.get("note"),
+            f"offset {start} is at or past the end of the {total}-char content.",
+        )
+        return
+
+    body = content[start:] if start else content
+    trimmed, truncated = _trim_flagged(body, cfg.max_page_chars)
     payload["content"] = trimmed
+    if start:
+        payload["offset"] = start
     if truncated:
         payload["truncated"] = True
+        payload["next_offset"] = start + cfg.max_page_chars
+        payload["note"] = _join_note(payload.get("note"), _OFFSET_HINT)
         if hint:
-            existing = payload.get("note")
-            payload["note"] = f"{existing} {_TRUNCATION_HINT}" if existing else _TRUNCATION_HINT
+            payload["note"] = payload["note"] + _NARROW_HINT
 
 
 def _clamp_count(
@@ -420,17 +456,46 @@ def _find_section(soup: BeautifulSoup, section: str) -> dict | None:
 # only needs the parts about one topic.
 # ---------------------------------------------------------------------------
 
+# ReDoS guard. The model's `query` is compiled as arbitrary regex and run over
+# every segment of a page, so a pathological pattern (catastrophic backtracking)
+# against a long page could pin the CPU and — since the server is single-process
+# — stall every other in-flight tool call. Two bounds keep that in check:
+#   * patterns that are over-long or contain a classically dangerous shape are
+#     refused as regex and matched as a literal substring instead (see
+#     `_compile_query`), and
+#   * the per-call scan is given a wall-clock budget (see `_extract_matches`).
+# The matching itself is also offloaded to a worker thread (`_query_payload`),
+# consistent with the sync-in-async convention.
+_MAX_REGEX_QUERY_CHARS = 200
+
+# Classic catastrophic-backtracking shape: a group that itself contains a
+# quantifier and is then immediately quantified — (a+)+, (.*)+, (x* )*. We refuse
+# to compile these as regex and fall back to a literal search rather than risk an
+# exponential match.
+_NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]")
+
+# Wall-clock budget for a single query's scan over a page's segments. A bound on
+# total matching work even when no individual pattern is pathological (e.g. a
+# very long page); on hitting it we return the matches found so far.
+_QUERY_MATCH_BUDGET_SECONDS = 2.0
+
+
 def _compile_query(query: str) -> re.Pattern:
     """Compile the model's `query` into a case-insensitive pattern.
 
-    The query may be a plain keyword/phrase or a regular expression. If it isn't
-    valid regex (e.g. unbalanced brackets in `cost (usd)`), fall back to matching
-    it as a literal substring so a naive query still works.
+    The query may be a plain keyword/phrase or a regular expression. It is matched
+    as a literal substring (via ``re.escape``) when it is not valid regex (e.g.
+    unbalanced brackets in `cost (usd)`), or when it trips the ReDoS guard — too
+    long, or containing a nested-quantifier shape prone to catastrophic
+    backtracking — so a naive query still works while a dangerous one can't stall
+    the server.
     """
-    try:
-        return re.compile(query, re.IGNORECASE)
-    except re.error:
-        return re.compile(re.escape(query), re.IGNORECASE)
+    if len(query) <= _MAX_REGEX_QUERY_CHARS and not _NESTED_QUANTIFIER_RE.search(query):
+        try:
+            return re.compile(query, re.IGNORECASE)
+        except re.error:
+            pass
+    return re.compile(re.escape(query), re.IGNORECASE)
 
 
 def _segment_text(text: str) -> list[str]:
@@ -461,7 +526,18 @@ def _extract_matches(
         return [], 0, 0
 
     pattern = _compile_query(query)
-    match_idxs = [i for i, seg in enumerate(segments) if pattern.search(seg)]
+    # Scan under a wall-clock budget: if matching is taking too long (a long page,
+    # or a query that slipped past the compile-time guard), stop and use what we
+    # have rather than block the single-process server. The literal/nested-
+    # quantifier guard in `_compile_query` prevents a single segment from blowing
+    # up; this bounds the total across many segments.
+    deadline = time.monotonic() + _QUERY_MATCH_BUDGET_SECONDS
+    match_idxs = []
+    for i, seg in enumerate(segments):
+        if pattern.search(seg):
+            match_idxs.append(i)
+        if time.monotonic() > deadline:
+            break
     if not match_idxs:
         return [], 0, 0
 
@@ -496,7 +572,7 @@ def _format_match_windows(windows: list[str]) -> str:
     )
 
 
-def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
+async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
     """Filter `text` to the segments matching `query`; raise if nothing matches.
 
     Returns fields to merge into a fetch_page result: the formatted ``content``
@@ -504,12 +580,18 @@ def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
     number of ``sections`` (windows) shown, and a ``note`` when some windows were
     dropped to stay within the cap. ``kind`` names what was searched (e.g.
     "content", "transcript segment") for the not-found error.
+
+    The regex matching runs in a worker thread (sync-in-async convention) so a
+    slow scan can't block the event loop along with every other in-flight call.
     """
-    windows, match_count, total_windows = _extract_matches(
-        text,
-        query,
-        context=cfg.query_context_segments,
-        max_windows=cfg.max_query_matches,
+    windows, match_count, total_windows = await anyio.to_thread.run_sync(
+        partial(
+            _extract_matches,
+            text,
+            query,
+            context=cfg.query_context_segments,
+            max_windows=cfg.max_query_matches,
+        )
     )
     if not windows:
         raise ToolError(
@@ -900,6 +982,7 @@ async def _searxng_query(
     timeout: float,
     verify_ssl: bool,
     user_agent: str,
+    page: int = 1,
 ) -> list[dict]:
     """Run a SearXNG JSON query and return [{url, title, snippet, engine}]."""
     params = {"q": query, "format": "json", "safesearch": str(safe_search)}
@@ -909,6 +992,8 @@ async def _searxng_query(
         params["language"] = language
     if time_range:
         params["time_range"] = time_range
+    if page and page > 1:
+        params["pageno"] = str(page)
 
     url = base_url.rstrip("/") + "/search"
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
@@ -1079,6 +1164,7 @@ def register(mcp: FastMCP) -> None:
         category: str | None = None,
         num_results: int | None = None,
         enrich_results: int | None = None,
+        page: int | None = None,
     ) -> str:
         """Search the web. Use for unknown facts, current events, or verification.
 
@@ -1089,14 +1175,19 @@ def register(mcp: FastMCP) -> None:
         "month"/"year"/"all". category: "general"|"news"|"science"|"it"|"social
         media"|"videos"|"images"|"music"|"files"|"map" (comma-separate).
         num_results/enrich_results: max counts (capped; enrich fetches metadata).
+        page: result page (1-based, default 1) — set page=2 to get the next batch
+        of results for the SAME query when the first page wasn't useful, instead
+        of reformulating.
 
         :param query: Keywords.
         :param time_range: Recency filter.
         :param category: Category (comma-separate).
         :param num_results: Max results (capped).
         :param enrich_results: Top N to enrich with metadata (capped).
-        :return: JSON {query, time_range, category, results:[{url,title,snippet,
-            published_date?,page_title?,page_description?,page_headings?,page_toc?}]}
+        :param page: Result page number (1-based; default 1).
+        :return: JSON {query, time_range, category, page, results:[{url,title,
+            snippet,published_date?,page_title?,page_description?,page_headings?,
+            page_toc?}]}
         """
         log_call(
             log,
@@ -1106,6 +1197,7 @@ def register(mcp: FastMCP) -> None:
             category=category,
             num_results=num_results,
             enrich_results=enrich_results,
+            page=page,
         )
         query = (query or "").strip()
         if not query:
@@ -1131,6 +1223,9 @@ def register(mcp: FastMCP) -> None:
         else:
             resolved_categories = category.strip() or cfg.searxng_categories
 
+        # Page is 1-based; anything below 1 (or unset) means the first page.
+        resolved_page = page if isinstance(page, int) and page > 1 else 1
+
         try:
             results = await _searxng_query(
                 base_url=cfg.searxng_url,
@@ -1143,11 +1238,16 @@ def register(mcp: FastMCP) -> None:
                 timeout=cfg.http_timeout_seconds,
                 verify_ssl=cfg.verify_ssl,
                 user_agent=cfg.user_agent,
+                page=resolved_page,
             )
         except Exception as e:
             raise ToolError(f"SearXNG query failed for {query!r}: {e}")
 
-        applied = {"time_range": resolved_time_range or "all", "category": resolved_categories}
+        applied = {
+            "time_range": resolved_time_range or "all",
+            "category": resolved_categories,
+            "page": resolved_page,
+        }
 
         if not results:
             return log_result(
@@ -1196,32 +1296,40 @@ def register(mcp: FastMCP) -> None:
         mode: str = "text",
         section: str | None = None,
         query: str | None = None,
+        offset: int | None = None,
     ) -> str:
         """Fetch one or more web page URLs or YouTube video transcripts.
 
-        Pass several URLs as a list (up to 3) to read them; 
+        Pass several URLs as a list (up to 3) to read them;
         URLs past the first 3 are skipped. YouTube auto-detects: returns transcript
         (use query= to find topics with [M:SS] timestamps). mode="text"
         (default): page as markdown — headings/lists/tables/links kept, link
         URLs absolute (fetchable). mode="structured": metadata (title,
         description, headings, JSON-LD). section= extracts one heading's
         content. query= extracts matching passages only (keyword/regex,
-        case-insensitive). mode/section/query apply to every URL. Use when
-        mcp_search_web result needs deeper reading or to read documents
+        case-insensitive). offset= (char position) reads the next chunk of
+        content that was truncated — pass the next_offset value from a truncated
+        result to continue reading; works for any format incl. JSON/long docs.
+        mode/section/query/offset apply to every URL. Use when mcp_search_web
+        result needs deeper reading or to read documents
         (PDF/Word/Excel/RTF/EPUB).
 
         :param url: One http/https URL, or a list of them.
         :param mode: "text" or "structured".
         :param section: Optional heading text to extract.
         :param query: Optional keyword/regex to filter content.
+        :param offset: Character offset to resume reading truncated content from.
         :return: For one URL: JSON {url,format,provenance?,content,query?,
-            match_count?,sections?,truncated?,note?} (format:
+            match_count?,sections?,truncated?,offset?,next_offset?,note?} (format:
             "youtube_transcript"|"markdown"|"text"|"structured"|"section"|
             "document_text"|"json"). For a list: JSON {results:[<that object|
             {url,error}>, ...],
             note?}, one entry per URL in order.
         """
-        log_call(log, "fetch_page", url=url, mode=mode, section=section, query=query)
+        log_call(
+            log, "fetch_page", url=url, mode=mode, section=section, query=query,
+            offset=offset,
+        )
 
         # Accept a single URL (string) or several (list). A bare string returns
         # one page object unchanged; a list returns {"results": [...]} so a
@@ -1251,14 +1359,18 @@ def register(mcp: FastMCP) -> None:
         skipped = urls[MAX_FETCH_URLS:]
         urls = urls[:MAX_FETCH_URLS]
 
+        # Normalize offset once: 1-based char position into the content; anything
+        # below 1 (or unset) means "from the start".
+        resolved_offset = offset if isinstance(offset, int) and offset > 0 else 0
+
         if single_input and not skipped:
-            payload = await _fetch_one(urls[0], mode, section, query)
+            payload = await _fetch_one(urls[0], mode, section, query, resolved_offset)
             return log_result(log, "fetch_page", to_json(payload))
 
         # Multiple URLs: fetch concurrently, capturing each URL's failure so one
         # bad URL doesn't sink the batch (partial-success contract).
         settled = await asyncio.gather(
-            *(_fetch_one(u, mode, section, query) for u in urls),
+            *(_fetch_one(u, mode, section, query, resolved_offset) for u in urls),
             return_exceptions=True,
         )
         results: list[dict] = []
@@ -1292,11 +1404,13 @@ def register(mcp: FastMCP) -> None:
         mode: str = "text",
         section: str | None = None,
         query: str | None = None,
+        offset: int = 0,
     ) -> dict:
         """Fetch a single URL and return its result payload dict.
 
         Shared by fetch_page for both the one-URL and list-of-URLs paths. Raises
         ToolError on a genuine failure (caught per-URL in the batch path).
+        `offset` resumes truncated content at that character position.
         """
         if not url or not isinstance(url, str):
             raise ToolError("Missing url.")
@@ -1324,7 +1438,7 @@ def register(mcp: FastMCP) -> None:
                 # Keep the metadata header (video id/language/source) for context
                 # and filter only the transcript body that follows the "---" rule.
                 header, sep, body = transcript.partition("\n---\n")
-                qres = _query_payload(
+                qres = await _query_payload(
                     body or transcript, query, url, kind="transcript segment"
                 )
                 filtered = f"{header}{sep}{qres.pop('content')}" if sep else qres.pop("content")
@@ -1372,11 +1486,11 @@ def register(mcp: FastMCP) -> None:
                 "format": "document_text",
             }
             if query:
-                qres = _query_payload(extracted, query, fetch_url, kind="content")
+                qres = await _query_payload(extracted, query, fetch_url, kind="content")
                 doc_payload.update(qres)
-                _set_content(doc_payload, qres["content"])
+                _set_content(doc_payload, qres["content"], offset=offset)
             else:
-                _set_content(doc_payload, extracted)
+                _set_content(doc_payload, extracted, offset=offset)
             return doc_payload
 
         text = fetched.get("text") or ""
@@ -1392,8 +1506,8 @@ def register(mcp: FastMCP) -> None:
                     "format": "json",
                 }
                 # query=/section= can't narrow JSON, so flag truncation without
-                # the retry hint that points at them.
-                _set_content(json_payload, to_json(compact), hint=False)
+                # the retry hint that points at them — but offset= still pages it.
+                _set_content(json_payload, to_json(compact), hint=False, offset=offset)
                 return json_payload
             except Exception:
                 pass
@@ -1450,14 +1564,14 @@ def register(mcp: FastMCP) -> None:
             }
             # When `query` is also given, search within the matched section.
             if query:
-                qres = _query_payload(
+                qres = await _query_payload(
                     section_data["text"], query, fetch_url, kind="content in that section"
                 )
                 section_payload.update(qres)
                 section_body = f"# {section_data['matched_heading']}\n\n{qres['content']}".strip()
             else:
                 section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
-            _set_content(section_payload, section_body)
+            _set_content(section_payload, section_body, offset=offset)
             return section_payload
 
         try:
@@ -1483,7 +1597,7 @@ def register(mcp: FastMCP) -> None:
         }
 
         if query:
-            qres = _query_payload(plain, query, fetch_url, kind="content")
+            qres = await _query_payload(plain, query, fetch_url, kind="content")
             content = qres.pop("content")
             if soup_title:
                 content = f"{soup_title}\n\n{content}"
@@ -1491,11 +1605,11 @@ def register(mcp: FastMCP) -> None:
             # A query-filter note takes precedence over the Cloudflare note, but
             # keep the block warning if there was no query note to report.
             text_payload["note"] = text_payload.get("note") or note
-            _set_content(text_payload, content)
+            _set_content(text_payload, content, offset=offset)
         else:
             if soup_title:
                 plain = f"{soup_title}\n\n{plain}"
             text_payload["note"] = note
-            _set_content(text_payload, plain)
+            _set_content(text_payload, plain, offset=offset)
 
         return text_payload

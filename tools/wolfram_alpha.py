@@ -7,6 +7,7 @@ Translated from the Open WebUI tool — the HTML "card" rendering was dropped
 """
 
 import logging
+from typing import Literal
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -33,7 +34,11 @@ _result_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
 def register(mcp: FastMCP) -> None:
     @mcp.tool()
-    async def query_wolfram_alpha(query: str, assumption: str | None = None) -> str:
+    async def query_wolfram_alpha(
+        query: str,
+        assumption: str | None = None,
+        units: Literal["metric", "nonmetric"] | None = None,
+    ) -> str:
         """Compute/lookup exact facts: math, units, physics, chemistry, finance,
         geography, demographics, dates, nutrition, weather, astronomy.
 
@@ -41,13 +46,18 @@ def register(mcp: FastMCP) -> None:
         "derivative of x^2", "speed of light"). No sentences. Math: use * for
         multiply, ^ for exponent (6*10^14, not 6e14). One property per call.
         If result shows "Assumptions", retry SAME query with assumption=<value>.
+        units="metric"(km, kg, °C) or "nonmetric"(miles, lb, °F) sets the unit
+        system for the answer — set it to match what the question asks for.
         NOT for opinions, news, code, or known facts.
 
         :param query: Keyword query.
         :param assumption: Disambiguation from prior result (if any).
+        :param units: "metric" or "nonmetric" (default: server config).
         :return: Plain text answer.
         """
-        log_call(log, "query_wolfram_alpha", query=query, assumption=assumption)
+        log_call(
+            log, "query_wolfram_alpha", query=query, assumption=assumption, units=units
+        )
         app_id = (cfg.app_id or "").strip()
         if not app_id:
             raise ToolError(
@@ -60,11 +70,18 @@ def register(mcp: FastMCP) -> None:
 
         clean_query = query.strip().replace("\n", " ")
 
+        # Units are per-question, not per-deployment (a US user asking for a
+        # distance wants miles), so the tool param overrides the configured
+        # default when supplied.
+        if units is not None and units not in ("metric", "nonmetric"):
+            raise ToolError("units must be 'metric' or 'nonmetric'.")
+        resolved_units = units or cfg.default_units
+
         params = {
             "input": clean_query,
             "appid": app_id,
             "maxchars": cfg.max_chars,
-            "units": cfg.default_units,
+            "units": resolved_units,
         }
         if assumption:
             params["assumption"] = assumption
@@ -72,7 +89,7 @@ def register(mcp: FastMCP) -> None:
         # Key on everything that affects the result (but never the AppID). A
         # null byte separates fields so values can't collide across boundaries.
         cache_key = "\x00".join(
-            (clean_query, assumption or "", cfg.default_units, str(cfg.max_chars))
+            (clean_query, assumption or "", resolved_units, str(cfg.max_chars))
         )
         cached = _result_cache.get(cache_key)
         if cached is not None:
