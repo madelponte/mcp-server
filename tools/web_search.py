@@ -92,6 +92,13 @@ CHALLENGE_MARKERS = (
     "geo.captcha-delivery.com",
     "ak_bmsc",                 # Akamai Bot Manager
     "/_sec/cp_challenge",
+    # Human-readable text of the *rendered* interstitial these walls serve — what
+    # FlareSolverr gets back when it can't solve an interactive challenge (e.g.
+    # PerimeterX "Press & Hold"). Distinctive enough that the >=2-marker rule on a
+    # 200 keeps them from false-positiving on real pages.
+    "access to this page has been denied",
+    "confirm you are a human",
+    "and not a bot",
 )
 ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
 
@@ -904,7 +911,7 @@ async def _resilient_fetch(
     except Exception as e:
         if flaresolverr_url:
             try:
-                fs_status, _, fs_html = await _flaresolverr_fetch(
+                fs_status, fs_headers, fs_html = await _flaresolverr_fetch(
                     url,
                     flaresolverr_url=flaresolverr_url,
                     max_timeout_ms=flaresolverr_timeout_ms,
@@ -917,7 +924,10 @@ async def _resilient_fetch(
                     "text": fs_html,
                     "bytes": None,
                     "via": "flaresolverr",
-                    "blocked_detected": True,
+                    # Flag the result if FlareSolverr's page is itself a wall
+                    # (interactive challenge it couldn't solve) rather than the
+                    # recovered content.
+                    "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
                 }
             except Exception as fe:
                 raise RuntimeError(
@@ -958,12 +968,17 @@ async def _resilient_fetch(
     blocked = _is_blocked_response(status, text, headers)
     if blocked and flaresolverr_url:
         try:
-            fs_status, _, fs_html = await _flaresolverr_fetch(
+            fs_status, fs_headers, fs_html = await _flaresolverr_fetch(
                 url,
                 flaresolverr_url=flaresolverr_url,
                 max_timeout_ms=flaresolverr_timeout_ms,
                 http_timeout=max(timeout, flaresolverr_timeout_ms / 1000 + 10),
             )
+            # FlareSolverr returning a page isn't the same as a bypass: an
+            # interactive wall (PerimeterX "Press & Hold", a CAPTCHA) renders as
+            # an ordinary page it can't solve. Re-run detection on what it
+            # actually got so a still-walled result is flagged (and raised
+            # downstream) instead of returned as content.
             return {
                 "url": url,
                 "status": fs_status,
@@ -971,7 +986,7 @@ async def _resilient_fetch(
                 "text": fs_html,
                 "bytes": None,
                 "via": "flaresolverr",
-                "blocked_detected": True,
+                "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
             }
         except Exception as fe:
             return {
@@ -1494,17 +1509,24 @@ def register(mcp: FastMCP) -> None:
         ctype = (fetched.get("content_type") or "").lower()
         via = fetched.get("via")
 
-        # Bot wall we couldn't get past: a challenge was detected and we're still
-        # on the direct response (FlareSolverr either wasn't configured, or ran
-        # and failed — when it succeeds, `via` is "flaresolverr"). The body here
-        # is the CAPTCHA/JS challenge, not the page, so returning it would dress a
-        # failure up as data (the very thing the error convention guards against).
-        # Raise instead, telling the model the page is protected — and the
-        # operator how to enable the bypass.
-        if fetched.get("blocked_detected") and via == "direct":
-            if fetched.get("flaresolverr_error"):
+        # Bot wall we couldn't get past: a challenge was detected in the response
+        # we're holding. `blocked_detected` is set whether that response came
+        # direct or back from FlareSolverr — FlareSolverr returning a page is not
+        # the same as a bypass, since an interactive wall (PerimeterX "Press &
+        # Hold", a CAPTCHA) renders as an ordinary page it can't solve. Returning
+        # the challenge would dress a failure up as data (the very thing the error
+        # convention guards against), so raise instead — telling the model the
+        # page is protected, and the operator what (if anything) is left to try.
+        if fetched.get("blocked_detected"):
+            if via == "flaresolverr":
                 detail = (
-                    "the FlareSolverr fallback ran but could not solve it "
+                    "the FlareSolverr fallback rendered it in a real browser but "
+                    "the page is still an interactive challenge (e.g. a "
+                    "'Press & Hold' / CAPTCHA) it cannot solve"
+                )
+            elif fetched.get("flaresolverr_error"):
+                detail = (
+                    "the FlareSolverr fallback could not fetch it "
                     f"({fetched['flaresolverr_error']})"
                 )
             elif cfg.flaresolverr_url:
