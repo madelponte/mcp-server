@@ -5,7 +5,7 @@ groups (originally written for Open WebUI), so they can be used from any
 MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
 support, etc.). `fetch_page` doubles as a YouTube transcript fetcher.
 
-Built on [FastMCP](https://github.com/modelcontextprotocol/python-sdk). The
+Built on [FastMCP v3](https://github.com/jlowin/fastmcp). The
 default transport is **streamable-http**, so the server is reachable over the
 network at `http://<host>:8000/mcp`.
 

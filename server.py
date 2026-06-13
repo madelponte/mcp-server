@@ -14,7 +14,7 @@ Or via Docker / docker-compose (see Dockerfile and docker-compose.yml).
 
 import logging
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
 from config import server_settings
@@ -35,6 +35,9 @@ def build_server() -> FastMCP:
             "MCP_DEBUG enabled: pretty-printed JSON output and verbose tool logging are ON."
         )
 
+    # FastMCP v3's constructor no longer accepts host/port — they're supplied
+    # per-transport at serve time (see run_http() below, which passes them to
+    # uvicorn directly, and mcp.run() for stdio which needs neither).
     mcp = FastMCP(
         "openwebui-tools",
         instructions=(
@@ -42,8 +45,6 @@ def build_server() -> FastMCP:
             "video transcripts), stock market data, Wolfram Alpha computations, and "
             "geocoding & nearby place search (OpenStreetMap)."
         ),
-        host=server_settings.host,
-        port=server_settings.port,
     )
 
     # Register every tool group. (YouTube transcripts are handled inside the
@@ -70,10 +71,13 @@ def run_http(transport: str) -> None:
 
     log = logging.getLogger(__name__)
 
+    # FastMCP v3 unifies app construction under http_app(transport=...); the
+    # 1.0 streamable_http_app()/sse_app() helpers are gone. The streamable-http
+    # app still mounts at /mcp and the SSE app at /sse by default.
     if transport == "sse":
-        app = mcp.sse_app()
+        app = mcp.http_app(transport="sse")
     else:  # streamable-http
-        app = mcp.streamable_http_app()
+        app = mcp.http_app(transport="streamable-http")
 
     token = server_settings.auth_token
     if token:
