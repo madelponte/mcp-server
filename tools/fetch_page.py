@@ -305,16 +305,19 @@ def _normalize_reddit_url(url: str) -> str:
         p = urlparse(url)
     except Exception:
         return url
-    host = (p.netloc or "").lower()
-    if not host.endswith("reddit.com"):
+    # Match reddit.com and its subdomains (www./old./np. …) only. A bare
+    # `endswith("reddit.com")` on the netloc would also catch look-alike domains
+    # like `notreddit.com` (and miss `reddit.com:443`, since the port is part of
+    # the netloc), so test the parsed hostname for an exact or dotted-suffix match.
+    host = (p.hostname or "").lower()
+    if host != "reddit.com" and not host.endswith(".reddit.com"):
         return url
-    host = "www.reddit.com"
     path = p.path or "/"
     if path.endswith("/"):
         path = path[:-1]
     if not path.endswith(".json"):
         path = path + ".json"
-    return urlunparse((p.scheme or "https", host, path, "", p.query, ""))
+    return urlunparse((p.scheme or "https", "www.reddit.com", path, "", p.query, ""))
 
 
 def _compact_reddit_json(data: Any) -> Any:
