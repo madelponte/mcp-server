@@ -34,6 +34,7 @@ from .serialize import to_json, log_call, log_result, debug_enabled
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     _cached_resilient_fetch,
+    _fetch_from_wayback,
     _is_tika_document,
     _render_with_flaresolverr,
     _tika_extract,
@@ -442,6 +443,13 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
+def _format_wayback_date(ts: str) -> str:
+    """Format a 14-digit Wayback timestamp (YYYYMMDDhhmmss) as 'YYYY-MM-DD'."""
+    if len(ts) >= 8 and ts[:8].isdigit():
+        return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
+    return ts or "an unknown date"
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -681,20 +689,62 @@ async def _fetch_one(
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-    # Still no readable text after the render attempt (or none was possible):
+    # Last resort: the live page (even rendered) still has no readable text. Try
+    # the Wayback Machine — a snapshot may have captured content the live SPA
+    # hides behind JS, or the page may since have changed/disappeared. Archived
+    # content is potentially stale, so it's used only after the live attempts
+    # failed, only when it actually has content, and is clearly flagged below
+    # (via="archive.org" + archived_snapshot + a staleness note).
+    wayback_meta = None
+    tried_wayback = False
+    if _is_contentless(plain) and cfg.wayback_fallback:
+        tried_wayback = True
+        archived = await _fetch_from_wayback(fetch_url)
+        if archived and archived.get("text"):
+            try:
+                arc_plain, arc_format = _render_text_body(archived["text"], fetch_url)
+            except Exception:
+                arc_plain, arc_format = "", text_format
+            if not _is_contentless(arc_plain):
+                text = archived["text"]
+                plain, text_format = arc_plain, arc_format
+                status = archived.get("status", status)
+                ctype = (archived.get("content_type") or ctype).lower()
+                via = archived.get("via")  # "archive.org"
+                soup_title = _page_title(BeautifulSoup(text, "lxml"))
+                ts = archived.get("wayback_timestamp", "")
+                wayback_meta = {
+                    "timestamp": ts,
+                    "date": _format_wayback_date(ts),
+                    "url": archived.get("wayback_url"),
+                }
+
+    # Still no readable text after every fallback (or none was possible):
     # returning the bare <title> or stray render noise ("; ;") as `content` would
     # look like a real-but-empty article, so signal the retrieval failure instead,
     # per the error convention. The recovered title (if any) is surfaced as a
     # breadcrumb so the model at least knows what the page was about.
     if _is_contentless(plain):
-        hint = (
-            "Even rendering it through the FlareSolverr browser fallback produced "
-            "no readable text, so the body is likely loaded by a script the "
-            "fallback didn't wait for. Try fetching the article from another source."
-            if tried_render else
-            "Configure the FlareSolverr fallback (WEB_SEARCH_FLARESOLVERR_URL) to "
-            "render JavaScript pages, or fetch the article from another source."
-        )
+        tried = [
+            name
+            for name, used in (
+                ("the FlareSolverr browser fallback", tried_render),
+                ("the Wayback Machine archive", tried_wayback),
+            )
+            if used
+        ]
+        if tried:
+            hint = (
+                f"Even {' and '.join(tried)} produced no readable text, so the "
+                "content is loaded by a script that wasn't captured or no usable "
+                "archive exists. Try another source."
+            )
+        else:
+            hint = (
+                "Enable the FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) or Wayback "
+                "(WEB_SEARCH_WAYBACK_FALLBACK) fallbacks to recover JavaScript-"
+                "rendered or archived pages, or fetch the article from another source."
+            )
         titled = f" (page title: {soup_title!r})" if soup_title else ""
         raise ToolError(
             f"{fetch_url} returned HTTP {status} but no extractable text content — "
@@ -722,6 +772,17 @@ async def _fetch_one(
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
         _set_content(text_payload, plain, offset=offset)
+
+    # Flag archived content so the model treats it as potentially stale, not live.
+    # Done after content is set so it survives the query path's `update()` and is
+    # merged onto (not clobbered by) any truncation note from `_set_content`.
+    if wayback_meta:
+        text_payload["archived_snapshot"] = wayback_meta
+        text_payload["note"] = _join_note(
+            text_payload.get("note"),
+            f"The live page had no readable content; this is an archived snapshot "
+            f"from {wayback_meta['date']} via the Wayback Machine and may be out of date.",
+        )
 
     return text_payload
 

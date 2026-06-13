@@ -15,6 +15,7 @@ import ipaddress
 import logging
 import re
 import socket
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
@@ -522,4 +523,61 @@ async def _render_with_flaresolverr(url: str) -> dict:
     }
     if fs_html and not result["blocked_detected"]:
         _page_cache.set(url, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Wayback Machine (archive.org) fallback
+# ---------------------------------------------------------------------------
+
+WAYBACK_AVAILABILITY_API = "https://archive.org/wayback/available"
+
+
+async def _fetch_from_wayback(url: str) -> dict | None:
+    """Fetch `url` from the Internet Archive's Wayback Machine as a last resort.
+
+    Used when the live page (even after a real-browser render) yields no readable
+    content, or has since changed/disappeared: a prior snapshot may have captured
+    text the live SPA hides behind JavaScript. Returns a raw-fetch dict in the
+    `_resilient_fetch` shape — with ``via="archive.org"`` and the snapshot's
+    ``wayback_timestamp`` / ``wayback_url`` — or ``None`` when no usable snapshot
+    exists. Best-effort: any error returns ``None`` rather than raising, since
+    this only ever runs after the live attempts already failed.
+
+    The snapshot is requested in ``id_`` (identity) mode, which returns the
+    original archived HTML with its original links and without the Wayback
+    toolbar/URL-rewriting, so the existing extractors handle it like a live page.
+    The snapshot fetch goes through `_cached_resilient_fetch`, so it is SSRF-
+    guarded and cached like any other; the availability API is a fixed host.
+    """
+    now = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
+    try:
+        async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
+            resp = await client.get(
+                WAYBACK_AVAILABILITY_API, params={"url": url, "timestamp": now}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return None
+
+    snap = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    timestamp = snap.get("timestamp") or ""
+    # Accept a snapshot only when it is available and (per the API) was a 200
+    # capture; some snapshots omit `status`, which we tolerate.
+    if not snap.get("available") or not timestamp:
+        return None
+    if str(snap.get("status") or "200") != "200":
+        return None
+
+    snapshot_url = f"https://web.archive.org/web/{timestamp}id_/{url}"
+    try:
+        fetched = await _cached_resilient_fetch(snapshot_url)
+    except Exception:
+        return None
+
+    result = dict(fetched)
+    result["via"] = "archive.org"
+    result["wayback_timestamp"] = timestamp
+    result["wayback_url"] = f"https://web.archive.org/web/{timestamp}/{url}"
     return result
