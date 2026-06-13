@@ -10,8 +10,8 @@ import logging
 from typing import Literal
 
 import httpx
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from config import wolfram_settings as cfg
 from .cache import TTLCache

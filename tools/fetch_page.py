@@ -26,8 +26,8 @@ from urllib.parse import urlparse, urlunparse
 
 import anyio
 from bs4 import BeautifulSoup
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
+from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg
 from .serialize import to_json, log_call, log_result, debug_enabled
