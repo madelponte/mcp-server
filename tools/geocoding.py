@@ -17,11 +17,13 @@ import logging
 import math
 import re
 import time
+from typing import Annotated
 
 import anyio
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 
 from config import geocoding_settings as cfg
 from .cache import TTLCache
@@ -457,44 +459,72 @@ async def _nearby_towns(
     return towns[:n]
 
 
+# The tool's model-facing description and the per-arg cap descriptions are built
+# at registration time (below) from `cfg`, so the configured caps/defaults appear
+# as concrete numbers the model can target instead of vague "capped". The return
+# schema is a plain (non-f) string to avoid brace-escaping the JSON shape.
+_RETURN_SCHEMA = (
+    "Returns JSON {query_category,center:{latitude,longitude,name?},radius_m,"
+    "count,results:[{name,latitude,longitude,distance_m,category,cuisine?,"
+    "address?,opening_hours?,phone?,website?}],nearby_towns_radius_m?,"
+    "nearby_towns?:[{name,latitude,longitude,distance_m,place_type?,population?}]}"
+)
+
+
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    description = (
+        "Find nearby places via OpenStreetMap (Overpass + Nominatim).\n\n"
+        'Location: near="city/address" (auto-geocoded) OR latitude+longitude. '
+        'NO "near me" access—ask user for location if needed. category: plain '
+        "language (restaurant/coffee/bar/supermarket/pharmacy/hospital/atm/bank/"
+        "gas station/hotel/museum/park/gym/etc). Prefix food with diet (vegan/"
+        "vegetarian/halal/kosher/gluten-free). Unknown categories match names "
+        '(e.g., "Starbucks").\n\n'
+        "include_nearby_towns=true adds a `nearby_towns` list (surrounding "
+        f"cities/towns/villages within {cfg.nearby_towns_radius_m} m, nearest-"
+        "first, with distance+population) to widen the search: pick one and recall "
+        f"with near=<town>.\n\n{_RETURN_SCHEMA}"
+    )
+
+    @mcp.tool(description=description)
     async def find_nearby_places(
         category: str,
         near: str | None = None,
         latitude: float | None = None,
         longitude: float | None = None,
-        radius_m: int | None = None,
-        limit: int | None = None,
+        radius_m: Annotated[
+            int | None,
+            Field(
+                description=f"Search radius in meters. Default "
+                f"{cfg.default_radius_m}, max {cfg.max_radius_m} (larger is clamped)."
+            ),
+        ] = None,
+        limit: Annotated[
+            int | None,
+            Field(
+                description=f"Max results, nearest-first. Default "
+                f"{cfg.default_nearby_results}, max {cfg.max_nearby_results} "
+                "(larger is clamped)."
+            ),
+        ] = None,
         include_nearby_towns: bool = False,
-        nearby_towns_limit: int | None = None,
+        nearby_towns_limit: Annotated[
+            int | None,
+            Field(
+                description="Max nearby towns, nearest-first. Default & max "
+                f"{cfg.max_nearby_towns} (larger is clamped). Needs "
+                "include_nearby_towns=true."
+            ),
+        ] = None,
     ) -> str:
-        """Find nearby places via OpenStreetMap (Overpass + Nominatim).
-
-        Location: near="city/address" (auto-geocoded) OR latitude+longitude.
-        NO "near me" access—ask user for location if needed. category: plain
-        language (restaurant/coffee/bar/supermarket/pharmacy/hospital/atm/
-        bank/gas station/hotel/museum/park/gym/etc). Prefix food with diet
-        (vegan/vegetarian/halal/kosher/gluten-free). Unknown categories match
-        names (e.g., "Starbucks"). radius_m/limit: capped; omit=default.
-
-        include_nearby_towns=true adds a `nearby_towns` list (surrounding
-        cities/towns/villages, nearest-first, with distance+population) to widen
-        the search: pick one and recall with near=<town>.
+        """Find nearby places via OpenStreetMap. The model-facing guidance lives in
+        the @mcp.tool(description=...) above (built with the live caps from cfg).
 
         :param category: What to find (plain language).
         :param near: Place/address (geocoded).
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
-        :param radius_m: Search radius (meters, capped).
-        :param limit: Max results (capped, nearest-first).
         :param include_nearby_towns: Also return surrounding towns to recenter on.
-        :param nearby_towns_limit: Max nearby towns (capped, nearest-first).
-        :return: JSON {query_category,center:{latitude,longitude,name?},
-            radius_m,count,results:[{name,latitude,longitude,distance_m,
-            category,cuisine?,address?,opening_hours?,phone?,website?}],
-            nearby_towns_radius_m?,nearby_towns?:[{name,latitude,longitude,
-            distance_m,place_type?,population?}]}
         """
         log_call(
             log,
