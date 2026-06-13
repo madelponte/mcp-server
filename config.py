@@ -159,6 +159,15 @@ class WebSearchSettings(BaseSettings):
             "for the old structure-free plain-text extraction."
         ),
     )
+    max_fetch_urls: int = Field(
+        3,
+        description=(
+            "Maximum number of URLs a single fetch_page call will read when passed "
+            "a list; URLs past this are skipped. A context-budget guard — more than "
+            "a few full pages in one response blows a small model's window. The "
+            "fetch_page tool description states this number to the model."
+        ),
+    )
     max_page_chars: int = Field(15000, description="Max characters of page content before truncation.")
     max_enrich_headings: int = Field(25, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, description="Max characters of each result snippet.")

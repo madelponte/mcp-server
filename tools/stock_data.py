@@ -21,12 +21,13 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import anyio
 import requests
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 
 from config import stock_settings as cfg
 from .cache import TTLCache
@@ -1349,11 +1350,42 @@ def register(mcp: FastMCP) -> None:
         sections: list[str] | None = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
-        periods: int | None = None,
-        news_items: int | None = None,
-        insider_weeks: int | None = None,
-        history_bars: int | None = None,
-        news_days: int | None = None,
+        periods: Annotated[
+            int | None,
+            Field(
+                description=f"Periods for financials (max "
+                f"{cfg.max_financial_periods}) and earnings (max "
+                f"{cfg.max_earnings_periods}); larger is clamped, omit for max."
+            ),
+        ] = None,
+        news_items: Annotated[
+            int | None,
+            Field(
+                description=f"News articles to return, up to {cfg.max_news_items} "
+                "(larger is clamped); omit for max."
+            ),
+        ] = None,
+        insider_weeks: Annotated[
+            int | None,
+            Field(
+                description=f"Insider-trading lookback in weeks, up to "
+                f"{cfg.max_insider_lookback_weeks} (larger is clamped); omit for max."
+            ),
+        ] = None,
+        history_bars: Annotated[
+            int | None,
+            Field(
+                description=f"Price-history bars to return, up to "
+                f"{cfg.max_history_bars} (larger is clamped); omit for max."
+            ),
+        ] = None,
+        news_days: Annotated[
+            int | None,
+            Field(
+                description=f"News lookback in days, up to "
+                f"{cfg.max_news_lookback_days} (larger is clamped); omit for max."
+            ),
+        ] = None,
         history_interval: Literal["1d", "1wk", "1mo"] = "1d",
     ) -> str:
         """Get stock/company data. symbol=ticker or name (auto-resolved).
@@ -1376,11 +1408,6 @@ def register(mcp: FastMCP) -> None:
         :param sections: Sections to fetch (default: quote,profile).
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
-        :param periods: Count for financials/earnings.
-        :param news_items: Article count.
-        :param insider_weeks: Lookback weeks.
-        :param history_bars: Price-history bar count.
-        :param news_days: News lookback window in days (capped).
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
         :return: JSON {symbol,sections,data:{...},resolved_from?,errors?}.
         """
