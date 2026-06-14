@@ -30,7 +30,23 @@ docker build -t openwebui-tools-mcp .
 docker run --rm -p 8000:8000 --env-file .env openwebui-tools-mcp
 ```
 
-There is **no test suite, linter, or formatter** configured. CI (`.github/workflows/`) only builds and publishes the Docker image.
+### Tests
+
+```bash
+pip install -r requirements-dev.txt   # adds pytest to the runtime deps
+pytest                                 # run the whole suite (config in pytest.ini)
+pytest tests/test_stock_data.py        # one module
+pytest -k clamp                        # by keyword
+```
+
+The suite under `tests/` is **offline and deterministic** — no real network, no live API keys. It reads the same `.env` the server does but never asserts on a configured value: caps are read from the live `cfg` at runtime, and anything a test needs pinned is `monkeypatch`ed. Conventions, established in `tests/conftest.py`:
+
+- **Async without a plugin.** Tests are plain sync functions that drive coroutines with the `run()` helper (`asyncio.run`). There is intentionally no `pytest-asyncio` dependency.
+- **Mocked HTTP.** The `patch_httpx` fixture swaps `httpx.AsyncClient` for one backed by an `httpx.MockTransport` handler, so code that builds its own client (wolfram, geocoding, web_search, the SSRF redirect path) is exercised without a socket. Sync clients (`requests` in stock, `httpx.put` for Tika) are monkeypatched per test.
+- **Tool closures.** A registered tool's raw function is reached via `tool.fn` (the `tool_fns` fixture maps every tool name to it): calling it returns the JSON string on success and raises `ToolError` on failure, bypassing MCP serialization. `Tool.run()` is exercised once in `test_server.py` (note it re-raises `ToolError`; the isError wrapping happens at the server request layer, not here).
+- **What's covered.** Pure helpers exhaustively (cache, serialize, web_extract, fetch_page helpers, geocoding/stock/web_search math + clamping, youtube URL parsing), the SSRF guard, block/Tika detection, the bearer-auth middleware, each tool's validation + happy path against mocked providers, and server wiring (tool registration + dynamic cap interpolation in descriptions).
+
+CI (`.github/workflows/`) only builds and publishes the Docker image; there is no linter or formatter configured.
 
 ## Architecture
 

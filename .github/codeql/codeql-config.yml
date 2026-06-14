@@ -1,0 +1,9 @@
+name: "CodeQL config"
+
+# Exclude the offline test suite from analysis. The tests deliberately use
+# substring checks against host strings (e.g. `"www.reddit.com" in url`) that
+# trip queries like py/incomplete-url-substring-sanitization; those patterns are
+# test assertions, not request-routing logic, so they carry no runtime risk.
+# (paths-ignore is honored for interpreted languages such as Python.)
+paths-ignore:
+  - tests

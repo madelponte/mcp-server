@@ -1,0 +1,80 @@
+name: "Security scanning"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 0 * * 0"  # weekly, Sunday 00:00 UTC
+
+jobs:
+  codeql:
+    name: CodeQL (Python)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          # Path exclusions (e.g. tests/) live here — see .github/codeql/codeql-config.yml
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  image-scan:
+    name: Docker image vulnerability scan (Trivy)
+    runs-on: ubuntu-latest
+    # Scans the published :latest image, so skip PRs (which haven't published a
+    # new image) — it runs on pushes to main and on the weekly cron.
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: read          # pull the image from GHCR
+      security-events: write  # upload SARIF to the Security tab
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR image names must be lowercase; github.repository may contain uppercase.
+      - name: Resolve image reference
+        id: img
+        env:
+          IMAGE: ${{ github.repository }}
+        run: echo "ref=ghcr.io/${IMAGE,,}:latest" >> "$GITHUB_OUTPUT"
+
+      # Scans the built image — OS packages from python:3.14-slim plus the
+      # installed Python deps — for known CVEs. Reports to the Security tab via
+      # SARIF; does not fail the job (exit-code defaults to 0), mirroring CodeQL.
+      - name: Run Trivy image vulnerability scan
+        uses: aquasecurity/trivy-action@0.36.0  # bump as new releases land
+        with:
+          scan-type: image
+          image-ref: ${{ steps.img.outputs.ref }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          limit-severities-for-sarif: true
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload results to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image

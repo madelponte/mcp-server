@@ -1,0 +1,319 @@
+"""Tests for the pure helpers in tools/fetch_page.py."""
+
+import tools.fetch_page as fp
+import tools.serialize as serialize
+from tools.fetch_page import (
+    _join_note,
+    _set_content,
+    _compile_query,
+    _segment_text,
+    _extract_matches,
+    _format_match_windows,
+    _normalize_reddit_url,
+    _compact_reddit_json,
+    _provenance,
+    _is_contentless,
+    _format_wayback_date,
+    _strip_wayback_chrome,
+    _render_text_body,
+)
+
+
+# --------------------------- _join_note ---------------------------
+
+def test_join_note_appends():
+    assert _join_note("a", "b") == "a b"
+
+
+def test_join_note_alone():
+    assert _join_note(None, "b") == "b"
+    assert _join_note("", "b") == "b"
+
+
+# --------------------------- _set_content ---------------------------
+
+def test_set_content_no_truncation():
+    payload = {}
+    _set_content(payload, "short content")
+    assert payload["content"] == "short content"
+    assert "truncated" not in payload
+    assert "next_offset" not in payload
+
+
+def test_set_content_truncates_and_sets_next_offset(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 10)
+    payload = {}
+    _set_content(payload, "a" * 50)
+    assert payload["truncated"] is True
+    assert payload["next_offset"] == 10
+    assert "offset=" in payload["note"]
+    # Narrowing hint is added by default.
+    assert "query=" in payload["note"]
+
+
+def test_set_content_no_narrow_hint_when_hint_false(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 10)
+    payload = {}
+    _set_content(payload, "a" * 50, hint=False)
+    assert payload["truncated"] is True
+    assert "query=" not in payload["note"]
+    assert "offset=" in payload["note"]
+
+
+def test_set_content_with_offset(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 1000)
+    payload = {}
+    _set_content(payload, "0123456789", offset=5)
+    assert payload["content"] == "56789"
+    assert payload["offset"] == 5
+
+
+def test_set_content_offset_past_end():
+    payload = {}
+    _set_content(payload, "0123456789", offset=100)
+    assert payload["content"] == ""
+    assert "at or past the end" in payload["note"]
+
+
+# --------------------------- _compile_query ---------------------------
+
+def test_compile_query_valid_regex():
+    pat = _compile_query(r"foo\d+")
+    assert pat.search("foo123")
+    assert not pat.search("bar")
+
+
+def test_compile_query_invalid_regex_falls_back_to_literal():
+    # Unbalanced bracket is not valid regex -> matched literally.
+    pat = _compile_query("cost (usd")
+    assert pat.search("the cost (usd here")
+
+
+def test_compile_query_nested_quantifier_falls_back_to_literal():
+    pat = _compile_query("(a+)+")
+    # Treated as the literal string, not a catastrophic-backtracking regex.
+    assert pat.search("value (a+)+ here")
+    assert not pat.search("aaaa")
+
+
+def test_compile_query_overlong_falls_back_to_literal():
+    long_q = "x" * 300
+    pat = _compile_query(long_q)
+    assert pat.search("prefix " + long_q)
+
+
+def test_compile_query_is_case_insensitive():
+    assert _compile_query("Hello").search("hello world")
+
+
+# --------------------------- _segment_text ---------------------------
+
+def test_segment_text_splits_and_drops_blanks():
+    assert _segment_text("a\n\n  b  \n\nc\n") == ["a", "b", "c"]
+
+
+# --------------------------- _extract_matches ---------------------------
+
+def _text(*lines):
+    return "\n".join(lines)
+
+
+def test_extract_matches_with_context():
+    text = _text("l0", "l1", "match here", "l3", "l4")
+    windows, total_matches, total_windows = _extract_matches(
+        text, "match", context=1, max_windows=10
+    )
+    assert total_matches == 1
+    assert total_windows == 1
+    assert windows == ["l1\nmatch here\nl3"]
+
+
+def test_extract_matches_merges_adjacent():
+    text = _text("match a", "x", "match b")
+    windows, total_matches, total_windows = _extract_matches(
+        text, "match", context=1, max_windows=10
+    )
+    # Two matches within one segment of each other merge into a single window.
+    assert total_matches == 2
+    assert total_windows == 1
+    assert len(windows) == 1
+
+
+def test_extract_matches_respects_max_windows():
+    text = _text("match", "a", "b", "c", "match", "d", "e", "f", "match")
+    windows, total_matches, total_windows = _extract_matches(
+        text, "match", context=0, max_windows=2
+    )
+    assert total_matches == 3
+    assert total_windows == 3
+    assert len(windows) == 2  # capped
+
+
+def test_extract_matches_no_match():
+    windows, total_matches, total_windows = _extract_matches(
+        "nothing here", "absent", context=2, max_windows=10
+    )
+    assert windows == []
+    assert total_matches == 0
+
+
+def test_extract_matches_empty_text():
+    assert _extract_matches("", "x", context=1, max_windows=5) == ([], 0, 0)
+
+
+# --------------------------- _format_match_windows ---------------------------
+
+def test_format_match_windows_single():
+    assert _format_match_windows(["only"]) == "only"
+
+
+def test_format_match_windows_multiple_labels():
+    out = _format_match_windows(["one", "two"])
+    assert "match 1 of 2" in out
+    assert "match 2 of 2" in out
+    assert "one" in out and "two" in out
+
+
+# --------------------------- _normalize_reddit_url ---------------------------
+
+def test_normalize_reddit_url_appends_json():
+    out = _normalize_reddit_url("https://www.reddit.com/r/python/comments/abc/title")
+    assert out.endswith(".json")
+    assert "www.reddit.com" in out
+
+
+def test_normalize_reddit_url_subdomain():
+    out = _normalize_reddit_url("https://old.reddit.com/r/x/comments/abc/title/")
+    assert out.endswith(".json")
+
+
+def test_normalize_reddit_url_already_json():
+    url = "https://www.reddit.com/r/x/comments/abc/title.json"
+    assert _normalize_reddit_url(url).endswith(".json")
+    assert _normalize_reddit_url(url).count(".json") == 1
+
+
+def test_normalize_reddit_url_non_reddit_unchanged():
+    url = "https://example.com/r/python/comments/abc"
+    assert _normalize_reddit_url(url) == url
+
+
+def test_normalize_reddit_url_lookalike_unchanged():
+    url = "https://notreddit.com/r/x/comments/abc"
+    assert _normalize_reddit_url(url) == url
+
+
+# --------------------------- _compact_reddit_json ---------------------------
+
+def test_compact_reddit_json_extracts_post_and_comments():
+    data = [
+        {"data": {"children": [{"data": {
+            "title": "T", "author": "u", "subreddit": "py",
+            "score": 10, "num_comments": 1, "selftext": "body",
+        }}]}},
+        {"data": {"children": [
+            {"kind": "t1", "data": {
+                "author": "c1", "score": 5, "body": "top comment",
+                "replies": {"data": {"children": [
+                    {"kind": "t1", "data": {"author": "c2", "score": 2, "body": "reply"}}
+                ]}},
+            }},
+        ]}},
+    ]
+    out = _compact_reddit_json(data)
+    assert out["post"]["title"] == "T"
+    assert out["comments"][0]["body"] == "top comment"
+    assert out["comments"][0]["depth"] == 0
+    # Nested reply collected with incremented depth.
+    assert out["comments"][1]["body"] == "reply"
+    assert out["comments"][1]["depth"] == 1
+
+
+def test_compact_reddit_json_passthrough_for_unexpected_shape():
+    data = {"unexpected": True}
+    assert _compact_reddit_json(data) == data
+
+
+# --------------------------- _provenance ---------------------------
+
+def test_provenance_happy_path_is_empty(monkeypatch):
+    monkeypatch.setattr(serialize.server_settings, "debug", False)
+    out = _provenance("https://e.com", "https://e.com", 200, "text/html", "direct")
+    assert out == {}
+
+
+def test_provenance_rewritten_url_adds_original():
+    out = _provenance("https://e.com", "https://e.com/x.json", 200, "application/json", "direct")
+    assert out["original_url"] == "https://e.com"
+
+
+def test_provenance_non_200_adds_status(monkeypatch):
+    monkeypatch.setattr(serialize.server_settings, "debug", False)
+    out = _provenance("https://e.com", "https://e.com", 404, "text/html", "direct")
+    assert out["status"] == 404
+    assert out["content_type"] == "text/html"
+
+
+def test_provenance_non_direct_via(monkeypatch):
+    monkeypatch.setattr(serialize.server_settings, "debug", False)
+    out = _provenance("https://e.com", "https://e.com", 200, "text/html", "flaresolverr")
+    assert out["via"] == "flaresolverr"
+
+
+def test_provenance_debug_forces_all(monkeypatch):
+    monkeypatch.setattr(serialize.server_settings, "debug", True)
+    out = _provenance("https://e.com", "https://e.com", 200, "text/html", "direct")
+    assert out["original_url"] == "https://e.com"
+    assert out["status"] == 200
+    assert out["via"] == "direct"
+
+
+# --------------------------- _is_contentless ---------------------------
+
+def test_is_contentless_empty():
+    assert _is_contentless("") is True
+
+
+def test_is_contentless_punctuation_only():
+    assert _is_contentless("; ; -- !!") is True
+
+
+def test_is_contentless_has_word():
+    assert _is_contentless("hi") is False
+    assert _is_contentless("a real sentence") is False
+
+
+# --------------------------- _format_wayback_date ---------------------------
+
+def test_format_wayback_date():
+    assert _format_wayback_date("20230615123000") == "2023-06-15"
+
+
+def test_format_wayback_date_invalid():
+    assert _format_wayback_date("xx") == "xx"
+
+
+# --------------------------- _strip_wayback_chrome ---------------------------
+
+def test_strip_wayback_chrome_removes_toolbar():
+    html = '<body><div id="wm-ipp-base">archive bar</div><p>real</p></body>'
+    out = _strip_wayback_chrome(html)
+    assert "archive bar" not in out
+    assert "real" in out
+
+
+# --------------------------- _render_text_body ---------------------------
+
+def test_render_text_body_markdown(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "markdown", True)
+    body, fmt = _render_text_body("<article><h1>Hi</h1></article>", "https://e.com")
+    assert fmt == "markdown"
+    assert "# Hi" in body
+
+
+def test_render_text_body_plain(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "markdown", False)
+    body, fmt = _render_text_body("<article><h1>Hi</h1><p>text</p></article>", "https://e.com")
+    assert fmt == "text"
+    assert "# Hi" not in body
+    assert "Hi" in body

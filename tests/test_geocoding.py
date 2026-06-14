@@ -1,0 +1,311 @@
+"""Tests for tools/geocoding.py — filters, math, clamping, and async I/O."""
+
+import httpx
+import pytest
+from fastmcp.exceptions import ToolError
+
+import tools.geocoding as geo
+from tools.geocoding import (
+    _build_filters,
+    _haversine_m,
+    _clamp,
+    _compose_address,
+    _primary_category,
+    _parse_population,
+    _is_relative_location,
+    _geocode,
+    _overpass,
+)
+from conftest import run
+
+
+# --------------------------- _build_filters ---------------------------
+
+def test_build_filters_known_category():
+    assert _build_filters("restaurant") == ['["amenity"="restaurant"]']
+
+
+def test_build_filters_longest_key_wins():
+    # "fast food" must beat the shorter "food"-ish matches.
+    assert _build_filters("fast food") == ['["amenity"="fast_food"]']
+
+
+def test_build_filters_diet_plus_category():
+    out = _build_filters("vegan restaurant")
+    assert out == ['["amenity"="restaurant"]["diet:vegan"~"yes|only"]']
+
+
+def test_build_filters_bare_diet_implies_food():
+    out = _build_filters("vegan")
+    assert out == ['["amenity"~"restaurant|cafe|fast_food"]["diet:vegan"~"yes|only"]']
+
+
+def test_build_filters_unknown_falls_back_to_name_search():
+    out = _build_filters("Starbucks")
+    assert out == ['["name"~"Starbucks",i]']
+
+
+def test_build_filters_strips_injection_chars():
+    out = _build_filters('Star"bucks\\')
+    assert out == ['["name"~"Starbucks",i]']
+
+
+def test_build_filters_empty_returns_empty():
+    assert _build_filters("") == []
+    assert _build_filters('"\\') == []
+
+
+# --------------------------- _haversine_m ---------------------------
+
+def test_haversine_zero_distance():
+    assert _haversine_m(40.0, -73.0, 40.0, -73.0) == 0.0
+
+
+def test_haversine_known_distance():
+    # NYC to LA is ~3,936 km; allow generous tolerance.
+    d = _haversine_m(40.7128, -74.0060, 34.0522, -118.2437)
+    assert 3_900_000 < d < 4_000_000
+
+
+# --------------------------- _clamp ---------------------------
+
+def test_clamp_none_uses_default():
+    assert _clamp(None, default=8, maximum=20) == 8
+
+
+def test_clamp_none_default_capped_to_max():
+    assert _clamp(None, default=50, maximum=20) == 20
+
+
+def test_clamp_value_within_range():
+    assert _clamp(5, default=8, maximum=20) == 5
+
+
+def test_clamp_value_above_max():
+    assert _clamp(100, default=8, maximum=20) == 20
+
+
+def test_clamp_value_below_one():
+    assert _clamp(0, default=8, maximum=20) == 1
+    assert _clamp(-3, default=8, maximum=20) == 1
+
+
+def test_clamp_invalid_uses_default():
+    assert _clamp("abc", default=8, maximum=20) == 8
+
+
+# --------------------------- _compose_address ---------------------------
+
+def test_compose_address_full():
+    tags = {"addr:housenumber": "10", "addr:street": "Main St", "addr:city": "Townsville"}
+    assert _compose_address(tags) == "10 Main St, Townsville"
+
+
+def test_compose_address_partial():
+    assert _compose_address({"addr:city": "Townsville"}) == "Townsville"
+    assert _compose_address({"addr:street": "Main St"}) == "Main St"
+
+
+def test_compose_address_none():
+    assert _compose_address({}) is None
+
+
+# --------------------------- _primary_category ---------------------------
+
+def test_primary_category_priority():
+    # amenity outranks shop.
+    assert _primary_category({"shop": "books", "amenity": "cafe"}) == "cafe"
+
+
+def test_primary_category_none():
+    assert _primary_category({"foo": "bar"}) is None
+
+
+# --------------------------- _parse_population ---------------------------
+
+def test_parse_population_int():
+    assert _parse_population(50000) == 50000
+
+
+def test_parse_population_comma_string():
+    assert _parse_population("1,234,567") == 1234567
+
+
+def test_parse_population_none_and_invalid():
+    assert _parse_population(None) is None
+    assert _parse_population("abc") is None
+
+
+# --------------------------- _is_relative_location ---------------------------
+
+@pytest.mark.parametrize("near", ["me", "here", "near me", "around here", "my location", "MY LOCATION"])
+def test_is_relative_location_true(near):
+    assert _is_relative_location(near) is True
+
+
+def test_is_relative_location_punctuation_variants():
+    assert _is_relative_location("near me!") is True
+    assert _is_relative_location('"here"') is True
+
+
+def test_is_relative_location_real_place_false():
+    assert _is_relative_location("Portland, OR") is False
+    assert _is_relative_location("Paris") is False
+
+
+# --------------------------- _geocode (async, mocked) ---------------------------
+
+def _no_throttle(monkeypatch):
+    monkeypatch.setattr(geo.cfg, "min_request_interval_seconds", 0)
+
+
+def _fresh_cache(monkeypatch):
+    from tools.cache import TTLCache
+    monkeypatch.setattr(geo, "_cache", TTLCache(0))  # disable caching for determinism
+
+
+def test_geocode_success(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+
+    def handler(request):
+        return httpx.Response(200, json=[
+            {"display_name": "Paris, France", "lat": "48.8566", "lon": "2.3522",
+             "class": "place", "type": "city", "address": {"country": "France"}},
+        ])
+
+    patch_httpx(handler)
+    out = run(_geocode("Paris", 1))
+    assert len(out) == 1
+    assert out[0]["name"] == "Paris, France"
+    assert out[0]["latitude"] == 48.8566
+    assert out[0]["longitude"] == 2.3522
+
+
+def test_geocode_empty_results(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, json=[]))
+    assert run(_geocode("Nowhereville XYZ", 1)) == []
+
+
+def test_geocode_empty_query_raises(monkeypatch):
+    _no_throttle(monkeypatch)
+    with pytest.raises(ToolError):
+        run(_geocode("   ", 1))
+
+
+def test_geocode_rate_limited_raises(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(429, text="slow down"))
+    with pytest.raises(ToolError) as exc:
+        run(_geocode("Paris", 1))
+    assert "429" in str(exc.value)
+
+
+def test_geocode_non_json_raises(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, text="<html>not json</html>"))
+    with pytest.raises(ToolError):
+        run(_geocode("Paris", 1))
+
+
+# --------------------------- _overpass (async, mocked) ---------------------------
+
+def test_overpass_success(monkeypatch, patch_httpx):
+    _fresh_cache(monkeypatch)
+    elements = [{"type": "node", "lat": 1.0, "lon": 2.0, "tags": {"name": "Cafe"}}]
+    patch_httpx(lambda req: httpx.Response(200, json={"elements": elements}))
+    assert run(_overpass("[out:json];node;out;")) == elements
+
+
+def test_overpass_remark_error_raises(monkeypatch, patch_httpx):
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, json={"remark": "runtime error: timeout"}))
+    with pytest.raises(ToolError) as exc:
+        run(_overpass("[out:json];node;out;"))
+    assert "error" in str(exc.value).lower()
+
+
+def test_overpass_rate_limited_raises(monkeypatch, patch_httpx):
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(429, text="too many"))
+    with pytest.raises(ToolError):
+        run(_overpass("[out:json];node;out;"))
+
+
+def test_overpass_non_json_raises(monkeypatch, patch_httpx):
+    _fresh_cache(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, text="Error: bad query"))
+    with pytest.raises(ToolError):
+        run(_overpass("bad query"))
+
+
+# --------------------------- find_nearby_places tool (validation) ---------------------------
+
+def test_find_nearby_places_empty_category_raises(tool_fns):
+    fn = tool_fns["find_nearby_places"]
+    with pytest.raises(ToolError):
+        run(fn(category="  "))
+
+
+def test_find_nearby_places_no_location_raises(tool_fns):
+    fn = tool_fns["find_nearby_places"]
+    with pytest.raises(ToolError):
+        run(fn(category="cafe"))
+
+
+def test_find_nearby_places_relative_location_raises(tool_fns):
+    fn = tool_fns["find_nearby_places"]
+    with pytest.raises(ToolError) as exc:
+        run(fn(category="cafe", near="near me"))
+    assert "relative location" in str(exc.value)
+
+
+def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
+    """End-to-end with geocode + overpass monkeypatched."""
+    import json as _json
+
+    async def fake_geocode(query, limit):
+        return [{"name": "Portland, OR", "latitude": 45.52, "longitude": -122.68}]
+
+    async def fake_overpass(query_ql):
+        return [
+            {"type": "node", "lat": 45.521, "lon": -122.681,
+             "tags": {"name": "Near Cafe", "amenity": "cafe", "cuisine": "coffee_shop"}},
+            {"type": "node", "lat": 45.6, "lon": -122.7,
+             "tags": {"name": "Far Cafe", "amenity": "cafe"}},
+        ]
+
+    monkeypatch.setattr(geo, "_geocode", fake_geocode)
+    monkeypatch.setattr(geo, "_overpass", fake_overpass)
+
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(category="cafe", near="Portland", radius_m=2000, limit=5)))
+    assert out["query_category"] == "cafe"
+    assert out["center"]["name"] == "Portland, OR"
+    assert out["count"] == 2
+    # Results are sorted nearest-first.
+    assert out["results"][0]["name"] == "Near Cafe"
+    assert out["results"][0]["distance_m"] <= out["results"][1]["distance_m"]
+
+
+def test_find_nearby_places_clamps_radius(monkeypatch, tool_fns):
+    """radius_m above the configured max is clamped."""
+    import json as _json
+
+    captured = {}
+
+    async def fake_overpass(query_ql):
+        captured["ql"] = query_ql
+        return []
+
+    monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(
+        category="cafe", latitude=45.0, longitude=-122.0,
+        radius_m=10_000_000,
+    )))
+    assert out["radius_m"] == geo.cfg.max_radius_m

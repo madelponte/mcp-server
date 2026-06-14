@@ -1,0 +1,38 @@
+# Keep the build context (and the resulting image) lean, and never bake host /
+# dev / secret files into the published image. The server's deps come from
+# requirements.txt; runtime config is injected via `docker run --env-file`.
+
+# Virtualenvs — host-specific; deps are reinstalled from requirements.txt
+.venv/
+venv/
+ENV/
+
+# Secrets / local config — NEVER copy into the image (use --env-file at runtime)
+.env
+.env.*
+!.env.example
+
+# Version control
+.git/
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Tests & dev-only tooling (not needed to run the server)
+tests/
+pytest.ini
+.pytest_cache/
+requirements-dev.txt
+
+# Docs / CI / compose (not used inside the image)
+README.md
+CLAUDE.md
+.github/
+docker-compose.yml
+Dockerfile
+.dockerignore
