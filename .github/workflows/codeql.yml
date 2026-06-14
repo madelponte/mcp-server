@@ -63,7 +63,7 @@ jobs:
       # installed Python deps — for known CVEs. Reports to the Security tab via
       # SARIF; does not fail the job (exit-code defaults to 0), mirroring CodeQL.
       - name: Run Trivy image vulnerability scan
-        uses: aquasecurity/trivy-action@0.36.0  # bump as new releases land
+        uses: aquasecurity/trivy-action@v0.36.0  # bump as new releases land
         with:
           scan-type: image
           image-ref: ${{ steps.img.outputs.ref }}
