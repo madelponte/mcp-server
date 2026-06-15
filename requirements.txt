@@ -8,7 +8,7 @@ pydantic-settings>=2.14
 
 # Shared HTTP / async
 httpx>=0.28
-anyio>=4.13
+anyio>=4.14
 
 # Agentic Web Search
 beautifulsoup4>=4.15
