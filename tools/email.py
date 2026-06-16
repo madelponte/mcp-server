@@ -101,7 +101,7 @@ def register(mcp: FastMCP) -> None:
             Field(
                 description=(
                     f"List of recipient email addresses (max {cfg.max_recipients}; "
-                    "addresses past the cap are dropped and reported, not sent)."
+                    "addresses past the cap are dropped)."
                 ),
             ),
         ],

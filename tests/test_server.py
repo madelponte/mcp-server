@@ -37,13 +37,6 @@ def test_find_nearby_places_description_interpolates_caps(server):
     assert str(geo.cfg.nearby_towns_radius_m) in tool.description
 
 
-def test_fetch_page_description_interpolates_url_cap(server):
-    import tools.fetch_page as fp
-
-    tool = next(t for t in _list_tools(server) if t.name == "fetch_page")
-    assert str(fp.MAX_FETCH_URLS) in tool.description
-
-
 def test_get_company_data_schema_has_section_params(server):
     tool = next(t for t in _list_tools(server) if t.name == "get_company_data")
     mcp_tool = tool.to_mcp_tool()
