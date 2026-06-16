@@ -431,6 +431,79 @@ class GeocodingSettings(BaseSettings):
     )
 
 
+class EmailSettings(BaseSettings):
+    """Valves for the Email (send-only) tool.
+
+    Defaults target Gmail. Gmail no longer accepts your normal account
+    password over SMTP — you must create an **App Password** (Google Account →
+    Security → 2-Step Verification → App passwords) and put that 16-character
+    value in EMAIL_PASSWORD, with your full address in EMAIL_USERNAME.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="EMAIL_", env_file=".env", extra="ignore"
+    )
+
+    smtp_host: str = Field(
+        "smtp.gmail.com",
+        description="SMTP server hostname. Default is Gmail; change to use another provider.",
+    )
+    smtp_port: int = Field(
+        465,
+        description=(
+            "SMTP server port. 465 for implicit SSL (use_ssl=true), 587 for "
+            "STARTTLS (use_ssl=false)."
+        ),
+    )
+    username: str = Field(
+        "",
+        description=(
+            "SMTP login username — for Gmail, your full email address "
+            "(e.g. you@gmail.com). Required for the tool to work."
+        ),
+    )
+    password: str = Field(
+        "",
+        description=(
+            "SMTP login password. For Gmail this MUST be a 16-character App "
+            "Password (not your normal account password); requires 2-Step "
+            "Verification enabled on the account. Required for the tool to work."
+        ),
+    )
+    from_address: str = Field(
+        "",
+        description=(
+            "Address the mail is sent From. Defaults to `username` when blank. "
+            "For Gmail this must be your own address (or a verified alias) or the "
+            "send is rejected."
+        ),
+    )
+    from_name: str = Field(
+        "",
+        description="Optional display name shown in the From header (e.g. 'My Bot').",
+    )
+    use_ssl: bool = Field(
+        True,
+        description=(
+            "True → connect with implicit SSL/TLS (SMTP_SSL, typically port 465). "
+            "False → connect plaintext then upgrade with STARTTLS (typically port 587)."
+        ),
+    )
+    timeout_seconds: float = Field(
+        30.0, description="Timeout for connecting to and talking to the SMTP server, in seconds."
+    )
+    # MAXIMUM, not a fixed amount: a guard against a single call fanning out to an
+    # unbounded recipient list. Recipients past this cap are dropped (and named in
+    # the result) rather than silently sent to.
+    max_recipients: int = Field(
+        25,
+        description=(
+            "Maximum number of recipient addresses a single send_email call will "
+            "send to; addresses past this are dropped and reported, not sent."
+        ),
+    )
+
+
 # Singletons imported by the tool modules and the server entrypoint.
 server_settings = ServerSettings()
 web_search_settings = WebSearchSettings()
@@ -438,3 +511,4 @@ stock_settings = StockSettings()
 wolfram_settings = WolframSettings()
 youtube_settings = YouTubeSettings()
 geocoding_settings = GeocodingSettings()
+email_settings = EmailSettings()

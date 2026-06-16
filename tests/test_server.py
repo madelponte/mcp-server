@@ -11,6 +11,7 @@ EXPECTED_TOOLS = {
     "get_company_data",
     "query_wolfram_alpha",
     "find_nearby_places",
+    "send_email",
 }
 
 
