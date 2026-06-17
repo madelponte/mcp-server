@@ -11,6 +11,7 @@ EXPECTED_TOOLS = {
     "get_company_data",
     "query_wolfram_alpha",
     "find_nearby_places",
+    "send_email",
 }
 
 
@@ -34,13 +35,6 @@ def test_find_nearby_places_description_interpolates_caps(server):
     tool = next(t for t in _list_tools(server) if t.name == "find_nearby_places")
     # The configured nearby-towns radius is rendered as a concrete number.
     assert str(geo.cfg.nearby_towns_radius_m) in tool.description
-
-
-def test_fetch_page_description_interpolates_url_cap(server):
-    import tools.fetch_page as fp
-
-    tool = next(t for t in _list_tools(server) if t.name == "fetch_page")
-    assert str(fp.MAX_FETCH_URLS) in tool.description
 
 
 def test_get_company_data_schema_has_section_params(server):

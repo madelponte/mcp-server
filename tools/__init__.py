@@ -14,6 +14,7 @@ from . import (
     wolfram_alpha,
     youtube_transcript,
     geocoding,
+    email,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "wolfram_alpha",
     "youtube_transcript",
     "geocoding",
+    "email",
 ]
