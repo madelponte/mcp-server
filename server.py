@@ -18,7 +18,7 @@ from fastmcp import FastMCP
 
 from auth import BearerAuthMiddleware
 from config import server_settings
-from tools import web_search, fetch_page, stock_data, wolfram_alpha, geocoding
+from tools import web_search, fetch_page, stock_data, wolfram_alpha, geocoding, email
 
 
 def build_server() -> FastMCP:
@@ -42,8 +42,8 @@ def build_server() -> FastMCP:
         "openwebui-tools",
         instructions=(
             "Tools for web search & page fetching (fetch_page also returns YouTube "
-            "video transcripts), stock market data, Wolfram Alpha computations, and "
-            "geocoding & nearby place search (OpenStreetMap)."
+            "video transcripts), stock market data, Wolfram Alpha computations, "
+            "geocoding & nearby place search (OpenStreetMap), and sending email."
         ),
     )
 
@@ -54,6 +54,7 @@ def build_server() -> FastMCP:
     stock_data.register(mcp)
     wolfram_alpha.register(mcp)
     geocoding.register(mcp)
+    email.register(mcp)
 
     return mcp
 

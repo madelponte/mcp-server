@@ -55,35 +55,32 @@ log = logging.getLogger(__name__)
 # page data. A valid-but-empty result is NOT a failure and is returned as normal
 # JSON. See the README "Error handling" section.
 
-# Hard cap on how many URLs a single fetch_page call will fetch when passed a
-# list (the WEB_SEARCH_MAX_FETCH_URLS valve). A context-budget guard: more than a
-# few full pages in one response blows a small model's window. The tool
-# description below is built from it (interpolated, not hardcoded), so the number
-# the model reads always matches the configured cap.
-MAX_FETCH_URLS = cfg.max_fetch_urls
-
-# The model-facing tool description, built once at import so MAX_FETCH_URLS is
-# stated as a concrete number the model can target. The return-shape part is a
-# plain (non-f) string to avoid brace-escaping the JSON shape.
+# The model-facing tool description. The return-shape part is a plain string so
+# its JSON braces don't need escaping.
 _FETCH_PAGE_DESC = (
-    "Fetch one or more web page URLs or YouTube video transcripts.\n\n"
-    f"Pass several URLs as a list (up to {MAX_FETCH_URLS}) to read them; URLs "
-    f"past the first {MAX_FETCH_URLS} are skipped. YouTube auto-detects: returns "
-    'transcript (use query= to find topics with [M:SS] timestamps). mode="text" '
-    "(default): page as markdown — headings/lists/tables/links kept, link URLs "
-    'absolute (fetchable). mode="structured": metadata (title, description, '
-    "headings, JSON-LD). section= extracts one heading's content. query= extracts "
-    "matching passages only (keyword/regex, case-insensitive). offset= (char "
-    "position) reads the next chunk of content that was truncated — pass the "
-    "next_offset value from a truncated result to continue reading; works for any "
-    "format incl. JSON/long docs. mode/section/query/offset apply to every URL. "
-    "Use when mcp_search_web result needs deeper reading or to read documents "
+    "Read one web page, document, or YouTube video transcript.\n\n"
+    "BASIC USE — this is all most calls need: pass one URL to get that page as "
+    "markdown (headings, lists, tables, and links are kept, links as absolute "
+    "URLs you can fetch). A YouTube video URL is detected automatically and "
+    "returns the video's transcript. The parameters below are optional "
+    "refinements — omit them all to get the whole page.\n\n"
+    "OPTIONAL PARAMETERS (leave unset unless you need them):\n"
+    "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
+    "passages that match, instead of the full page. On a YouTube transcript it "
+    "returns the matching lines tagged with [M:SS] timestamps.\n"
+    "• section — a heading's text. Returns only the content under that heading.\n"
+    '• mode — "text" (the default) returns the page content; "structured" '
+    "returns only metadata (title, description, headings, JSON-LD).\n"
+    "• offset — for CONTINUING a long page only. If a result comes back marked "
+    '"truncated", call again with offset set to the "next_offset" value from '
+    "that result to read the next chunk. Do NOT set it on a first fetch. It "
+    "works for every format, including JSON and long documents.\n\n"
+    "Reads ONE URL per call — to read several pages, call this tool once per "
+    "URL. Use it to read an mcp_search_web result in depth, or to read documents "
     "(PDF/Word/Excel/RTF/EPUB).\n\n"
-    "Returns — for one URL: JSON {url,format,provenance?,content,query?,"
-    "match_count?,sections?,truncated?,offset?,next_offset?,note?} (format: "
-    '"youtube_transcript"|"markdown"|"text"|"structured"|"section"|'
-    '"document_text"|"json"). For a list: JSON {results:[<that object|'
-    "{url,error}>, ...], note?}, one entry per URL in order."
+    "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
+    "truncated?,offset?,next_offset?,note?} (format: \"youtube_transcript\"|"
+    '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
 )
 
 
@@ -918,108 +915,34 @@ async def _fetch_one(
 def register(mcp: FastMCP) -> None:
     @mcp.tool(description=_FETCH_PAGE_DESC)
     async def fetch_page(
-        url: str | list[str],
+        url: str,
         mode: str = "text",
         section: str | None = None,
         query: str | None = None,
         offset: int | None = None,
     ) -> str:
-        """Fetch web pages / YouTube transcripts. The model-facing guidance lives
-        in the @mcp.tool(description=...) above (built with the live URL cap).
+        """Fetch one web page / YouTube transcript. The model-facing guidance
+        lives in the @mcp.tool(description=...) above.
 
-        :param url: One http/https URL as a string, or several as a JSON array
-            of strings (e.g. ["https://a.com", "https://b.com"]) — pass an actual
-            array, not the array written as a single string.
-        :param mode: "text" or "structured".
-        :param section: Optional heading text to extract.
-        :param query: Optional keyword/regex to filter content.
-        :param offset: Character offset to resume reading truncated content from.
+        :param url: One http/https URL to read.
+        :param mode: "text" (default; returns the page content) or "structured"
+            (returns only metadata). Omit for "text".
+        :param section: Optional. A heading's text to return only that section.
+            Omit to get the whole page.
+        :param query: Optional. A keyword/phrase or regex; returns only the
+            matching passages. Omit to get the whole page.
+        :param offset: Optional, for continuing a truncated result only. Set it
+            to the "next_offset" value from a previous response to read the next
+            chunk. Leave unset on a first fetch.
         """
         log_call(
             log, "fetch_page", url=url, mode=mode, section=section, query=query,
             offset=offset,
         )
 
-        # Accept a single URL (string) or several (list). A bare string returns
-        # one page object unchanged; a list returns {"results": [...]} so a
-        # small model can read several pages in one call instead of chaining
-        # fetches and risking a derail.
-        #
-        # Models frequently mishandle the `str | list[str]` union by passing the
-        # list *JSON-encoded as a string* (e.g. '["https://a", "https://b"]'),
-        # which validly matches the string branch and would otherwise be treated
-        # as one bogus URL. Detect that shape and decode it back into a list so
-        # the call succeeds instead of failing with "Invalid URL".
-        if isinstance(url, str):
-            stripped = url.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                try:
-                    decoded = json.loads(stripped)
-                except (ValueError, TypeError):
-                    decoded = None
-                if isinstance(decoded, list):
-                    url = decoded
-
-        single_input = isinstance(url, str)
-        raw = [url] if single_input else url if isinstance(url, list) else None
-        if raw is None:
-            raise ToolError("Missing url.")
-
-        # Clean: stringify-guard, strip, drop blanks, de-dupe (preserve order).
-        urls: list[str] = []
-        seen: set[str] = set()
-        for u in raw:
-            if not isinstance(u, str):
-                continue
-            u = u.strip()
-            if u and u not in seen:
-                seen.add(u)
-                urls.append(u)
-        if not urls:
-            raise ToolError("Missing url.")
-
-        # Context-budget cap: clamp how many URLs we fetch in one call. Extra
-        # URLs are reported as skipped rather than silently dropped.
-        total = len(urls)
-        skipped = urls[MAX_FETCH_URLS:]
-        urls = urls[:MAX_FETCH_URLS]
-
-        # Normalize offset once: 1-based char position into the content; anything
-        # below 1 (or unset) means "from the start".
+        # One URL per call. Reading several pages is done by calling the tool
+        # again rather than batching, which small models handled unreliably.
+        # `_fetch_one` validates the URL (scheme/blank) and raises ToolError.
         resolved_offset = offset if isinstance(offset, int) and offset > 0 else 0
-
-        if single_input and not skipped:
-            payload = await _fetch_one(urls[0], mode, section, query, resolved_offset)
-            return log_result(log, "fetch_page", to_json(payload))
-
-        # Multiple URLs: fetch concurrently, capturing each URL's failure so one
-        # bad URL doesn't sink the batch (partial-success contract).
-        settled = await asyncio.gather(
-            *(_fetch_one(u, mode, section, query, resolved_offset) for u in urls),
-            return_exceptions=True,
-        )
-        results: list[dict] = []
-        failures = 0
-        for u, res in zip(urls, settled):
-            if isinstance(res, Exception):
-                failures += 1
-                results.append({"url": u, "error": str(res)})
-            else:
-                results.append(res)
-        for u in skipped:
-            results.append(
-                {"url": u, "error": f"Skipped: exceeded the {MAX_FETCH_URLS}-URL per-call limit."}
-            )
-
-        # Only a total failure is a ToolError; any success is a normal result.
-        if failures == len(urls):
-            joined = "; ".join(f"{r['url']}: {r['error']}" for r in results if "error" in r)
-            raise ToolError(f"All fetches failed: {joined}")
-
-        batch: dict = {"results": results}
-        if skipped:
-            batch["note"] = (
-                f"Fetched the first {MAX_FETCH_URLS} of {total} URLs; "
-                f"{len(skipped)} skipped (per-call limit)."
-            )
-        return log_result(log, "fetch_page", to_json(batch))
+        payload = await _fetch_one(url, mode, section, query, resolved_offset)
+        return log_result(log, "fetch_page", to_json(payload))
