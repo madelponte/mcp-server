@@ -37,6 +37,7 @@ from .web_fetch import (
     _fetch_from_wayback,
     _is_tika_document,
     _render_with_flaresolverr,
+    _sniff_document_bytes,
     _tika_extract,
 )
 from .web_extract import (
@@ -94,6 +95,13 @@ _FETCH_PAGE_DESC = (
 # is added only for formats those two params can target, so the model can jump
 # straight to what it needs instead of paging.
 # ---------------------------------------------------------------------------
+
+# Statuses that mean the URL itself is gone/unavailable rather than bot-walled:
+# 404 (not found), 410 (gone), 451 (unavailable for legal reasons). On these,
+# fetch_page tries the Wayback Machine before returning the live error page, since
+# archive.org may still hold the original content. (Block/throttle statuses are
+# handled separately by `_is_blocked_response`, not here.)
+_GONE_STATUSES = {404, 410, 451}
 
 _OFFSET_HINT = (
     "Content was truncated to fit the size limit; the rest was dropped. To read "
@@ -697,10 +705,25 @@ async def _fetch_one(
             f"{detail}. The page content could not be retrieved."
         )
 
+    # A dead/removed/legally-unavailable URL (404 Gone-style, 410, 451): the live
+    # page is no longer there, but archive.org very likely still holds the
+    # original article. Try the Wayback Machine before falling through to return
+    # the (error) page body as if it were content. Skipped when Wayback finds
+    # nothing usable, in which case the normal handling below runs as before.
+    if status in _GONE_STATUSES and cfg.wayback_fallback:
+        wb = await _wayback_content(fetch_url)
+        if wb:
+            return await _archived_text_payload(
+                url, fetch_url, wb, query=query, offset=offset,
+                reason=f"The live page is unavailable (HTTP {status})",
+            )
+
     # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
     # routed to Apache Tika and returned as plain text, regardless of the
-    # requested mode.
-    if _is_tika_document(ctype, fetch_url):
+    # requested mode. Detected by content-type/extension or — for a document
+    # served with a generic/wrong content-type and no telling extension — by a
+    # magic-byte sniff of the raw bytes.
+    if _is_tika_document(ctype, fetch_url) or _sniff_document_bytes(fetched.get("bytes")):
         body = fetched.get("bytes")
         if not body and fetched.get("text"):
             body = fetched["text"].encode("utf-8", errors="replace")

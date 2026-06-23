@@ -143,6 +143,63 @@ def test_document_no_content_raises(monkeypatch, tool_fns):
         run(tool_fns["fetch_page"](url="https://example.com/report.pdf"))
 
 
+def test_mislabeled_pdf_sniffed_to_tika(monkeypatch, tool_fns):
+    """A PDF served as octet-stream from an extensionless URL is routed by magic bytes."""
+    _patch_fetch(
+        monkeypatch,
+        _fetched(content_type="application/octet-stream", body=b"%PDF-1.5\n%binary", text=None),
+    )
+    monkeypatch.setattr(fp, "_tika_extract", lambda data, url, **kw: "Sniffed PDF text.")
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/download?id=42")))
+    assert out["format"] == "document_text"
+    assert out["content"] == "Sniffed PDF text."
+
+
+# --------------------------- gone-status Wayback fallback ---------------------------
+
+def test_gone_status_falls_back_to_wayback(monkeypatch, tool_fns):
+    """A 404/410/451 page tries the Wayback Machine before returning the error body."""
+    monkeypatch.setattr(fp.cfg, "wayback_fallback", True)
+    _patch_fetch(
+        monkeypatch,
+        _fetched(text="<html><body>Not Found</body></html>", status=404),
+    )
+
+    async def fake_wayback(url):
+        return {
+            "text": "<html><body><article>Archived article body.</article></body></html>",
+            "plain": "Archived article body.",
+            "format": "markdown",
+            "status": 200,
+            "content_type": "text/html",
+            "meta": {"timestamp": "20240101000000", "date": "2024-01-01", "url": "https://web.archive.org/x"},
+        }
+
+    monkeypatch.setattr(fp, "_wayback_content", fake_wayback)
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/dead")))
+    assert out["via"] == "archive.org"
+    assert "Archived article body." in out["content"]
+    assert out["archived_snapshot"]["date"] == "2024-01-01"
+    assert "unavailable (HTTP 404)" in out["note"]
+
+
+def test_gone_status_without_wayback_hit_returns_error_page(monkeypatch, tool_fns):
+    """When no usable snapshot exists, fall through to the normal (error-page) handling."""
+    monkeypatch.setattr(fp.cfg, "wayback_fallback", True)
+    _patch_fetch(
+        monkeypatch,
+        _fetched(text="<html><body><p>Page not found here.</p></body></html>", status=404),
+    )
+
+    async def no_wayback(url):
+        return None
+
+    monkeypatch.setattr(fp, "_wayback_content", no_wayback)
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/dead")))
+    assert out["status"] == 404
+    assert "Page not found here." in out["content"]
+
+
 # --------------------------- Reddit / JSON ---------------------------
 
 def test_reddit_url_compacted(monkeypatch, tool_fns):

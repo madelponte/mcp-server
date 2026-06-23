@@ -11,6 +11,7 @@ each caller formats it for its own needs.
 """
 
 import asyncio
+import codecs
 import ipaddress
 import logging
 import re
@@ -21,6 +22,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from bs4 import UnicodeDammit
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
@@ -163,6 +165,110 @@ def _is_tika_document(ctype: str, url: str) -> bool:
     return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
 
 
+def _sniff_document_bytes(body: bytes | None) -> bool:
+    """True if the leading bytes look like a Tika-extractable binary document.
+
+    The last line of defence when neither the content-type nor the URL extension
+    reveals the type — e.g. a PDF served as ``application/octet-stream`` (or even
+    mislabelled ``text/html``) from an extensionless ``/download?id=`` URL. Without
+    this the binary would be UTF-8-decoded into garbage and returned as if it were
+    page text. Only unambiguous signatures are matched; a plain ZIP is accepted
+    only when it carries an Office/OpenDocument/EPUB marker, never as a bare
+    archive.
+    """
+    if not body:
+        return False
+    head = body[:8]
+    if head.startswith(b"%PDF"):
+        return True
+    if head.startswith(b"{\\rtf"):
+        return True
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):  # OLE2: legacy doc/xls/ppt
+        return True
+    if head.startswith(b"PK\x03\x04"):
+        # A ZIP container — only a document if it's an OOXML/ODF/EPUB package, not
+        # an arbitrary archive. These markers appear in the first local-file entry.
+        sample = body[:2000]
+        return (
+            b"word/" in sample
+            or b"xl/" in sample
+            or b"ppt/" in sample
+            or b"mimetypeapplication/epub+zip" in sample
+            or b"mimetypeapplication/vnd.oasis.opendocument" in sample
+        )
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Charset-aware decoding
+#
+# A fetched page's bytes must be decoded with the right charset, not a blind
+# UTF-8: a large slice of the web is served in another encoding (Cyrillic
+# windows-1251, Japanese Shift_JIS, Korean EUC-KR, Western windows-1252, …), and
+# decoding those as UTF-8 turns every non-ASCII character into a replacement
+# glyph — content the rest of the stack would then return as if it were real.
+# We resolve the charset like a browser: HTTP Content-Type header, then an
+# in-document <meta charset>, then statistical detection, then UTF-8 as a floor.
+# ---------------------------------------------------------------------------
+
+_CHARSET_PARAM_RE = re.compile(r"charset\s*=\s*([a-zA-Z0-9_\-:.]+)", re.I)
+# <meta charset="..."> or <meta http-equiv=content-type content="...;charset=...">.
+# Sniffed from the raw head bytes (ASCII-safe) before we've committed to a codec.
+_META_CHARSET_RE = re.compile(rb"""<meta[^>]+?charset\s*=\s*["']?\s*([a-zA-Z0-9_\-:.]+)""", re.I)
+
+
+def _normalize_codec(name: str | None) -> str | None:
+    """Return the canonical codec name if `name` is a real encoding, else None."""
+    if not name:
+        return None
+    try:
+        return codecs.lookup(name.strip().strip("\"'")).name
+    except (LookupError, TypeError, ValueError):
+        return None
+
+
+def _decode_body(body: bytes, ctype: str) -> str:
+    """Decode page bytes to text using the declared/detected charset.
+
+    Precedence mirrors a browser: (1) the HTTP ``Content-Type`` charset, (2) a
+    ``<meta charset>`` declaration inside the document head, (3) BeautifulSoup's
+    ``UnicodeDammit`` statistical detection (with the declared charsets fed in as
+    hints), and (4) UTF-8 with replacement as a floor that never raises. Decoding
+    blindly as UTF-8 would garble every non-UTF-8 page.
+    """
+    if not body:
+        return ""
+    header_enc = _normalize_codec(_charset_from_ctype(ctype))
+    meta_match = _META_CHARSET_RE.search(body[:4096])
+    meta_enc = _normalize_codec(meta_match.group(1).decode("ascii", "ignore")) if meta_match else None
+
+    # A declared charset that actually decodes the bytes cleanly wins outright.
+    for enc in (header_enc, meta_enc):
+        if enc:
+            try:
+                return body.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                pass
+
+    # Otherwise let UnicodeDammit detect, preferring the declared encodings as
+    # overrides and handling BOMs / Microsoft smart-quote bytes along the way.
+    overrides = [e for e in (header_enc, meta_enc) if e]
+    try:
+        dammit = UnicodeDammit(body, override_encodings=overrides, is_html=True)
+        if dammit.unicode_markup is not None:
+            return dammit.unicode_markup
+    except Exception:
+        pass
+
+    return body.decode("utf-8", errors="replace")
+
+
+def _charset_from_ctype(ctype: str) -> str | None:
+    """Extract the ``charset=`` value from a Content-Type header, if any."""
+    m = _CHARSET_PARAM_RE.search(ctype or "")
+    return m.group(1) if m else None
+
+
 def _tika_extract(
     data: bytes,
     tika_url: str,
@@ -292,14 +398,23 @@ async def _assert_url_allowed(url: str) -> None:
 # Fetching (with FlareSolverr fallback)
 # ---------------------------------------------------------------------------
 
+class DownloadTooLargeError(RuntimeError):
+    """A response body exceeded the configured download-size cap."""
+
+
 async def _httpx_fetch(
-    url: str, timeout: float, user_agent: str, verify_ssl: bool
+    url: str, timeout: float, user_agent: str, verify_ssl: bool, max_bytes: int = 0
 ) -> tuple[int, dict, bytes, str]:
     """Direct fetch via httpx. Returns (status, headers, body_bytes, content_type).
 
     Redirects are followed by hand (not httpx's follow_redirects) so each hop's
     target passes the SSRF guard before we connect to it. The caller validates
     the initial URL; here we re-validate every redirect destination.
+
+    The body is streamed and aborted once it passes ``max_bytes`` (0 = unbounded)
+    so a multi-GB response — or a decompression bomb, since the cap is on the
+    decoded stream httpx hands us — can't exhaust memory on the single-process
+    server. Exceeding the cap raises ``DownloadTooLargeError``.
     """
     headers = {
         "User-Agent": user_agent,
@@ -314,14 +429,24 @@ async def _httpx_fetch(
     ) as client:
         current = url
         for _ in range(MAX_REDIRECTS + 1):
-            resp = await client.get(current)
-            location = resp.headers.get("location")
-            if resp.is_redirect and location:
-                current = str(resp.url.join(location))
-                await _assert_url_allowed(current)
-                continue
-            ctype = resp.headers.get("content-type", "")
-            return resp.status_code, dict(resp.headers), resp.content, ctype
+            async with client.stream("GET", current) as resp:
+                location = resp.headers.get("location")
+                if resp.is_redirect and location:
+                    current = str(resp.url.join(location))
+                    await _assert_url_allowed(current)
+                    continue
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise DownloadTooLargeError(
+                            f"Response from {current!r} exceeds the "
+                            f"{max_bytes}-byte download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
+                        )
+                    chunks.append(chunk)
+                ctype = resp.headers.get("content-type", "")
+                return resp.status_code, dict(resp.headers), b"".join(chunks), ctype
     raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
@@ -355,6 +480,7 @@ async def _resilient_fetch(
     verify_ssl: bool,
     flaresolverr_url: str | None,
     flaresolverr_timeout_ms: int,
+    max_bytes: int = 0,
 ) -> dict:
     """Try direct httpx; on a Cloudflare wall, retry through FlareSolverr if configured."""
     # SSRF guard the initial URL before EITHER fetch path. FlareSolverr is the
@@ -363,11 +489,13 @@ async def _resilient_fetch(
     await _assert_url_allowed(url)
     try:
         status, headers, body, ctype = await _httpx_fetch(
-            url, timeout=timeout, user_agent=user_agent, verify_ssl=verify_ssl
+            url, timeout=timeout, user_agent=user_agent, verify_ssl=verify_ssl,
+            max_bytes=max_bytes,
         )
-    except SSRFError:
-        # A redirect hop resolved to a blocked host — refuse outright rather than
-        # handing the same URL to FlareSolverr, which would follow it in-browser.
+    except (SSRFError, DownloadTooLargeError):
+        # A redirect hop resolved to a blocked host, or the body blew past the
+        # size cap — refuse outright rather than handing the same URL to
+        # FlareSolverr, which would re-fetch (and re-download) it in-browser.
         raise
     except Exception as e:
         if flaresolverr_url:
@@ -399,9 +527,12 @@ async def _resilient_fetch(
     # Office/OpenDocument content-types contain the substring "xml" (e.g.
     # application/vnd.openxmlformats-officedocument...), so the loose checks
     # below would mis-classify them as text and corrupt the bytes via UTF-8
-    # decode. Documents we hand to Tika must stay binary.
+    # decode. Documents we hand to Tika must stay binary — detected by
+    # content-type/extension OR by a magic-byte sniff, which also catches a
+    # document mislabelled with a text/* or octet-stream content-type.
+    is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
     is_textlike = (
-        not _is_tika_document(ctype, url)
+        not is_document
         and (
             ctype.startswith("text/")
             or "json" in ctype
@@ -421,10 +552,7 @@ async def _resilient_fetch(
             "blocked_detected": False,
         }
 
-    try:
-        text = body.decode("utf-8", errors="replace")
-    except Exception:
-        text = body.decode("latin-1", errors="replace")
+    text = _decode_body(body, ctype)
 
     blocked = _is_blocked_response(status, text, headers)
     if blocked and flaresolverr_url:
@@ -491,6 +619,7 @@ async def _cached_resilient_fetch(url: str) -> dict:
         verify_ssl=cfg.verify_ssl,
         flaresolverr_url=cfg.flaresolverr_url or None,
         flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
+        max_bytes=cfg.max_download_bytes,
     )
     _page_cache.set(url, fetched)
     return fetched
