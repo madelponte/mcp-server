@@ -12,8 +12,12 @@ from tools.geocoding import (
     _compose_address,
     _primary_category,
     _parse_population,
+    _parse_bbox,
+    _parse_float,
+    _format_place,
     _is_relative_location,
     _geocode,
+    _place_lookup,
     _overpass,
 )
 from conftest import run
@@ -136,6 +140,61 @@ def test_parse_population_none_and_invalid():
     assert _parse_population("abc") is None
 
 
+# --------------------------- _parse_bbox / _parse_float ---------------------------
+
+def test_parse_bbox_valid():
+    # Nominatim order: [south, north, west, east]
+    out = _parse_bbox(["48.81", "48.90", "2.22", "2.46"])
+    assert out == {"south": 48.81, "north": 48.90, "west": 2.22, "east": 2.46}
+
+
+def test_parse_bbox_invalid():
+    assert _parse_bbox(None) is None
+    assert _parse_bbox(["1", "2", "3"]) is None  # wrong length
+    assert _parse_bbox(["a", "b", "c", "d"]) is None  # non-numeric
+
+
+def test_parse_float():
+    assert _parse_float("35") == 35.0
+    assert _parse_float(" 12.5 ") == 12.5
+    assert _parse_float(None) is None
+    assert _parse_float("abc") is None
+
+
+# --------------------------- _format_place ---------------------------
+
+def test_format_place_folds_extratags_and_drops_empty():
+    entry = {
+        "name": "Paris, France",
+        "latitude": 48.8566,
+        "longitude": 2.3522,
+        "category": "place",
+        "type": "city",
+        "address": {"country": "France"},
+        "bounding_box": {"south": 48.8, "north": 48.9, "west": 2.2, "east": 2.5},
+        "extratags": {"population": "2,100,000", "wikidata": "Q90",
+                      "wikipedia": "en:Paris", "ele": "35"},
+        "namedetails": {"official_name": "Ville de Paris"},
+        "importance": 0.9,
+        "osm_type": "relation",
+        "osm_id": 7444,
+    }
+    out = _format_place(entry)
+    assert out["class"] == "place"
+    assert out["population"] == 2100000
+    assert out["wikidata"] == "Q90"
+    assert out["elevation_m"] == 35.0
+    assert out["official_name"] == "Ville de Paris"
+    # Empty/absent fields are omitted (no phone/website/opening_hours here).
+    assert "phone" not in out
+    assert "website" not in out
+
+
+def test_format_place_minimal_entry():
+    out = _format_place({"name": "X", "latitude": 1.0, "longitude": 2.0})
+    assert out == {"name": "X", "latitude": 1.0, "longitude": 2.0}
+
+
 # --------------------------- _is_relative_location ---------------------------
 
 @pytest.mark.parametrize("near", ["me", "here", "near me", "around here", "my location", "MY LOCATION"])
@@ -210,6 +269,95 @@ def test_geocode_non_json_raises(monkeypatch, patch_httpx):
     patch_httpx(lambda req: httpx.Response(200, text="<html>not json</html>"))
     with pytest.raises(ToolError):
         run(_geocode("Paris", 1))
+
+
+# --------------------------- _geocode detailed / _place_lookup ---------------------------
+
+def test_geocode_detailed_surfaces_extratags(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+
+    captured = {}
+
+    def handler(request):
+        captured["url"] = str(request.url)
+        return httpx.Response(200, json=[
+            {"display_name": "Paris, France", "lat": "48.8566", "lon": "2.3522",
+             "class": "place", "type": "city",
+             "boundingbox": ["48.81", "48.90", "2.22", "2.46"],
+             "extratags": {"population": "2100000", "wikidata": "Q90"},
+             "namedetails": {"official_name": "Ville de Paris"},
+             "importance": 0.9, "osm_type": "relation", "osm_id": 7444,
+             "address": {"country": "France"}},
+        ])
+
+    patch_httpx(handler)
+    out = run(_geocode("Paris", 5, detailed=True))
+    # extratags/namedetails were requested and surfaced.
+    assert "extratags=1" in captured["url"]
+    assert "namedetails=1" in captured["url"]
+    assert out[0]["bounding_box"]["north"] == 48.90
+    assert out[0]["extratags"]["wikidata"] == "Q90"
+
+
+def test_place_lookup_builds_payload(monkeypatch):
+    async def fake_geocode(query, limit, detailed=False):
+        assert detailed is True
+        return [
+            {"name": "Paris, France", "latitude": 48.8566, "longitude": 2.3522,
+             "category": "place", "type": "city",
+             "extratags": {"population": "2100000", "wikidata": "Q90"},
+             "namedetails": {}, "bounding_box": None},
+            {"name": "Paris, TX", "latitude": 33.66, "longitude": -95.55,
+             "type": "city", "extratags": {}, "namedetails": {}},
+        ]
+
+    monkeypatch.setattr(geo, "_geocode", fake_geocode)
+    out = run(_place_lookup("Paris"))
+    assert out["query"] == "Paris"
+    assert out["place"]["population"] == 2100000
+    assert out["place"]["wikidata"] == "Q90"
+    assert out["alternatives"][0]["name"] == "Paris, TX"
+
+
+def test_place_lookup_no_match_raises(monkeypatch):
+    async def fake_geocode(query, limit, detailed=False):
+        return []
+
+    monkeypatch.setattr(geo, "_geocode", fake_geocode)
+    with pytest.raises(ToolError):
+        run(_place_lookup("Nowhereville XYZ"))
+
+
+# --------------------------- place_details tool mode ---------------------------
+
+def test_find_nearby_places_place_details_happy_path(monkeypatch, tool_fns):
+    import json as _json
+
+    async def fake_geocode(query, limit, detailed=False):
+        return [{"name": "Portland, OR", "latitude": 45.52, "longitude": -122.68,
+                 "category": "place", "type": "city",
+                 "extratags": {"population": "650000"}, "namedetails": {}}]
+
+    monkeypatch.setattr(geo, "_geocode", fake_geocode)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(near="Portland, OR", place_details=True)))
+    assert out["place"]["name"] == "Portland, OR"
+    assert out["place"]["population"] == 650000
+
+
+def test_find_nearby_places_place_details_requires_near(tool_fns):
+    fn = tool_fns["find_nearby_places"]
+    with pytest.raises(ToolError) as exc:
+        run(fn(category="", place_details=True))
+    assert "near" in str(exc.value)
+
+
+def test_find_nearby_places_place_details_rejects_relative(tool_fns):
+    fn = tool_fns["find_nearby_places"]
+    with pytest.raises(ToolError) as exc:
+        run(fn(near="near me", place_details=True))
+    assert "relative location" in str(exc.value)
 
 
 # --------------------------- _overpass (async, mocked) ---------------------------
