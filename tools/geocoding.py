@@ -8,6 +8,11 @@ accepts a place name that is geocoded internally via **Nominatim**, so a query
 like "vegan restaurants in Portland" needs only one tool call; alternatively the
 caller passes explicit ``latitude``/``longitude``.
 
+Passing ``place_details=True`` switches the tool into a place-lookup mode: rather
+than searching for POIs, it returns rich structured info *about* the place named
+in ``near`` (coordinates, bounding box, address breakdown, population, wikidata/
+wikipedia links, website) — the "where/what is X" question.
+
 By default it uses the public OpenStreetMap APIs. Set ``GEO_NOMINATIM_URL`` /
 ``GEO_OVERPASS_URL`` to self-host. Nominatim's usage policy (a descriptive
 User-Agent and a 1 req/sec cap on the public API) is honored — see config.py.
@@ -283,14 +288,72 @@ def _is_relative_location(near: str) -> bool:
     return cleaned in _RELATIVE_LOCATION_TERMS
 
 
-async def _geocode(query: str, limit: int) -> list[dict]:
+def _parse_bbox(box) -> dict | None:
+    """Nominatim's `boundingbox` is [south, north, west, east] as strings.
+    Coerce to a labelled dict of floats; return None if it's missing/malformed."""
+    if not box or len(box) != 4:
+        return None
+    try:
+        south, north, west, east = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return None
+    return {"south": south, "north": north, "west": west, "east": east}
+
+
+def _parse_float(value) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_place(entry: dict) -> dict:
+    """Build the rich place-details payload from a detailed `_geocode` entry.
+
+    Folds the most useful `extratags`/`namedetails` Nominatim returns (population,
+    wikidata/wikipedia, website, opening hours, elevation, official name) up into
+    flat fields, dropping anything absent so the response stays compact.
+    """
+    extra = entry.get("extratags") or {}
+    names = entry.get("namedetails") or {}
+    place = {
+        "name": entry.get("name"),
+        "latitude": entry.get("latitude"),
+        "longitude": entry.get("longitude"),
+        "class": entry.get("category"),
+        "type": entry.get("type"),
+        "address": entry.get("address"),
+        "bounding_box": entry.get("bounding_box"),
+        "population": _parse_population(extra.get("population")),
+        "wikidata": extra.get("wikidata"),
+        "wikipedia": extra.get("wikipedia"),
+        "website": extra.get("website") or extra.get("url") or extra.get("contact:website"),
+        "phone": extra.get("phone") or extra.get("contact:phone"),
+        "opening_hours": extra.get("opening_hours"),
+        "elevation_m": _parse_float(extra.get("ele")),
+        "official_name": names.get("official_name") or names.get("name:en"),
+        "importance": entry.get("importance"),
+        "osm_type": entry.get("osm_type"),
+        "osm_id": entry.get("osm_id"),
+    }
+    return {k: v for k, v in place.items() if v not in (None, {}, "")}
+
+
+async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]:
     """Geocode a free-text query via Nominatim. Returns a (possibly empty) list
-    of matches. Raises ToolError only on a real failure (network / bad status)."""
+    of matches. Raises ToolError only on a real failure (network / bad status).
+
+    When ``detailed`` is set, requests Nominatim's ``extratags``/``namedetails``
+    and surfaces the bounding box, importance, and OSM id so a place-details
+    lookup can report population, wikidata/wikipedia links, etc. The basic
+    (non-detailed) shape is unchanged — the nearby-search path relies on it."""
     q = (query or "").strip()
     if not q:
         raise ToolError("Empty query. Provide a place name or address to geocode.")
 
-    cache_key = "geocode\x00" + "\x00".join((q.lower(), str(limit), cfg.language))
+    cache_key = "geocode\x00" + "\x00".join(
+        (q.lower(), str(limit), cfg.language, "d" if detailed else "")
+    )
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
@@ -301,6 +364,9 @@ async def _geocode(query: str, limit: int) -> list[dict]:
         "limit": limit,
         "addressdetails": 1,
     }
+    if detailed:
+        params["extratags"] = 1
+        params["namedetails"] = 1
     if cfg.nominatim_email.strip():
         params["email"] = cfg.nominatim_email.strip()
 
@@ -338,19 +404,49 @@ async def _geocode(query: str, limit: int) -> list[dict]:
             lon = float(item["lon"])
         except (KeyError, TypeError, ValueError):
             continue
-        results.append(
-            {
-                "name": item.get("display_name"),
-                "latitude": lat,
-                "longitude": lon,
-                "category": item.get("category") or item.get("class"),
-                "type": item.get("type"),
-                "address": item.get("address"),
-            }
-        )
+        entry = {
+            "name": item.get("display_name"),
+            "latitude": lat,
+            "longitude": lon,
+            "category": item.get("category") or item.get("class"),
+            "type": item.get("type"),
+            "address": item.get("address"),
+        }
+        if detailed:
+            entry["bounding_box"] = _parse_bbox(item.get("boundingbox"))
+            entry["extratags"] = item.get("extratags") or {}
+            entry["namedetails"] = item.get("namedetails") or {}
+            entry["importance"] = item.get("importance")
+            entry["osm_type"] = item.get("osm_type")
+            entry["osm_id"] = item.get("osm_id")
+        results.append(entry)
 
     _cache.set(cache_key, results)
     return results
+
+
+async def _place_lookup(query: str) -> dict:
+    """Resolve a place name/address to rich structured info (the top match) plus
+    a few lighter alternatives. Raises ToolError when nothing matches."""
+    matches = await _geocode(query, cfg.max_place_matches, detailed=True)
+    if not matches:
+        raise ToolError(
+            f"Could not find a place matching '{query}'. Try a more specific "
+            "name or a full address."
+        )
+    payload: dict = {"query": query, "place": _format_place(matches[0])}
+    alternatives = [
+        {
+            "name": m.get("name"),
+            "latitude": m.get("latitude"),
+            "longitude": m.get("longitude"),
+            "type": m.get("type"),
+        }
+        for m in matches[1:]
+    ]
+    if alternatives:
+        payload["alternatives"] = alternatives
+    return payload
 
 
 # -------------------------------- Overpass -------------------------------
@@ -461,34 +557,41 @@ async def _nearby_towns(
 
 # The tool's model-facing description and the per-arg cap descriptions are built
 # at registration time (below) from `cfg`, so the configured caps/defaults appear
-# as concrete numbers the model can target instead of vague "capped". The return
-# schema is a plain (non-f) string to avoid brace-escaping the JSON shape.
+# as concrete numbers the model can target. The schemas list the meaningful keys
+# only (echoed inputs like query_category are omitted); plain (non-f) strings keep
+# the JSON braces from needing escaping.
 _RETURN_SCHEMA = (
-    "Returns JSON {query_category,center:{latitude,longitude,name?},radius_m,"
-    "count,results:[{name,latitude,longitude,distance_m,category,cuisine?,"
-    "address?,opening_hours?,phone?,website?}],nearby_towns_radius_m?,"
-    "nearby_towns?:[{name,latitude,longitude,distance_m,place_type?,population?}]}"
+    "Search returns {center:{latitude,longitude,name?},count,results:[{name,"
+    "latitude,longitude,distance_m,category,cuisine?,address?,opening_hours?,"
+    "phone?,website?}],nearby_towns?:[{name,latitude,longitude,distance_m,"
+    "place_type?,population?}]}"
+)
+
+_PLACE_RETURN_SCHEMA = (
+    "place_details returns {place:{name,latitude,longitude,class,type,address,"
+    "bounding_box?,population?,wikidata?,wikipedia?,website?,phone?,opening_hours?,"
+    "elevation_m?},alternatives?:[{name,latitude,longitude,type}]}"
 )
 
 
 def register(mcp: FastMCP) -> None:
     description = (
-        "Find nearby places via OpenStreetMap (Overpass + Nominatim).\n\n"
-        'Location: near="city/address" (auto-geocoded) OR latitude+longitude. '
-        'NO "near me" access—ask user for location if needed. category: plain '
-        "language (restaurant/coffee/bar/supermarket/pharmacy/hospital/atm/bank/"
-        "gas station/hotel/museum/park/gym/etc). Prefix food with diet (vegan/"
-        "vegetarian/halal/kosher/gluten-free). Unknown categories match names "
-        '(e.g., "Starbucks").\n\n'
-        "include_nearby_towns=true adds a `nearby_towns` list (surrounding "
-        f"cities/towns/villages within {cfg.nearby_towns_radius_m} m, nearest-"
-        "first, with distance+population) to widen the search: pick one and recall "
-        f"with near=<town>.\n\n{_RETURN_SCHEMA}"
+        "Find places via OpenStreetMap. Default: search POIs of `category` near a "
+        'location — near="city/address" OR latitude+longitude (no "near me"; ask '
+        "the user). category is plain language (restaurant, coffee, pharmacy, atm, "
+        "hotel, park, gym, …); prefix food with a diet (vegan/vegetarian/halal/"
+        'kosher/gluten-free); unknown words match names ("Starbucks"). '
+        f"include_nearby_towns=true also lists towns within {cfg.nearby_towns_radius_m} m "
+        "to recenter a follow-up search.\n"
+        "place_details=true: ignore category/radius/limit and return rich info "
+        "ABOUT the place in `near` (coords, bounding box, address, population, "
+        "wikidata/wikipedia, website) — answers 'where/what is X'.\n"
+        f"{_RETURN_SCHEMA}\n{_PLACE_RETURN_SCHEMA}"
     )
 
     @mcp.tool(description=description)
     async def find_nearby_places(
-        category: str,
+        category: str = "",
         near: str | None = None,
         latitude: float | None = None,
         longitude: float | None = None,
@@ -516,15 +619,18 @@ def register(mcp: FastMCP) -> None:
                 "include_nearby_towns=true."
             ),
         ] = None,
+        place_details: bool = False,
     ) -> str:
         """Find nearby places via OpenStreetMap. The model-facing guidance lives in
         the @mcp.tool(description=...) above (built with the live caps from cfg).
 
-        :param category: What to find (plain language).
-        :param near: Place/address (geocoded).
+        :param category: What to find (plain language). Ignored when place_details=true.
+        :param near: Place/address (geocoded). Required when place_details=true.
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
         :param include_nearby_towns: Also return surrounding towns to recenter on.
+        :param place_details: Look up rich info about the place in `near` instead
+            of searching for nearby POIs.
         """
         log_call(
             log,
@@ -537,7 +643,27 @@ def register(mcp: FastMCP) -> None:
             limit=limit,
             include_nearby_towns=include_nearby_towns,
             nearby_towns_limit=nearby_towns_limit,
+            place_details=place_details,
         )
+
+        # place_details mode: look up rich info ABOUT a place rather than POIs
+        # around it. Requires a name/address in `near` (this server has no user
+        # location, and coords-to-place reverse lookup is out of scope here).
+        if place_details:
+            if not (near and near.strip()):
+                raise ToolError(
+                    "place_details lookup needs a place name or address in `near` "
+                    "(e.g. 'Portland, OR' or 'Eiffel Tower')."
+                )
+            if _is_relative_location(near):
+                raise ToolError(
+                    f"'{near.strip()}' is a relative location, and this server has "
+                    "no access to the user's location. Pass an actual place name "
+                    "or address as `near`."
+                )
+            payload = await _place_lookup(near.strip())
+            return log_result(log, "find_nearby_places", to_json(payload))
+
         if not (category or "").strip():
             raise ToolError("Empty category. Say what to look for, e.g. 'pharmacy'.")
 

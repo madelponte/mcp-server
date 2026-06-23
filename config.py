@@ -439,6 +439,14 @@ class GeocodingSettings(BaseSettings):
         ),
     )
 
+    max_place_matches: int = Field(
+        5,
+        description=(
+            "Maximum candidate places a place_details lookup returns (the top "
+            "match plus alternatives). Caps the alternatives list size."
+        ),
+    )
+
     cache_ttl_seconds: int = Field(
         86400,
         description=(
