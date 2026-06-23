@@ -127,6 +127,17 @@ class WebSearchSettings(BaseSettings):
     )
 
     http_timeout_seconds: float = Field(25.0, description="HTTP timeout for fetches, in seconds.")
+    max_download_bytes: int = Field(
+        104857600,  # 100 MiB
+        description=(
+            "Maximum bytes a single fetch_page response may download before the "
+            "fetch is aborted (0 = unbounded). The cap is on the decompressed "
+            "stream, so it also bounds a decompression bomb. Sized for the largest "
+            "reasonable document — an image-heavy/scanned PDF, which Tika still "
+            "reduces to plain text — while protecting the single-process server "
+            "from a multi-GB body exhausting memory."
+        ),
+    )
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
     user_agent: str = Field(DEFAULT_UA, description="User-Agent sent with direct fetches.")
     ssrf_allowlist: str = Field(
