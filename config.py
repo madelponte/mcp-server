@@ -251,6 +251,25 @@ class StockSettings(BaseSettings):
     max_history_bars: int = Field(
         30, description="Maximum daily OHLC price-history bars returned."
     )
+    # Caps for the peers / dividends / ownership sections. These are pure
+    # server-side safety caps (not model-tunable params): they bound the
+    # response size for sections whose natural length is open-ended.
+    max_peers: int = Field(
+        15, description="Maximum peer tickers returned by the 'peers' section."
+    )
+    max_dividend_events: int = Field(
+        24,
+        description=(
+            "Maximum dividend payments (and stock splits) returned by the "
+            "'dividends' section, most recent first."
+        ),
+    )
+    max_institutional_holders: int = Field(
+        10,
+        description=(
+            "Maximum top institutional holders returned by the 'ownership' section."
+        ),
+    )
 
 
 class WolframSettings(BaseSettings):
