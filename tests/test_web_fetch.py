@@ -9,10 +9,13 @@ import tools.web_fetch as web_fetch
 from tools.web_fetch import (
     _is_blocked_response,
     _is_tika_document,
+    _sniff_document_bytes,
+    _decode_body,
     _parse_allowlist,
     _ip_of,
     _addr_is_blocked,
     _assert_url_allowed,
+    DownloadTooLargeError,
     SSRFError,
 )
 from conftest import run
@@ -80,6 +83,133 @@ def test_is_tika_document_true(ctype, url):
 )
 def test_is_tika_document_false(ctype, url):
     assert _is_tika_document(ctype, url) is False
+
+
+# --------------------------- magic-byte document sniffing ---------------------------
+
+def test_sniff_pdf_magic():
+    assert _sniff_document_bytes(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3 rest") is True
+
+
+def test_sniff_rtf_magic():
+    assert _sniff_document_bytes(rb"{\rtf1\ansi hello}") is True
+
+
+def test_sniff_ole2_legacy_office():
+    assert _sniff_document_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32) is True
+
+
+def test_sniff_ooxml_zip_is_document():
+    # A ZIP whose entries name an OOXML part (word/) is a docx, not a bare archive.
+    body = b"PK\x03\x04" + b"\x00" * 20 + b"[Content_Types].xml word/document.xml"
+    assert _sniff_document_bytes(body) is True
+
+
+def test_sniff_epub_zip_is_document():
+    body = b"PK\x03\x04" + b"\x00" * 20 + b"mimetypeapplication/epub+zip"
+    assert _sniff_document_bytes(body) is True
+
+
+def test_sniff_plain_zip_is_not_document():
+    # A generic ZIP with no Office/ODF/EPUB marker must NOT be routed to Tika.
+    body = b"PK\x03\x04" + b"\x00" * 20 + b"notes.txt photos/cat.png"
+    assert _sniff_document_bytes(body) is False
+
+
+def test_sniff_html_is_not_document():
+    assert _sniff_document_bytes(b"<!doctype html><html><body>hi</body></html>") is False
+
+
+def test_sniff_empty_or_none():
+    assert _sniff_document_bytes(b"") is False
+    assert _sniff_document_bytes(None) is False
+
+
+# --------------------------- charset-aware decoding ---------------------------
+
+def test_decode_uses_content_type_charset():
+    body = "Привет мир".encode("windows-1251")
+    assert _decode_body(body, "text/html; charset=windows-1251") == "Привет мир"
+
+
+def test_decode_uses_meta_charset_when_header_silent():
+    body = (
+        b"<html><head><meta charset='shift_jis'></head><body>"
+        + "こんにちは".encode("shift_jis")
+        + b"</body></html>"
+    )
+    assert "こんにちは" in _decode_body(body, "text/html")
+
+
+def test_decode_detects_when_undeclared():
+    # No header charset, no <meta>: detection (UnicodeDammit) should still avoid
+    # the all-replacement-glyph garble a blind UTF-8 decode produces.
+    body = "café résumé".encode("windows-1252")
+    out = _decode_body(body, "text/html")
+    assert "�" not in out
+    assert "caf" in out and "sum" in out
+
+
+def test_decode_plain_utf8_roundtrips():
+    assert _decode_body("héllo".encode("utf-8"), "text/html; charset=utf-8") == "héllo"
+
+
+def test_decode_bogus_charset_falls_back_to_utf8():
+    # An unknown/garbage charset name must not raise; UTF-8 bytes still decode.
+    assert _decode_body("hi".encode("utf-8"), "text/html; charset=totally-bogus") == "hi"
+
+
+def test_decode_empty_body():
+    assert _decode_body(b"", "text/html") == ""
+
+
+# --------------------------- download size cap ---------------------------
+
+def test_download_cap_aborts_oversized_body(patch_httpx):
+    """A body past max_bytes raises DownloadTooLargeError instead of buffering it."""
+    big = b"x" * 5000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=big, headers={"content-type": "text/plain"})
+
+    patch_httpx(handler)
+    with pytest.raises(DownloadTooLargeError):
+        run(
+            web_fetch._httpx_fetch(
+                "https://example.com/big", timeout=5, user_agent="t",
+                verify_ssl=False, max_bytes=1000,
+            )
+        )
+
+
+def test_download_cap_allows_within_limit(patch_httpx):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"small", headers={"content-type": "text/plain"})
+
+    patch_httpx(handler)
+    status, _headers, body, ctype = run(
+        web_fetch._httpx_fetch(
+            "https://example.com/ok", timeout=5, user_agent="t",
+            verify_ssl=False, max_bytes=1000,
+        )
+    )
+    assert status == 200 and body == b"small"
+
+
+def test_download_cap_zero_is_unbounded(patch_httpx):
+    big = b"y" * 100000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=big, headers={"content-type": "text/plain"})
+
+    patch_httpx(handler)
+    _status, _headers, body, _ctype = run(
+        web_fetch._httpx_fetch(
+            "https://example.com/big", timeout=5, user_agent="t",
+            verify_ssl=False, max_bytes=0,
+        )
+    )
+    assert len(body) == 100000
 
 
 # --------------------------- allowlist parsing ---------------------------
