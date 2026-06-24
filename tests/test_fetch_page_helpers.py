@@ -46,9 +46,27 @@ def test_set_content_truncates_and_sets_next_offset(monkeypatch):
     _set_content(payload, "a" * 50)
     assert payload["truncated"] is True
     assert payload["next_offset"] == 10
+    # Full content size is reported so the model can size what remains.
+    assert payload["content_length"] == 50
     assert "offset=" in payload["note"]
     # Narrowing hint is added by default.
     assert "query=" in payload["note"]
+
+
+def test_set_content_no_content_length_when_not_truncated():
+    payload = {}
+    _set_content(payload, "short content")
+    assert "content_length" not in payload
+
+
+def test_set_content_content_length_is_full_size_with_offset(monkeypatch):
+    # content_length reports the whole content's size, not the post-offset slice.
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 10)
+    payload = {}
+    _set_content(payload, "a" * 50, offset=5)
+    assert payload["truncated"] is True
+    assert payload["content_length"] == 50
+    assert payload["next_offset"] == 15
 
 
 def test_set_content_no_narrow_hint_when_hint_false(monkeypatch):
