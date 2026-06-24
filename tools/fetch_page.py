@@ -80,7 +80,8 @@ _FETCH_PAGE_DESC = (
     "URL. Use it to read an mcp_search_web result in depth, or to read documents "
     "(PDF/Word/Excel/RTF/EPUB).\n\n"
     "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
-    "truncated?,offset?,next_offset?,note?} (format: \"youtube_transcript\"|"
+    "truncated?,offset?,next_offset?,content_length?,note?} (format: "
+    "\"youtube_transcript\"|"
     '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
 )
 
@@ -127,9 +128,10 @@ def _set_content(
     `offset` (a character position, default 0) lets the model page through
     content too long to return at once: the rest of a truncated response is
     reachable by re-fetching with ``offset=`` set to the ``next_offset`` echoed
-    here. When trimming actually dropped text, set ``payload["truncated"] = True``
-    and ``payload["next_offset"]`` to where the next chunk begins, and fold the
-    offset hint into ``payload["note"]``. When `hint`, also add the
+    here. When trimming actually dropped text, set ``payload["truncated"] = True``,
+    ``payload["next_offset"]`` to where the next chunk begins, and
+    ``payload["content_length"]`` to the full content's size in characters; also fold
+    the offset hint into ``payload["note"]``. When `hint`, additionally add the
     `query=`/`section=` narrowing hint — those can't narrow some formats (e.g.
     JSON), so `hint` is False there, but `offset=` still works.
     """
@@ -153,6 +155,7 @@ def _set_content(
     if truncated:
         payload["truncated"] = True
         payload["next_offset"] = start + cfg.max_page_chars
+        payload["content_length"] = total
         payload["note"] = _join_note(payload.get("note"), _OFFSET_HINT)
         if hint:
             payload["note"] = payload["note"] + _NARROW_HINT
