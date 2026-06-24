@@ -169,15 +169,20 @@ def register(mcp: FastMCP) -> None:
         Results include url/title/snippet + optional page metadata (headings,
         description) for top results. Then use mcp_fetch_page to read full content.
 
-        Query: short keywords only (not sentences). time_range: "day"/"week"/
-        "month"/"year"/"all". category: "general"|"news"|"science"|"it"|"social
-        media"|"videos"|"images"|"music"|"files"|"map" (comma-separate).
+        Query: short keywords only (not sentences). Search operators are
+        supported and sharpen results — use them when they fit: site:domain.com
+        (restrict to one site), "exact phrase" (quoted), -word (exclude a term),
+        term OR term (alternatives), filetype:pdf (a file type). time_range:
+        "day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|
+        "it"|"social media"|"videos"|"images"|"music"|"files"|"map"
+        (comma-separate).
         num_results/enrich_results: max counts (see per-arg caps; enrich fetches
         metadata). page: result page (1-based, default 1) — set page=2 to get the
         next batch of results for the SAME query when the first page wasn't
         useful, instead of reformulating.
 
-        :param query: Keywords.
+        :param query: Keywords (operators supported: site:, "phrase", -exclude,
+            OR, filetype:).
         :param time_range: Recency filter.
         :param category: Category (comma-separate).
         :param page: Result page number (1-based; default 1).
