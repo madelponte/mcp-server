@@ -8,7 +8,8 @@ Exposes a single tool:
   (``Apple``); a name is resolved to its ticker via symbol search before any
   data is fetched, so the model never has to make a separate lookup call. The
   caller chooses which sections to fetch: ``quote``, ``profile``,
-  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``.
+  ``financials``, ``earnings``, ``news``, ``insiders``, ``price_history``,
+  ``peers``, ``dividends``, ``ownership``.
 
 Uses Finnhub (primary, free API key), yfinance (no-key fallback), and optionally
 Financial Modeling Prep for deep financial statements. Translated from the Open
@@ -410,6 +411,47 @@ def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
     }
 
 
+def _finnhub_peers(symbol: str, limit: int) -> dict | None:
+    """Peer companies in the same sector/industry (Finnhub, free tier).
+
+    Returns only the peer tickers — deliberately, not precomputed sector
+    averages, which no provider offers free. The model can pass these symbols
+    back to ``get_company_data`` as a list to pull each peer's metrics and
+    compute its own relative-valuation comparison from the raw numbers.
+    """
+    token = _finnhub_require_key()
+    data = _http_get_json(
+        "https://finnhub.io/api/v1/stock/peers", {"symbol": symbol, "token": token}
+    )
+    if not data or not isinstance(data, list):
+        return None
+    upper = symbol.upper()
+    # Finnhub includes the queried symbol itself; drop it and de-dupe, preserving
+    # order, then cap.
+    peers: list[str] = []
+    seen: set[str] = set()
+    for p in data:
+        if not isinstance(p, str):
+            continue
+        pu = p.strip().upper()
+        if not pu or pu == upper or pu in seen:
+            continue
+        seen.add(pu)
+        peers.append(pu)
+    if not peers:
+        return None
+    return {
+        "provider": "finnhub",
+        "symbol": symbol,
+        "peers": peers[:limit],
+        "note": (
+            "Peer tickers in the same sector/industry. Pass them back as a list "
+            "to get_company_data (with sections like profile/financials) to "
+            "compare metrics and judge relative valuation."
+        ),
+    }
+
+
 def _finnhub_search(query: str, limit: int) -> list[dict]:
     """Look up tickers by company name via Finnhub's symbol search."""
     token = _finnhub_require_key()
@@ -785,6 +827,127 @@ def _yfinance_history(symbol: str, bars: int, interval: str = "1d") -> dict | No
     }
 
 
+def _yfinance_peers(symbol: str, limit: int) -> None:
+    """No-op peers fallback: yfinance exposes no peer/competitor endpoint, so
+    the 'peers' section is Finnhub-only. Present so `_fetch_section` has a
+    yf_fn to route to when Finnhub is unkeyed (it returns None → "no data")."""
+    return None
+
+
+def _yfinance_dividends(symbol: str, max_events: int) -> dict | None:
+    """Dividend payment history and stock splits (yfinance, keyless).
+
+    Finnhub/FMP gate dividend history behind paid tiers, so this section is
+    yfinance-only — the same pattern as price_history. Returns the most recent
+    ``max_events`` of each, newest first, plus the trailing-12-month dividend
+    total so the model can sanity-check the profile's dividend yield.
+    """
+    from datetime import date, timedelta
+
+    ticker = _yfinance_ticker(symbol)
+    try:
+        div = ticker.dividends
+    except Exception:
+        div = None
+    try:
+        spl = ticker.splits
+    except Exception:
+        spl = None
+
+    dividends = []
+    if div is not None and not div.empty:
+        for idx, amt in div.tail(max_events).items():
+            d = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+            amount = _safe_float(amt)
+            if amount is None:
+                continue
+            dividends.append({"date": d, "amount": amount})
+        dividends.reverse()  # most recent first
+
+    splits = []
+    if spl is not None and not spl.empty:
+        for idx, ratio in spl.tail(max_events).items():
+            d = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)
+            r = _safe_float(ratio)
+            if not r:
+                continue
+            splits.append({"date": d, "ratio": r})
+        splits.reverse()
+
+    if not dividends and not splits:
+        return None
+
+    # Trailing-12-month dividend total from the events we have.
+    ttm = None
+    if dividends:
+        cutoff = (date.today() - timedelta(days=365)).isoformat()
+        recent = [d["amount"] for d in dividends if d["date"] >= cutoff]
+        if recent:
+            ttm = round(sum(recent), 4)
+
+    return {
+        "provider": "yfinance",
+        "symbol": symbol,
+        "trailing_12m_dividend": ttm,
+        "dividend_count": len(dividends),
+        "dividends": dividends,
+        "splits": splits,
+    }
+
+
+def _yfinance_ownership(symbol: str, max_holders: int) -> dict | None:
+    """Ownership structure: insider/institutional ownership percentages and the
+    top institutional holders (yfinance, keyless).
+
+    Distinct from the 'insiders' section, which is recent *transactions*; this is
+    the standing ownership picture — a smart-money conviction / float signal.
+    """
+    ticker = _yfinance_ticker(symbol)
+
+    # major_holders is a small DataFrame keyed by metric (insidersPercentHeld,
+    # institutionsPercentHeld, …) with a single value column.
+    summary: dict[str, Any] = {}
+    try:
+        mh = ticker.major_holders
+        if mh is not None and not mh.empty:
+            for label in mh.index:
+                row = mh.loc[label]
+                val = row.iloc[0] if hasattr(row, "iloc") else row
+                summary[str(label)] = _safe_float(val)
+    except Exception:
+        summary = {}
+
+    holders = []
+    try:
+        ih = ticker.institutional_holders
+        if ih is not None and not ih.empty:
+            for _, row in ih.head(max_holders).iterrows():
+                date_val = row.get("Date Reported")
+                date_str = (
+                    date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime")
+                    else (str(date_val) if date_val is not None else None)
+                )
+                holders.append({
+                    "holder": row.get("Holder"),
+                    "shares": _safe_int(row.get("Shares")),
+                    "date_reported": date_str,
+                    "percent_held": _safe_float(row.get("pctHeld")),
+                    "value": _safe_float(row.get("Value")),
+                })
+    except Exception:
+        pass
+
+    if not summary and not holders:
+        return None
+
+    return {
+        "provider": "yfinance",
+        "symbol": symbol,
+        "ownership_summary": summary or None,
+        "institutional_holders": holders,
+    }
+
+
 def _yfinance_search(query: str, limit: int) -> list[dict]:
     """Look up tickers by company name via Yahoo's keyless search endpoint.
 
@@ -1075,7 +1238,10 @@ def _resolve_symbol(raw: str) -> tuple[str, dict | None]:
 # replaced each repeated that pattern; it now lives in one helper so the
 # consolidated `get_company_data` tool can fetch any mix of sections.
 
-VALID_SECTIONS = ("quote", "profile", "financials", "earnings", "news", "insiders", "price_history")
+VALID_SECTIONS = (
+    "quote", "profile", "financials", "earnings", "news", "insiders",
+    "price_history", "peers", "dividends", "ownership",
+)
 DEFAULT_SECTIONS = ("quote", "profile")
 
 
@@ -1172,6 +1338,36 @@ def _section_history(symbol: str, opts: dict):
     )
 
 
+def _section_peers(symbol: str, opts: dict):
+    # Finnhub-only (yfinance has no peer endpoint). When Finnhub is unkeyed the
+    # resolved provider is yfinance, which routes to the no-op fallback → "no
+    # data available" rather than an error.
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {"finnhub": _finnhub_peers},
+        _yfinance_peers, (symbol, opts["peers"]),
+    )
+
+
+def _section_dividends(symbol: str, opts: dict):
+    # yfinance-only (dividend history is paid on Finnhub/FMP); empty primary map
+    # routes every resolved provider to the yfinance fetcher, like price_history.
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {},
+        _yfinance_dividends, (symbol, opts["dividend_events"]),
+    )
+
+
+def _section_ownership(symbol: str, opts: dict):
+    # yfinance-only, same routing as dividends/price_history.
+    return _fetch_section(
+        _resolve_provider(cfg.default_provider),
+        {},
+        _yfinance_ownership, (symbol, opts["ownership_holders"]),
+    )
+
+
 _SECTION_FETCHERS = {
     "quote": _section_quote,
     "profile": _section_profile,
@@ -1180,6 +1376,9 @@ _SECTION_FETCHERS = {
     "news": _section_news,
     "insiders": _section_insiders,
     "price_history": _section_history,
+    "peers": _section_peers,
+    "dividends": _section_dividends,
+    "ownership": _section_ownership,
 }
 
 
@@ -1221,6 +1420,11 @@ async def _gather_sections(
         "insider_weeks": _clamp_amount(insider_weeks, cfg.max_insider_lookback_weeks),
         "history_bars": _clamp_amount(history_bars, cfg.max_history_bars),
         "history_interval": history_interval,
+        # Pure server-side caps (no model-tunable param) for the open-ended
+        # peers / dividends / ownership sections.
+        "peers": cfg.max_peers,
+        "dividend_events": cfg.max_dividend_events,
+        "ownership_holders": cfg.max_institutional_holders,
     }
     settled = await asyncio.gather(
         *(
@@ -1342,15 +1546,18 @@ def register(mcp: FastMCP) -> None:
 
         sections: "quote"(price/day's change)|"profile"(fundamentals/market cap)|
         "financials"(income/balance/cashflow)|"earnings"(EPS vs est)|"news"|
-        "insiders"(buy/sell txns)|"price_history"(OHLC bars).
+        "insiders"(buy/sell txns)|"price_history"(OHLC bars)|"peers"(competitor
+        tickers in same sector)|"dividends"(payment history+splits)|"ownership"
+        (institutional/insider holdings).
         Params: statement(income|balance|cashflow), period(annual|quarterly),
         periods, news_items, insider_weeks, history_bars, news_days (all capped;
         omit=max). history_interval(1d|1wk|1mo): bar size for price_history —
         use 1wk/1mo to cover months/years within the same bar budget.
 
         Use for: current price, company fundamentals, financial statements,
-        earnings reports, recent news, insider trading, price charts. Crypto/FX/
-        indices (BTC-USD, ^GSPC) only support quote/price_history.
+        earnings reports, recent news, insider trading, price charts, sector
+        peers, dividend history, ownership structure.
+        Crypto/FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
 
         :param sections: Sections to fetch (default: quote,profile).
         :param statement: Financials statement type.

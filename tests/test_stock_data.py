@@ -303,6 +303,32 @@ def test_fmp_quote_empty_returns_none(monkeypatch):
     assert stock._fmp_quote("AAPL") is None
 
 
+# --------------------------- _finnhub_peers ---------------------------
+
+def test_finnhub_peers_drops_self_dedupes_and_caps(monkeypatch):
+    monkeypatch.setattr(stock.cfg, "finnhub_api_key", "key")
+    monkeypatch.setattr(
+        stock, "_http_get_json",
+        lambda url, params=None: ["AAPL", "MSFT", "msft", "GOOGL", "AMZN"],
+    )
+    out = stock._finnhub_peers("AAPL", limit=2)
+    # Self ("AAPL") dropped, case-insensitive de-dupe of MSFT, capped to 2.
+    assert out["peers"] == ["MSFT", "GOOGL"]
+    assert out["provider"] == "finnhub"
+
+
+def test_finnhub_peers_only_self_returns_none(monkeypatch):
+    monkeypatch.setattr(stock.cfg, "finnhub_api_key", "key")
+    monkeypatch.setattr(stock, "_http_get_json", lambda url, params=None: ["AAPL"])
+    assert stock._finnhub_peers("AAPL", limit=10) is None
+
+
+def test_finnhub_peers_empty_returns_none(monkeypatch):
+    monkeypatch.setattr(stock.cfg, "finnhub_api_key", "key")
+    monkeypatch.setattr(stock, "_http_get_json", lambda url, params=None: [])
+    assert stock._finnhub_peers("AAPL", limit=10) is None
+
+
 # --------------------------- _http_get_json caching ---------------------------
 
 def test_http_get_json_caches(monkeypatch):
@@ -325,6 +351,92 @@ def test_http_get_json_caches(monkeypatch):
     b = stock._http_get_json("https://x.com/api", {"q": 1})
     assert a == b == {"ok": True}
     assert calls["n"] == 1  # second call served from cache
+
+
+# --------------------------- _yfinance_dividends / _yfinance_ownership ---------------------------
+
+def test_yfinance_dividends_parses_and_orders(monkeypatch):
+    import pandas as pd
+
+    class FakeTicker:
+        dividends = pd.Series(
+            [0.22, 0.23, 0.24],
+            index=pd.to_datetime(["2024-02-01", "2024-05-01", "2024-08-01"]),
+        )
+        splits = pd.Series([4.0], index=pd.to_datetime(["2020-08-31"]))
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    out = stock._yfinance_dividends("AAPL", max_events=24)
+    # Most recent dividend first.
+    assert out["dividends"][0]["date"] == "2024-08-01"
+    assert out["dividends"][0]["amount"] == 0.24
+    assert out["dividend_count"] == 3
+    assert out["splits"][0]["ratio"] == 4.0
+
+
+def test_yfinance_dividends_caps_events(monkeypatch):
+    import pandas as pd
+
+    idx = pd.to_datetime([f"2020-01-{d:02d}" for d in range(1, 11)])
+
+    class FakeTicker:
+        dividends = pd.Series(range(1, 11), index=idx).astype(float)
+        splits = pd.Series(dtype=float)
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    out = stock._yfinance_dividends("AAPL", max_events=3)
+    assert len(out["dividends"]) == 3
+
+
+def test_yfinance_dividends_none_when_empty(monkeypatch):
+    import pandas as pd
+
+    class FakeTicker:
+        dividends = pd.Series(dtype=float)
+        splits = pd.Series(dtype=float)
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    assert stock._yfinance_dividends("AAPL", max_events=24) is None
+
+
+def test_yfinance_ownership_parses(monkeypatch):
+    import pandas as pd
+
+    major = pd.DataFrame(
+        {"Value": [0.0007, 0.62]},
+        index=["insidersPercentHeld", "institutionsPercentHeld"],
+    )
+    inst = pd.DataFrame([
+        {"Date Reported": pd.Timestamp("2024-03-31"), "Holder": "Vanguard",
+         "Shares": 1234, "pctHeld": 0.08, "Value": 5000},
+    ])
+
+    class FakeTicker:
+        major_holders = major
+        institutional_holders = inst
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    out = stock._yfinance_ownership("AAPL", max_holders=10)
+    assert out["ownership_summary"]["institutionsPercentHeld"] == 0.62
+    assert out["institutional_holders"][0]["holder"] == "Vanguard"
+    assert out["institutional_holders"][0]["date_reported"] == "2024-03-31"
+
+
+def test_yfinance_ownership_none_when_empty(monkeypatch):
+    import pandas as pd
+
+    class FakeTicker:
+        major_holders = pd.DataFrame()
+        institutional_holders = pd.DataFrame()
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    assert stock._yfinance_ownership("AAPL", max_holders=10) is None
+
+
+def test_new_sections_are_valid():
+    for sec in ("peers", "dividends", "ownership"):
+        assert sec in stock.VALID_SECTIONS
+        assert sec in stock._SECTION_FETCHERS
 
 
 # --------------------------- _gather_sections (async) ---------------------------
