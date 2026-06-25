@@ -29,7 +29,7 @@ from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from config import web_search_settings as cfg
+from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
@@ -58,34 +58,38 @@ log = logging.getLogger(__name__)
 # page data. A valid-but-empty result is NOT a failure and is returned as normal
 # JSON. See the README "Error handling" section.
 
-# The model-facing tool description. The return-shape part is a plain string so
-# its JSON braces don't need escaping.
-_FETCH_PAGE_DESC = (
-    "Read one web page, document, or YouTube video transcript.\n\n"
-    "BASIC USE — this is all most calls need: pass one URL to get that page as "
-    "markdown (headings, lists, tables, and links are kept, links as absolute "
-    "URLs you can fetch). A YouTube video URL is detected automatically and "
-    "returns the video's transcript. The parameters below are optional "
-    "refinements — omit them all to get the whole page.\n\n"
-    "OPTIONAL PARAMETERS (leave unset unless you need them):\n"
-    "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
-    "passages that match, instead of the full page. On a YouTube transcript it "
-    "returns the matching lines tagged with [M:SS] timestamps.\n"
-    "• section — a heading's text. Returns only the content under that heading.\n"
-    '• mode — "text" (the default) returns the page content; "structured" '
-    "returns only metadata (title, description, headings, JSON-LD).\n"
-    "• offset — for CONTINUING a long page only. If a result comes back marked "
-    '"truncated", call again with offset set to the "next_offset" value from '
-    "that result to read the next chunk. Do NOT set it on a first fetch. It "
-    "works for every format, including JSON and long documents.\n\n"
-    "Reads ONE URL per call — to read several pages, call this tool once per "
-    "URL. Use it to read an mcp_search_web result in depth, or to read documents "
-    "(PDF/Word/Excel/RTF/EPUB).\n\n"
-    "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
-    "truncated?,offset?,next_offset?,content_length?,note?} (format: "
-    "\"youtube_transcript\"|"
-    '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
-)
+# The model-facing tool description. Built at registration time so the sibling
+# tool reference (search_web) carries the client's tool-name prefix — the same
+# prefix the model sees on that tool (see ServerSettings.tool_prefix). The
+# return-shape part is a plain string so its JSON braces don't need escaping; the
+# prefix is spliced in with `+` rather than an f-string for the same reason.
+def _fetch_page_desc(prefix: str) -> str:
+    return (
+        "Read one web page, document, or YouTube video transcript.\n\n"
+        "BASIC USE — this is all most calls need: pass one URL to get that page as "
+        "markdown (headings, lists, tables, and links are kept, links as absolute "
+        "URLs you can fetch). A YouTube video URL is detected automatically and "
+        "returns the video's transcript. The parameters below are optional "
+        "refinements — omit them all to get the whole page.\n\n"
+        "OPTIONAL PARAMETERS (leave unset unless you need them):\n"
+        "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
+        "passages that match, instead of the full page. On a YouTube transcript it "
+        "returns the matching lines tagged with [M:SS] timestamps.\n"
+        "• section — a heading's text. Returns only the content under that heading.\n"
+        '• mode — "text" (the default) returns the page content; "structured" '
+        "returns only metadata (title, description, headings, JSON-LD).\n"
+        "• offset — for CONTINUING a long page only. If a result comes back marked "
+        '"truncated", call again with offset set to the "next_offset" value from '
+        "that result to read the next chunk. Do NOT set it on a first fetch. It "
+        "works for every format, including JSON and long documents.\n\n"
+        "Reads ONE URL per call — to read several pages, call this tool once per "
+        "URL. Use it to read an " + prefix + "search_web result in depth, or to "
+        "read documents (PDF/Word/Excel/RTF/EPUB).\n\n"
+        "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
+        "truncated?,offset?,next_offset?,content_length?,note?} (format: "
+        "\"youtube_transcript\"|"
+        '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1003,7 @@ async def _fetch_one(
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool(description=_FETCH_PAGE_DESC)
+    @mcp.tool(description=_fetch_page_desc(server_settings.tool_prefix))
     async def fetch_page(
         url: str,
         mode: str = "text",
