@@ -1550,7 +1550,7 @@ def register(mcp: FastMCP) -> None:
                 "skipped). Pass an actual array, not the array written as a string."
             ),
         ],
-        sections: list[str] | None = None,
+        sections: list[str] | str | None = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
         periods: Annotated[
@@ -1609,7 +1609,9 @@ def register(mcp: FastMCP) -> None:
         peers, dividend history, ownership structure.
         Crypto/FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
 
-        :param sections: Sections to fetch (default: quote,profile).
+        :param sections: Sections to fetch (default: quote,profile). A list
+            (["quote","profile"]) is preferred, but a comma-separated string
+            ("quote,profile") is also accepted.
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
@@ -1669,7 +1671,16 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("A ticker symbol or company name is required.")
 
         # Validate the call-level params once — they apply to every symbol.
-        requested = sections if sections else list(DEFAULT_SECTIONS)
+        # `sections` is documented as a list, but small models routinely pass a
+        # comma-separated string ("quote,profile") or a list holding one
+        # ("quote,profile"). Coerce both to a flat list of section names rather
+        # than failing — matching the leniency the `symbol` param already affords.
+        if not sections:
+            requested = list(DEFAULT_SECTIONS)
+        elif isinstance(sections, str):
+            requested = sections.split(",")
+        else:
+            requested = [part for s in sections for part in (s or "").split(",")]
         normalized: list[str] = []
         for s in requested:
             key = (s or "").strip().lower()
