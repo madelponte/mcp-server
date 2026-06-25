@@ -51,6 +51,16 @@ class ServerSettings(BaseSettings):
             "transport, which has no network surface."
         ),
     )
+    tool_prefix: str = Field(
+        "",
+        description=(
+            "String prepended (verbatim) to every registered tool's name, e.g. "
+            "MCP_TOOL_PREFIX=mcp_ exposes the tools as mcp_search_web, "
+            "mcp_fetch_page, … Useful for clients (such as Open WebUI) that need a "
+            "namespace to avoid tool-name collisions across servers. Blank (the "
+            "default) leaves the bare names unchanged."
+        ),
+    )
 
 
 class WebSearchSettings(BaseSettings):

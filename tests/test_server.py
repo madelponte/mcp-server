@@ -29,6 +29,38 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
+def test_tool_prefix_namespaces_every_tool(monkeypatch):
+    """MCP_TOOL_PREFIX prepends its value to every registered tool name."""
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "mcp_")
+    built = server_mod.build_server()
+    names = {t.name for t in run(built.list_tools())}
+    assert names == {f"mcp_{n}" for n in EXPECTED_TOOLS}
+
+
+def test_prefixed_tool_is_still_callable(monkeypatch):
+    """A prefixed tool still routes to and runs the original function."""
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "mcp_")
+    built = server_mod.build_server()
+    # send_email validates its args before any network use, so an empty
+    # recipients list raises ToolError — proving the prefixed name dispatches
+    # to the real tool function rather than 404-ing.
+    with pytest.raises(ToolError):
+        run(built.call_tool("mcp_send_email", {"recipients": [], "subject": "x", "body": "y"}))
+
+
+def test_blank_tool_prefix_leaves_names_unchanged(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "")
+    built = server_mod.build_server()
+    names = {t.name for t in run(built.list_tools())}
+    assert names == EXPECTED_TOOLS
+
+
 def test_find_nearby_places_description_interpolates_caps(server):
     import tools.geocoding as geo
 

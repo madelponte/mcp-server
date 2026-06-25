@@ -43,6 +43,13 @@ def test_clean_403_without_markers_is_not_blocked():
     assert _is_blocked_response(403, "<p>Plain forbidden page</p>", {}) is False
 
 
+def test_cloudflare_managed_challenge_text_is_blocked():
+    # Cloudflare's managed-challenge interstitial sometimes arrives as a 403 with
+    # only this visible body text (no cf-* token / "just a moment" title). It must
+    # be recognized as a wall, not returned as content.
+    assert _is_blocked_response(403, "Enable JavaScript and cookies to continue", {}) is True
+
+
 def test_200_with_two_markers_is_blocked():
     body = "cf-ray challenge-platform present here"
     assert _is_blocked_response(200, body, {}) is True
