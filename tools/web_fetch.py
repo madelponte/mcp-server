@@ -80,6 +80,11 @@ CLOUDFLARE_MARKERS = (
     "challenge-platform",
     "please enable cookies",
     "/cdn-cgi/challenge-platform",
+    # Cloudflare's managed-challenge interstitial doesn't always carry a "just a
+    # moment" title or a cf-* token in a stripped/minimal response — but its
+    # visible body text is this. Distinctive enough not to false-positive on a
+    # real page (and the >=2-marker rule still guards the bare-200 case).
+    "enable javascript and cookies to continue",
 )
 # Markers for the other major bot walls. Kept separate from the Cloudflare set
 # only for clarity; detection treats them the same way.

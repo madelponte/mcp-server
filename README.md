@@ -190,6 +190,15 @@ indented, human-readable JSON (instead of compact JSON) and each tool call emits
 verbose per-call logs to stdout. Useful for troubleshooting; leave it off in
 normal operation so responses stay compact in the model's context window.
 
+### Tool-name prefix
+
+Set `MCP_TOOL_PREFIX` to prepend a namespace to every tool's name. For example
+`MCP_TOOL_PREFIX=mcp_` exposes the tools as `mcp_search_web`, `mcp_fetch_page`,
+`mcp_get_company_data`, and so on. This is handy for clients (such as Open WebUI)
+that expect or add a prefix to keep tool names from colliding across servers.
+Leaving it blank (the default) keeps the bare names unchanged. The value is
+prepended verbatim, so include any trailing separator you want (e.g. the `_`).
+
 ### Authentication
 
 Set `MCP_AUTH_TOKEN` to require a bearer token on every HTTP request. Clients

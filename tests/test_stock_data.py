@@ -20,6 +20,8 @@ from tools.stock_data import (
     _resolve_symbol,
     _fetch_section,
     _gather_sections,
+    _scrub_secrets,
+    _provider_error,
 )
 from conftest import run
 
@@ -155,6 +157,35 @@ def test_retrieval_error_with_errors():
 def test_retrieval_error_without_errors():
     msg = _retrieval_error("quote", "AAPL", [])
     assert msg == "Could not retrieve quote for AAPL."
+
+
+# --------------------------- secret redaction ---------------------------
+
+def test_scrub_secrets_redacts_fmp_apikey():
+    raw = (
+        "402 Client Error: Payment Required for url: "
+        "https://financialmodelingprep.com/stable/income-statement"
+        "?symbol=BTC-USD&limit=4&apikey=SUPERSECRETKEY"
+    )
+    scrubbed = _scrub_secrets(raw)
+    assert "SUPERSECRETKEY" not in scrubbed
+    assert "apikey=REDACTED" in scrubbed
+    # Non-secret query params are preserved for diagnostics.
+    assert "symbol=BTC-USD" in scrubbed
+
+
+def test_scrub_secrets_redacts_finnhub_token():
+    raw = "HTTPError for url: https://finnhub.io/api/v1/quote?symbol=AAPL&token=abc123"
+    scrubbed = _scrub_secrets(raw)
+    assert "abc123" not in scrubbed
+    assert "token=REDACTED" in scrubbed
+
+
+def test_provider_error_redacts_embedded_key():
+    exc = Exception("boom for url: https://x/stable/q?apikey=LEAK&api_key=ALSOLEAK")
+    out = _provider_error("fmp", exc)
+    assert "LEAK" not in out and "ALSOLEAK" not in out
+    assert out.startswith("fmp: Exception:")
 
 
 # --------------------------- _resolve_symbol ---------------------------

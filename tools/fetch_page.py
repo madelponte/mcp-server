@@ -777,6 +777,23 @@ async def _fetch_one(
             body = fetched["text"].encode("utf-8", errors="replace")
         if not body:
             raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
+        # Guard against an error/challenge page masquerading as the document: a
+        # genuine document endpoint answers 200 with the document's bytes. When
+        # the only reason we're here is the URL's extension (e.g. ".../x.pdf"),
+        # the server returned an HTTP error, and the body is HTML that doesn't
+        # carry a document's magic bytes, it's an error page (a 403 bot wall, a
+        # "not found" stub) — extracting it would dress a failure up as document
+        # text, the exact thing the error convention forbids. Raise instead.
+        if (
+            status
+            and status >= 400
+            and "html" in ctype
+            and not _sniff_document_bytes(body)
+        ):
+            raise ToolError(
+                f"{fetch_url} returned HTTP {status} with an HTML error page, not "
+                "the expected document. The document could not be retrieved."
+            )
         extracted = await asyncio.to_thread(
             _tika_extract,
             body,

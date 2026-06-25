@@ -12,9 +12,11 @@ Run locally:
 Or via Docker / docker-compose (see Dockerfile and docker-compose.yml).
 """
 
+import asyncio
 import logging
 
 from fastmcp import FastMCP
+from fastmcp.tools import Tool
 
 from auth import BearerAuthMiddleware
 from config import server_settings
@@ -56,7 +58,49 @@ def build_server() -> FastMCP:
     geocoding.register(mcp)
     email.register(mcp)
 
+    _apply_tool_prefix(mcp, server_settings.tool_prefix)
+
     return mcp
+
+
+def _apply_tool_prefix(mcp: FastMCP, prefix: str) -> None:
+    """Prepend ``prefix`` to every registered tool's name.
+
+    Lets a deployment namespace the whole tool surface from one env var
+    (``MCP_TOOL_PREFIX``) — e.g. to satisfy a client like Open WebUI that adds /
+    expects an ``mcp_`` prefix — without touching each tool's ``register``. A
+    blank prefix is a no-op, preserving the bare names. Each tool is re-registered
+    under its prefixed name via a name-only transform that delegates to the
+    original, so behavior is unchanged.
+    """
+    prefix = (prefix or "").strip()
+    if not prefix:
+        return
+    provider = mcp.local_provider
+    for tool in _run_sync(mcp.list_tools()):
+        if tool.name.startswith(prefix):
+            continue
+        provider.remove_tool(tool.name)
+        provider.add_tool(Tool.from_tool(tool, name=f"{prefix}{tool.name}"))
+
+
+def _run_sync(coro):
+    """Drive an async coroutine to completion from sync code.
+
+    ``build_server()`` is normally called at import time (no running loop), where
+    ``asyncio.run`` works — but it may also be called from inside an already
+    running loop (e.g. scripts/show_tool.py awaits a wrapper that builds the
+    server). ``asyncio.run`` raises there, so fall back to running the coroutine
+    on its own loop in a worker thread.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 mcp = build_server()
