@@ -39,6 +39,22 @@ def make_mock_async_client_cls(handler):
     return _MockAsyncClient
 
 
+@pytest.fixture(autouse=True)
+def _reset_fetch_clients():
+    """Drop the shared direct-fetch clients between tests.
+
+    `web_fetch` reuses one `httpx.AsyncClient` per `verify` setting for keep-alive.
+    Tests build that client lazily under a patched `httpx.AsyncClient` (a fresh
+    MockTransport per test), so the cache must be cleared each test or a later
+    test would reuse an earlier test's mock handler.
+    """
+    from tools import web_fetch
+
+    web_fetch._fetch_clients.clear()
+    yield
+    web_fetch._fetch_clients.clear()
+
+
 @pytest.fixture
 def patch_httpx(monkeypatch):
     """Return a function that installs a MockTransport handler on httpx.AsyncClient.

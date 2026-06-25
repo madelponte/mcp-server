@@ -147,28 +147,27 @@ def _structured_from_html(html: str, url: str) -> dict:
 # Readable-text rendering
 # ---------------------------------------------------------------------------
 
-def _plain_text_from_html(html: str) -> str:
-    """Strip scripts/styles/nav and return readable text."""
-    soup = BeautifulSoup(html, "lxml")
+def _plain_text_from_soup(soup: BeautifulSoup) -> str:
+    """Strip scripts/styles/nav from an already-parsed soup and return readable
+    text. Mutates ``soup`` (decompose), so the caller must not reuse it after."""
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
         t.decompose()
     root = soup.find("article") or soup.find("main") or soup.body or soup
     text = root.get_text("\n", strip=True)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
+    return re.sub(r"\n{3,}", "\n\n", text)
 
 
-def _markdown_from_html(html: str, base_url: str) -> str:
-    """Convert page HTML to markdown, keeping the structure plain text loses.
+def _plain_text_from_html(html: str) -> str:
+    """Strip scripts/styles/nav and return readable text."""
+    return _plain_text_from_soup(BeautifulSoup(html, "lxml"))
 
-    Headings, lists, tables, and hyperlinks survive the conversion, so the model
-    sees the page the way a reader does — and can follow a link it found in the
-    content with another fetch_page call. Link hrefs are resolved against
-    `base_url` to absolute URLs for exactly that reason. Non-content elements
-    (scripts, nav, site header/footer chrome, forms) and images are dropped;
-    `escape_*` are off because the output feeds a model, not a markdown renderer.
-    """
-    soup = BeautifulSoup(html, "lxml")
+
+def _markdown_from_soup(soup: BeautifulSoup, base_url: str) -> str:
+    """Convert an already-parsed soup to markdown (see ``_markdown_from_html``).
+
+    Mutates ``soup`` (decompose/unwrap), so the caller must extract anything else
+    it needs (e.g. the title) before calling this and must not reuse the soup
+    afterward. Split out so a caller can parse the HTML once and reuse the soup."""
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg",
                    "nav", "aside", "form", "button"]):
         t.decompose()
@@ -194,6 +193,19 @@ def _markdown_from_html(html: str, base_url: str) -> str:
         escape_underscores=False,
     ).convert_soup(root)
     return re.sub(r"\n{3,}", "\n\n", md).strip()
+
+
+def _markdown_from_html(html: str, base_url: str) -> str:
+    """Convert page HTML to markdown, keeping the structure plain text loses.
+
+    Headings, lists, tables, and hyperlinks survive the conversion, so the model
+    sees the page the way a reader does — and can follow a link it found in the
+    content with another fetch_page call. Link hrefs are resolved against
+    `base_url` to absolute URLs for exactly that reason. Non-content elements
+    (scripts, nav, site header/footer chrome, forms) and images are dropped;
+    `escape_*` are off because the output feeds a model, not a markdown renderer.
+    """
+    return _markdown_from_soup(BeautifulSoup(html, "lxml"), base_url)
 
 
 # ---------------------------------------------------------------------------

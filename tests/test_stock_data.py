@@ -346,7 +346,7 @@ def test_http_get_json_caches(monkeypatch):
         calls["n"] += 1
         return FakeResp()
 
-    monkeypatch.setattr(stock.requests, "get", fake_get)
+    monkeypatch.setattr(stock._session, "get", fake_get)
     a = stock._http_get_json("https://x.com/api", {"q": 1})
     b = stock._http_get_json("https://x.com/api", {"q": 1})
     assert a == b == {"ok": True}
