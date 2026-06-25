@@ -29,36 +29,40 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
-def test_tool_prefix_namespaces_every_tool(monkeypatch):
-    """MCP_TOOL_PREFIX prepends its value to every registered tool name."""
+def _tool_by_name(server, name):
+    return next(t for t in _list_tools(server) if t.name == name)
+
+
+def test_tool_prefix_does_not_rename_tools(monkeypatch):
+    """MCP_TOOL_PREFIX must NOT rename the server's own tools — the client adds
+    its own prefix, so renaming here would double it (mcp_mcp_fetch_page)."""
     import server as server_mod
 
     monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "mcp_")
     built = server_mod.build_server()
     names = {t.name for t in run(built.list_tools())}
-    assert names == {f"mcp_{n}" for n in EXPECTED_TOOLS}
+    assert names == EXPECTED_TOOLS
 
 
-def test_prefixed_tool_is_still_callable(monkeypatch):
-    """A prefixed tool still routes to and runs the original function."""
+def test_tool_prefix_interpolated_into_cross_references(monkeypatch):
+    """The configured prefix is spliced into the docstring cross-references so
+    they match what the model sees once the client has prefixed the names."""
     import server as server_mod
 
-    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "mcp_")
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "owui_")
     built = server_mod.build_server()
-    # send_email validates its args before any network use, so an empty
-    # recipients list raises ToolError — proving the prefixed name dispatches
-    # to the real tool function rather than 404-ing.
-    with pytest.raises(ToolError):
-        run(built.call_tool("mcp_send_email", {"recipients": [], "subject": "x", "body": "y"}))
+    assert "owui_fetch_page" in _tool_by_name(built, "search_web").description
+    assert "owui_search_web" in _tool_by_name(built, "fetch_page").description
 
 
-def test_blank_tool_prefix_leaves_names_unchanged(monkeypatch):
+def test_blank_tool_prefix_yields_bare_cross_references(monkeypatch):
     import server as server_mod
 
     monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "")
     built = server_mod.build_server()
-    names = {t.name for t in run(built.list_tools())}
-    assert names == EXPECTED_TOOLS
+    desc = _tool_by_name(built, "search_web").description
+    assert "fetch_page" in desc
+    assert "mcp_fetch_page" not in desc
 
 
 def test_find_nearby_places_description_interpolates_caps(server):

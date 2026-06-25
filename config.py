@@ -54,11 +54,13 @@ class ServerSettings(BaseSettings):
     tool_prefix: str = Field(
         "",
         description=(
-            "String prepended (verbatim) to every registered tool's name, e.g. "
-            "MCP_TOOL_PREFIX=mcp_ exposes the tools as mcp_search_web, "
-            "mcp_fetch_page, … Useful for clients (such as Open WebUI) that need a "
-            "namespace to avoid tool-name collisions across servers. Blank (the "
-            "default) leaves the bare names unchanged."
+            "Prefix your MCP client prepends to tool names when it presents them "
+            "to the model (Open WebUI, for example, forces an 'mcp_' namespace). "
+            "The server does NOT rename its own tools — this value is only "
+            "interpolated into docstrings where one tool refers to another (e.g. "
+            "search_web pointing at fetch_page), so those cross-references read as "
+            "'mcp_fetch_page' and match what the model actually sees. Set it to "
+            "match your client's prefix, or blank if it adds none."
         ),
     )
 
