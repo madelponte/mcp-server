@@ -188,6 +188,51 @@ def test_provider_error_redacts_embedded_key():
     assert out.startswith("fmp: Exception:")
 
 
+# --------------------------- sections coercion ---------------------------
+
+def _capture_sections(monkeypatch):
+    """Stub _fetch_company so the tool's section normalization can be inspected
+    without resolving symbols or hitting any provider."""
+    captured = {}
+
+    async def fake_fetch(query, sections, *rest):
+        captured["sections"] = sections
+        return {"symbol": query, "sections": sections, "data": {}}
+
+    monkeypatch.setattr(stock, "_fetch_company", fake_fetch)
+    return captured
+
+
+def test_sections_accepts_comma_separated_string(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections="quote,profile,financials"))
+    assert captured["sections"] == ["quote", "profile", "financials"]
+
+
+def test_sections_accepts_list_with_comma_joined_entry(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=["quote,profile"]))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_plain_list_still_works(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=["quote", "profile"]))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_string_with_spaces_and_dupes_is_cleaned(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=" Quote , profile ,quote"))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_invalid_string_still_raises(monkeypatch, tool_fns):
+    _capture_sections(monkeypatch)
+    with pytest.raises(ToolError):
+        run(tool_fns["get_company_data"](symbol="AAPL", sections="quote,bogus"))
+
+
 # --------------------------- _resolve_symbol ---------------------------
 
 def test_resolve_symbol_special_passthrough():

@@ -43,6 +43,27 @@ def test_clean_403_without_markers_is_not_blocked():
     assert _is_blocked_response(403, "<p>Plain forbidden page</p>", {}) is False
 
 
+def test_datadome_401_challenge_is_blocked():
+    # DataDome (e.g. Reuters) serves its interstitial as HTTP 401 with a
+    # captcha-delivery marker in the body and a datadome= cookie — both signals,
+    # and 401 is a block status, so it must be recognized rather than returned.
+    body = (
+        '<p id="cmsg">Please enable JS and disable any ad blocker</p>'
+        "<script>var dd={'host':'geo.captcha-delivery.com'}</script>"
+    )
+    headers = {"set-cookie": "datadome=AbC~xyz; Max-Age=31536000; Path=/; Secure"}
+    assert _is_blocked_response(401, body, headers) is True
+
+
+def test_plain_401_without_markers_is_not_blocked():
+    # A genuine auth-required 401 (no challenge marker/cookie) is NOT a bot wall —
+    # adding 401 to the block statuses must not turn every 401 into a block.
+    assert (
+        _is_blocked_response(401, '{"error":"unauthorized"}', {"www-authenticate": "Bearer"})
+        is False
+    )
+
+
 def test_cloudflare_managed_challenge_text_is_blocked():
     # Cloudflare's managed-challenge interstitial sometimes arrives as a 403 with
     # only this visible body text (no cf-* token / "just a moment" title). It must
