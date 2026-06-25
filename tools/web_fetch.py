@@ -35,6 +35,28 @@ log = logging.getLogger(__name__)
 # alone is a sufficient key. See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
+# Shared httpx clients for direct fetches, keyed by the `verify` setting (the
+# only client-construction option that varies). Reusing one client per setting
+# keeps a keep-alive connection pool warm across fetches — so an agent loop that
+# reads several pages from the same host reuses the TCP+TLS connection instead of
+# reopening it each time — while per-request headers/timeout still vary per call.
+# Built lazily so tests that patch `httpx.AsyncClient` are still honored.
+_fetch_clients: dict[bool, httpx.AsyncClient] = {}
+
+
+def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
+    """Return the shared direct-fetch client for `verify_ssl`, building it once.
+
+    `follow_redirects` is off (redirects are followed by hand so each hop is
+    SSRF-checked); the User-Agent, timeout, and Accept headers are supplied
+    per-request by `_httpx_fetch`, since only `verify` must be fixed at
+    construction time."""
+    client = _fetch_clients.get(verify_ssl)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(follow_redirects=False, verify=verify_ssl)
+        _fetch_clients[verify_ssl] = client
+    return client
+
 
 # ---------------------------------------------------------------------------
 # Bot-wall / CAPTCHA detection
@@ -424,29 +446,27 @@ async def _httpx_fetch(
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    async with httpx.AsyncClient(
-        follow_redirects=False, timeout=timeout, verify=verify_ssl, headers=headers
-    ) as client:
-        current = url
-        for _ in range(MAX_REDIRECTS + 1):
-            async with client.stream("GET", current) as resp:
-                location = resp.headers.get("location")
-                if resp.is_redirect and location:
-                    current = str(resp.url.join(location))
-                    await _assert_url_allowed(current)
-                    continue
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.aiter_bytes():
-                    total += len(chunk)
-                    if max_bytes and total > max_bytes:
-                        raise DownloadTooLargeError(
-                            f"Response from {current!r} exceeds the "
-                            f"{max_bytes}-byte download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
-                        )
-                    chunks.append(chunk)
-                ctype = resp.headers.get("content-type", "")
-                return resp.status_code, dict(resp.headers), b"".join(chunks), ctype
+    client = _fetch_client(verify_ssl)
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
+            location = resp.headers.get("location")
+            if resp.is_redirect and location:
+                current = str(resp.url.join(location))
+                await _assert_url_allowed(current)
+                continue
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise DownloadTooLargeError(
+                        f"Response from {current!r} exceeds the "
+                        f"{max_bytes}-byte download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
+                    )
+                chunks.append(chunk)
+            ctype = resp.headers.get("content-type", "")
+            return resp.status_code, dict(resp.headers), b"".join(chunks), ctype
     raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
@@ -623,6 +643,70 @@ async def _cached_resilient_fetch(url: str) -> dict:
     )
     _page_cache.set(url, fetched)
     return fetched
+
+
+async def _enrich_fetch(url: str) -> dict | None:
+    """Lean fetch used only to enrich a search result with page metadata.
+
+    Enrichment wants a hit's title/description/heading outline — all in the
+    document head — not its whole body, and it isn't worth a multi-second browser
+    render. So unlike `_cached_resilient_fetch` this:
+
+    * reuses an already-cached full fetch when one exists (so a later
+      ``fetch_page`` read and this share a download), but
+    * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
+      fetch through the same SSRF-guarded redirect path — and **skips** the
+      FlareSolverr and Wayback fallbacks, so one bot-walled result among the top
+      hits can't stall the whole ``search_web`` call.
+
+    A page larger than the cap returns ``None`` (left un-enriched) rather than
+    being pulled in full. Only a complete, textlike, un-blocked result is written
+    to the shared page cache — never a truncated/blocked one, which would poison a
+    later real ``fetch_page`` read. Returns a raw-fetch-shaped dict, or ``None``.
+    """
+    cached = _page_cache.get(url)
+    if cached is not None:
+        return cached
+    await _assert_url_allowed(url)
+    try:
+        status, headers, body, ctype = await _httpx_fetch(
+            url,
+            timeout=cfg.http_timeout_seconds,
+            user_agent=cfg.user_agent,
+            verify_ssl=cfg.verify_ssl,
+            max_bytes=cfg.enrich_max_bytes,
+        )
+    except (SSRFError, DownloadTooLargeError):
+        # Blocked redirect host, or a page too big to enrich cheaply — skip it.
+        return None
+
+    is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
+    is_textlike = (
+        not is_document
+        and (
+            ctype.startswith("text/")
+            or "json" in ctype
+            or "xml" in ctype
+            or "html" in ctype
+        )
+    )
+    text = _decode_body(body, ctype) if is_textlike else None
+    blocked = _is_blocked_response(status, text or "", headers)
+    result = {
+        "url": url,
+        "status": status,
+        "content_type": ctype,
+        "text": text,
+        "bytes": None if is_textlike else body,
+        "via": "direct",
+        "blocked_detected": blocked,
+    }
+    # Cache only a complete, readable, un-blocked page, so a later fetch_page read
+    # can reuse it. A blocked direct response must not be cached: fetch_page would
+    # then reuse it and skip its own FlareSolverr attempt.
+    if is_textlike and not blocked:
+        _page_cache.set(url, result)
+    return result
 
 
 async def _render_with_flaresolverr(url: str) -> dict:
