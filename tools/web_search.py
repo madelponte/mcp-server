@@ -15,6 +15,7 @@ import asyncio
 import logging
 from typing import Annotated
 
+import anyio
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -22,7 +23,7 @@ from pydantic import Field
 
 from config import web_search_settings as cfg
 from .serialize import to_json, log_call, log_result
-from .web_fetch import _cached_resilient_fetch, _is_tika_document
+from .web_fetch import _enrich_fetch, _is_tika_document
 from .web_extract import _structured_from_html, _trim
 
 log = logging.getLogger(__name__)
@@ -128,17 +129,21 @@ async def _enrich_result(url: str | None) -> dict | None:
     if not url:
         return None
     try:
-        fetched = await _cached_resilient_fetch(url)
+        fetched = await _enrich_fetch(url)
     except Exception as e:
         return {"error": str(e)}
 
+    if not fetched:
+        return None
     ctype = (fetched.get("content_type") or "").lower()
     if _is_tika_document(ctype, url):
         return {"title": None, "description": None, "headings": [], "toc": None}
     text = fetched.get("text")
     if not text:
         return None
-    return _structured_from_html(text, url)
+    # lxml parsing is CPU-bound; offload it so enriching several results doesn't
+    # serialize on (and block) the event loop.
+    return await anyio.to_thread.run_sync(_structured_from_html, text, url)
 
 
 def register(mcp: FastMCP) -> None:

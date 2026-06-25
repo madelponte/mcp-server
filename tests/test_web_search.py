@@ -101,7 +101,7 @@ def test_enrich_result_html(monkeypatch):
         return {"content_type": "text/html",
                 "text": "<title>My Page</title><meta name=description content='D'><h1>H</h1>"}
 
-    monkeypatch.setattr(ws, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
     out = run(_enrich_result("https://e.com"))
     assert out["title"] == "My Page"
     assert out["description"] == "D"
@@ -111,7 +111,7 @@ def test_enrich_result_tika_document(monkeypatch):
     async def fake_fetch(url):
         return {"content_type": "application/pdf", "text": None}
 
-    monkeypatch.setattr(ws, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
     out = run(_enrich_result("https://e.com/file.pdf"))
     assert out == {"title": None, "description": None, "headings": [], "toc": None}
 
@@ -120,7 +120,7 @@ def test_enrich_result_no_text_returns_none(monkeypatch):
     async def fake_fetch(url):
         return {"content_type": "text/html", "text": ""}
 
-    monkeypatch.setattr(ws, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
     assert run(_enrich_result("https://e.com")) is None
 
 
@@ -128,9 +128,18 @@ def test_enrich_result_fetch_error_returns_error_dict(monkeypatch):
     async def fake_fetch(url):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(ws, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
     out = run(_enrich_result("https://e.com"))
     assert "error" in out
+
+
+def test_enrich_result_fetch_none_returns_none(monkeypatch):
+    # A page too big to enrich (or a blocked redirect) yields None, not metadata.
+    async def fake_fetch(url):
+        return None
+
+    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
+    assert run(_enrich_result("https://e.com")) is None
 
 
 # --------------------------- search_web tool ---------------------------

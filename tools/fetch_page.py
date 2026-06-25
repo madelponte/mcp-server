@@ -43,8 +43,10 @@ from .web_fetch import (
 from .web_extract import (
     _find_section,
     _markdown_from_html,
+    _markdown_from_soup,
     _page_title,
     _plain_text_from_html,
+    _plain_text_from_soup,
     _structured_from_html,
     _trim_flagged,
 )
@@ -454,12 +456,55 @@ def _provenance(
 def _render_text_body(html: str, base_url: str) -> tuple[str, str]:
     """Render page HTML to ``(body, format)`` for text mode.
 
-    `format` is "markdown" or "text" per the WEB_SEARCH_MARKDOWN valve. Shared by
-    the initial extraction and the FlareSolverr re-render retry in `_fetch_one`.
+    `format` is "markdown" or "text" per the WEB_SEARCH_MARKDOWN valve. Used by
+    the Wayback-archive paths, which need only the body (the title is taken
+    separately there). The live path uses `_render_text_mode`, which parses once
+    and returns the title too.
     """
     if cfg.markdown:
         return _markdown_from_html(html, base_url), "markdown"
     return _plain_text_from_html(html), "text"
+
+
+# `_render_text_mode` and `_parse_section` parse the page HTML and run
+# markdownify — both CPU-bound — so callers offload them to a worker thread
+# (`anyio.to_thread.run_sync`), per the sync-in-async convention: on the
+# single-process server an inline parse of a large page would stall every other
+# in-flight tool call. Each parses the HTML exactly once and pulls the title from
+# the same soup, rather than the old title-parse-then-render-parse double pass.
+
+def _render_text_mode(html: str, base_url: str) -> tuple[str | None, str, str]:
+    """Parse page HTML once and return ``(title, body, format)`` for text mode.
+
+    The title is read before the markdown/plain render mutates the soup, so the
+    document is parsed a single time. CPU-bound — offload via the caller.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    title = _page_title(soup)
+    if cfg.markdown:
+        return title, _markdown_from_soup(soup, base_url), "markdown"
+    return title, _plain_text_from_soup(soup), "text"
+
+
+def _parse_section(html: str, section: str) -> tuple[str | None, dict | None, list[str]]:
+    """Parse page HTML once for section mode.
+
+    Returns ``(title, section_data, available_headings)``. ``section_data`` is the
+    `_find_section` result (or None when the heading wasn't found, in which case
+    ``available_headings`` lists the page's headings for the error message).
+    CPU-bound — offload via the caller.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    title = _page_title(soup)
+    section_data = _find_section(soup, section)
+    if section_data is not None:
+        return title, section_data, []
+    available = [
+        h.get_text(" ", strip=True)
+        for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+    ]
+    available = [a for a in (a.strip() for a in available) if a][: cfg.max_enrich_headings]
+    return title, None, available
 
 
 # A run of two or more letters — i.e. an actual word. A rendered body without
@@ -776,7 +821,9 @@ async def _fetch_one(
     # return only metadata); structured mode applies only without a query.
     if mode == "structured" and not query:
         try:
-            structured = _structured_from_html(text, fetch_url)
+            structured = await anyio.to_thread.run_sync(
+                _structured_from_html, text, fetch_url
+            )
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
         if structured.get("headings"):
@@ -789,21 +836,14 @@ async def _fetch_one(
         }
 
     # mode == "text"
-    try:
-        full_soup = BeautifulSoup(text, "lxml")
-    except Exception as e:
-        raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
-    soup_title = _page_title(full_soup)
-
     if section:
-        section_data = _find_section(full_soup, section)
+        try:
+            soup_title, section_data, available = await anyio.to_thread.run_sync(
+                _parse_section, text, section
+            )
+        except Exception as e:
+            raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
         if section_data is None:
-            available = [
-                h.get_text(" ", strip=True)
-                for h in full_soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
-            ]
-            available = [a for a in (a.strip() for a in available) if a][: cfg.max_enrich_headings]
             available_str = "; ".join(available) if available else "(none found)"
             raise ToolError(
                 f"Section '{section}' not found on {fetch_url}. "
@@ -834,7 +874,9 @@ async def _fetch_one(
         return section_payload
 
     try:
-        plain, text_format = _render_text_body(text, fetch_url)
+        soup_title, plain, text_format = await anyio.to_thread.run_sync(
+            _render_text_mode, text, fetch_url
+        )
     except Exception as e:
         raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
@@ -859,9 +901,10 @@ async def _fetch_one(
             status = rendered["status"]
             ctype = (rendered.get("content_type") or ctype).lower()
             via = rendered.get("via")
-            soup_title = _page_title(BeautifulSoup(text, "lxml"))
             try:
-                plain, text_format = _render_text_body(text, fetch_url)
+                soup_title, plain, text_format = await anyio.to_thread.run_sync(
+                    _render_text_mode, text, fetch_url
+                )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 

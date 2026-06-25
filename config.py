@@ -138,6 +138,18 @@ class WebSearchSettings(BaseSettings):
             "from a multi-GB body exhausting memory."
         ),
     )
+    enrich_max_bytes: int = Field(
+        3145728,  # 3 MiB
+        description=(
+            "Maximum bytes search_web downloads per result when enriching it with "
+            "page metadata (title/description/headings). Enrichment only needs the "
+            "document head, so this is far smaller than max_download_bytes: a result "
+            "whose page exceeds it is left un-enriched rather than pulled in full, "
+            "and — unlike a fetch_page read — enrichment skips the FlareSolverr/"
+            "Wayback fallbacks, so a single bot-walled hit can't slow the whole "
+            "search. 0 = unbounded."
+        ),
+    )
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
     user_agent: str = Field(DEFAULT_UA, description="User-Agent sent with direct fetches.")
     ssrf_allowlist: str = Field(
