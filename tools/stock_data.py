@@ -121,18 +121,21 @@ def _clamp_amount(requested: int | None, maximum: int) -> int:
 # responses are small and the TTL is short.
 _cache = TTLCache(cfg.cache_ttl_seconds)
 
+# A single shared Session so the many calls a multi-section request makes to the
+# same host (Finnhub's profile alone is two calls; FMP/Finnhub get hit 4-6 times
+# across sections) reuse one keep-alive connection pool instead of paying a fresh
+# TCP+TLS handshake each time. Section fetchers run in worker threads, but
+# urllib3's pool — and read-only use of the Session — is safe under that fan-out.
+_session = requests.Session()
+_session.headers.update({"User-Agent": "MCP-StockDataTool/1.0"})
+
 
 def _http_get_json(url: str, params: dict | None = None) -> Any:
     cache_key = f"GET::{url}::{json.dumps(params or {}, sort_keys=True)}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    resp = requests.get(
-        url,
-        params=params,
-        timeout=cfg.request_timeout,
-        headers={"User-Agent": "MCP-StockDataTool/1.0"},
-    )
+    resp = _session.get(url, params=params, timeout=cfg.request_timeout)
     resp.raise_for_status()
     data = resp.json()
     _cache.set(cache_key, data)
@@ -481,13 +484,40 @@ def _yfinance_quote(symbol: str) -> dict | None:
         fast = ticker.fast_info or {}
     except Exception:
         fast = {}
-    try:
-        info = ticker.info or {}
-    except Exception:
-        info = {}
 
-    price = _safe_float(fast.get("last_price") or info.get("regularMarketPrice") or info.get("currentPrice"))
-    prev_close = _safe_float(fast.get("previous_close") or info.get("regularMarketPreviousClose") or info.get("previousClose"))
+    # `fast_info` is a cheap, dedicated quote endpoint; `.info` is a heavy
+    # full-summary scrape (and the `profile` section pays for it too). Pull every
+    # quote field from `fast_info` first and only fall back to the costly `.info`
+    # for whatever it left missing — on a typical liquid symbol that means we
+    # skip `.info` here entirely.
+    price = _safe_float(fast.get("last_price"))
+    prev_close = _safe_float(fast.get("previous_close"))
+    open_ = _safe_float(fast.get("open"))
+    high = _safe_float(fast.get("day_high"))
+    low = _safe_float(fast.get("day_low"))
+    volume = _safe_int(fast.get("last_volume"))
+    currency = fast.get("currency")
+
+    if None in (price, prev_close, open_, high, low, volume) or not currency:
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
+        if price is None:
+            price = _safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
+        if prev_close is None:
+            prev_close = _safe_float(info.get("regularMarketPreviousClose") or info.get("previousClose"))
+        if open_ is None:
+            open_ = _safe_float(info.get("regularMarketOpen") or info.get("open"))
+        if high is None:
+            high = _safe_float(info.get("regularMarketDayHigh") or info.get("dayHigh"))
+        if low is None:
+            low = _safe_float(info.get("regularMarketDayLow") or info.get("dayLow"))
+        if volume is None:
+            volume = _safe_int(info.get("regularMarketVolume") or info.get("volume"))
+        if not currency:
+            currency = info.get("currency")
+
     if price is None and prev_close is None:
         return None
 
@@ -500,12 +530,12 @@ def _yfinance_quote(symbol: str) -> dict | None:
         "price": price,
         "change": round(change, 4) if change is not None else None,
         "change_percent": round(change_pct, 4) if change_pct is not None else None,
-        "open": _safe_float(fast.get("open") or info.get("regularMarketOpen") or info.get("open")),
-        "high": _safe_float(fast.get("day_high") or info.get("regularMarketDayHigh") or info.get("dayHigh")),
-        "low": _safe_float(fast.get("day_low") or info.get("regularMarketDayLow") or info.get("dayLow")),
+        "open": open_,
+        "high": high,
+        "low": low,
         "previous_close": prev_close,
-        "volume": _safe_int(fast.get("last_volume") or info.get("regularMarketVolume") or info.get("volume")),
-        "currency": fast.get("currency") or info.get("currency"),
+        "volume": volume,
+        "currency": currency,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
     }
 
