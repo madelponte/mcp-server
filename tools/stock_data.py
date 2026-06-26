@@ -19,6 +19,7 @@ WebUI tool; per-user valves and status emitters were removed.
 import asyncio
 import json
 import logging
+import math
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
@@ -45,9 +46,14 @@ def _safe_float(v: Any) -> float | None:
     try:
         if v is None or v == "":
             return None
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    # NaN/Infinity are valid Python floats but `json.dumps` renders them as the
+    # bare tokens NaN/Infinity, which are *invalid* JSON that breaks downstream
+    # parsers. yfinance/pandas hand back NaN for absent numeric cells, so reject
+    # non-finite values here (→ null) rather than letting them reach the output.
+    return f if math.isfinite(f) else None
 
 
 def _safe_int(v: Any) -> int | None:
@@ -55,7 +61,9 @@ def _safe_int(v: Any) -> int | None:
         if v is None or v == "":
             return None
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # int(nan) raises ValueError and int(inf) raises OverflowError; both mean
+        # "no usable integer here" → None.
         return None
 
 
@@ -387,7 +395,7 @@ def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
 
     transactions = []
     shares_bought = shares_sold = 0
-    buy_count = sell_count = 0
+    buy_count = sell_count = neutral_count = 0
     for row in rows:
         change = _safe_int(row.get("change")) or 0
         if change > 0:
@@ -400,6 +408,7 @@ def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
             shares_sold += -change
         else:
             direction = "neutral"
+            neutral_count += 1
         code = row.get("transactionCode")
         transactions.append({
             "name": row.get("name"),
@@ -426,6 +435,7 @@ def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
             "total_transactions": len(transactions),
             "buy_transactions": buy_count,
             "sell_transactions": sell_count,
+            "neutral_transactions": neutral_count,
             "shares_bought": shares_bought,
             "shares_sold": shares_sold,
             "net_shares": shares_bought - shares_sold,
@@ -765,7 +775,7 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
 
     transactions = []
     shares_bought = shares_sold = 0
-    buy_count = sell_count = 0
+    buy_count = sell_count = neutral_count = 0
     for _, row in df.iterrows():
         start = row.get("Start Date")
         tx_date = start.strftime("%Y-%m-%d") if hasattr(start, "strftime") else (str(start) if start is not None else None)
@@ -785,6 +795,7 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
             shares_bought += shares
         else:
             direction = "neutral"
+            neutral_count += 1
 
         transactions.append({
             "name": row.get("Insider"),
@@ -811,6 +822,7 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
             "total_transactions": len(transactions),
             "buy_transactions": buy_count,
             "sell_transactions": sell_count,
+            "neutral_transactions": neutral_count,
             "shares_bought": shares_bought,
             "shares_sold": shares_sold,
             "net_shares": shares_bought - shares_sold,

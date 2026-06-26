@@ -83,6 +83,32 @@ def test_structured_mode(monkeypatch, tool_fns):
     assert out["content"]["description"] == "D"
 
 
+def test_structured_mode_with_section_scopes_headings(monkeypatch, tool_fns):
+    html = (
+        "<body><h1>Top</h1>"
+        "<h2>Alpha</h2><p>a</p>"
+        "<h2>Beta</h2><p>b</p><h3>Beta-1</h3><p>b1</p>"
+        "<h2>Gamma</h2><p>g</p></body>"
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com", mode="structured", section="Beta"))
+    )
+    assert out["format"] == "structured"
+    # Only the Beta subtree, not the whole page's headings.
+    assert out["content"]["section"] == "Beta"
+    assert [h["text"] for h in out["content"]["headings"]] == ["Beta", "Beta-1"]
+    assert "Alpha" not in (out["content"].get("toc") or [])
+
+
+def test_structured_mode_section_not_found_raises(monkeypatch, tool_fns):
+    html = "<body><h2>Alpha</h2><p>a</p></body>"
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://example.com", mode="structured", section="Nope"))
+    assert "Available headings" in str(exc.value)
+
+
 # --------------------------- section extraction ---------------------------
 
 SECTION_HTML = (
