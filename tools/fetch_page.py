@@ -48,6 +48,7 @@ from .web_extract import (
     _plain_text_from_html,
     _plain_text_from_soup,
     _structured_from_html,
+    _structured_section_from_html,
     _trim_flagged,
 )
 
@@ -75,9 +76,10 @@ def _fetch_page_desc(prefix: str) -> str:
         "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
         "passages that match, instead of the full page. On a YouTube transcript it "
         "returns the matching lines tagged with [M:SS] timestamps.\n"
-        "• section — a heading's text. Returns only the content under that heading.\n"
+        "• section — a heading's text. Returns only the content under that "
+        "heading (in structured mode, only that section's sub-headings/toc).\n"
         '• mode — "text" (the default) returns the page content; "structured" '
-        "returns only metadata (title, description, headings, JSON-LD).\n"
+        "returns only metadata (title, description, headings, toc, JSON-LD).\n"
         "• offset — for CONTINUING a long page only. If a result comes back marked "
         '"truncated", call again with offset set to the "next_offset" value from '
         "that result to read the next chunk. Do NOT set it on a first fetch. It "
@@ -490,17 +492,18 @@ def _render_text_mode(html: str, base_url: str) -> tuple[str | None, str, str]:
     return title, _plain_text_from_soup(soup), "text"
 
 
-def _parse_section(html: str, section: str) -> tuple[str | None, dict | None, list[str]]:
+def _parse_section(html: str, section: str, base_url: str = "") -> tuple[str | None, dict | None, list[str]]:
     """Parse page HTML once for section mode.
 
     Returns ``(title, section_data, available_headings)``. ``section_data`` is the
     `_find_section` result (or None when the heading wasn't found, in which case
     ``available_headings`` lists the page's headings for the error message).
-    CPU-bound — offload via the caller.
+    `base_url` is threaded to `_find_section` so the section's reference/citation
+    links resolve to followable URLs. CPU-bound — offload via the caller.
     """
     soup = BeautifulSoup(html, "lxml")
     title = _page_title(soup)
-    section_data = _find_section(soup, section)
+    section_data = _find_section(soup, section, base_url)
     if section_data is not None:
         return title, section_data, []
     available = [
@@ -841,14 +844,36 @@ async def _fetch_one(
     # `query` is a content search, so it overrides "structured" (which would
     # return only metadata); structured mode applies only without a query.
     if mode == "structured" and not query:
-        try:
-            structured = await anyio.to_thread.run_sync(
-                _structured_from_html, text, fetch_url
-            )
-        except Exception as e:
-            raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+        # With a `section`, scope the metadata to that heading's subtree so the
+        # headings/toc describe just that section, not the whole page.
+        if section:
+            try:
+                structured, available = await anyio.to_thread.run_sync(
+                    _structured_section_from_html, text, fetch_url, section
+                )
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+            if structured is None:
+                available = available[: cfg.max_enrich_headings]
+                available_str = "; ".join(available) if available else "(none found)"
+                raise ToolError(
+                    f"Section '{section}' not found on {fetch_url}. "
+                    f"Available headings: {available_str}. "
+                    "Retry with one of those headings, or omit `section` to fetch "
+                    "the whole page."
+                )
+        else:
+            try:
+                structured = await anyio.to_thread.run_sync(
+                    _structured_from_html, text, fetch_url
+                )
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+        # Cap headings and the (heading-derived) toc together so they stay aligned.
         if structured.get("headings"):
             structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
+        if structured.get("toc"):
+            structured["toc"] = structured["toc"][: cfg.max_enrich_headings]
         return {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype, via),
@@ -860,7 +885,7 @@ async def _fetch_one(
     if section:
         try:
             soup_title, section_data, available = await anyio.to_thread.run_sync(
-                _parse_section, text, section
+                _parse_section, text, section, fetch_url
             )
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
