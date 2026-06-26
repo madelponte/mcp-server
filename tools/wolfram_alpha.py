@@ -95,6 +95,7 @@ def _structure_result(body: str, query: str) -> dict:
     data: dict[str, str] = {}
     assumptions: dict | None = None
     url: str | None = None
+    last_key: str | None = None  # section an unlabeled block continues
 
     for block in re.split(r"\n[ \t]*\n", body.strip()):
         block = block.strip()
@@ -119,10 +120,17 @@ def _structure_result(body: str, query: str) -> dict:
         content = _clean_body(content)
         if not content:
             continue  # section was image-only boilerplate
+        if not label and last_key is not None:
+            # An unlabeled block continues the previous section (e.g. the
+            # alternate-unit forms Wolfram lists under "Value"), rather than
+            # being its own entry.
+            data[last_key] += "\n" + content
+            continue
         key = label or "answer"
-        while key in data:  # don't clobber a repeated label
+        while key in data:  # a genuinely repeated label
             key += " (cont.)"
         data[key] = content
+        last_key = key
 
     payload: dict[str, Any] = {"query": query}
     if assumptions:
