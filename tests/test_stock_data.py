@@ -517,6 +517,77 @@ def test_yfinance_ownership_none_when_empty(monkeypatch):
     assert stock._yfinance_ownership("AAPL", max_holders=10) is None
 
 
+# --------------------------- insider transactions ---------------------------
+
+def test_safe_float_rejects_non_finite():
+    # NaN/Infinity are valid floats but serialize to invalid JSON tokens, so the
+    # shared coercion must drop them to None.
+    assert stock._safe_float(float("nan")) is None
+    assert stock._safe_float(float("inf")) is None
+    assert stock._safe_float(float("-inf")) is None
+    assert stock._safe_float(3.5) == 3.5
+
+
+def test_yfinance_insiders_nan_value_and_neutral_count(monkeypatch):
+    import json
+    import pandas as pd
+    from tools.serialize import to_json
+
+    today = pd.Timestamp.today().normalize()
+    # 1 sell + 2 neutral (a gift and a conversion), matching the bug report; the
+    # neutral gift carries a NaN Value (yfinance's marker for an absent number).
+    df = pd.DataFrame([
+        {"Start Date": today, "Insider": "ALICE", "Position": "CEO",
+         "Transaction": "Sale", "Text": "Sale", "Shares": 116, "Value": 5000.0},
+        {"Start Date": today, "Insider": "NEWSTEAD JENNIFER", "Position": "Dir",
+         "Transaction": "Gift", "Text": "Gift", "Shares": 10, "Value": float("nan")},
+        {"Start Date": today, "Insider": "BOB", "Position": "CFO",
+         "Transaction": "Conversion", "Text": "Conversion", "Shares": 5, "Value": 200.0},
+    ])
+
+    class FakeTicker:
+        insider_transactions = df
+
+    monkeypatch.setattr(stock, "_yfinance_ticker", lambda s: FakeTicker())
+    out = stock._yfinance_insider_transactions("AAPL", weeks=52)
+
+    # Bug 2: neutral transactions are counted and the breakdown reconciles.
+    s = out["summary"]
+    assert s["total_transactions"] == 3
+    assert s["buy_transactions"] == 0
+    assert s["sell_transactions"] == 1
+    assert s["neutral_transactions"] == 2
+    assert (
+        s["buy_transactions"] + s["sell_transactions"] + s["neutral_transactions"]
+        == s["total_transactions"]
+    )
+
+    # Bug 1: the NaN Value becomes null, and the serialized payload is valid JSON
+    # (no bare NaN token that would break a strict parser).
+    nan_row = next(t for t in out["transactions"] if t["name"] == "NEWSTEAD JENNIFER")
+    assert nan_row["value"] is None
+    serialized = to_json(out)
+    assert "NaN" not in serialized
+    json.loads(serialized)
+
+
+def test_finnhub_insiders_counts_neutral(monkeypatch):
+    monkeypatch.setattr(stock.cfg, "finnhub_api_key", "KEY")
+    payload = {"data": [
+        {"name": "A", "change": -116, "transactionDate": "2026-06-20", "transactionCode": "S"},
+        {"name": "B", "change": 0, "transactionDate": "2026-06-20", "transactionCode": "A"},
+        {"name": "C", "change": 0, "transactionDate": "2026-06-20", "transactionCode": "M"},
+    ]}
+    monkeypatch.setattr(stock, "_http_get_json", lambda url, params=None: payload)
+    out = stock._finnhub_insider_transactions("AAPL", weeks=52)
+    s = out["summary"]
+    assert (s["buy_transactions"], s["sell_transactions"], s["neutral_transactions"]) == (0, 1, 2)
+    assert (
+        s["buy_transactions"] + s["sell_transactions"] + s["neutral_transactions"]
+        == s["total_transactions"]
+    )
+
+
 def test_new_sections_are_valid():
     for sec in ("peers", "dividends", "ownership"):
         assert sec in stock.VALID_SECTIONS
