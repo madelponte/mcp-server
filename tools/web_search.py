@@ -21,12 +21,40 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from config import web_search_settings as cfg
+from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result
 from .web_fetch import _enrich_fetch, _is_tika_document
 from .web_extract import _structured_from_html, _trim
 
 log = logging.getLogger(__name__)
+
+
+# The model-facing tool description. Built at registration time so the sibling
+# tool reference (fetch_page) carries the client's tool-name prefix — the same
+# prefix the model sees on that tool (see ServerSettings.tool_prefix). The
+# return-shape part is a plain string so its JSON braces don't need escaping; the
+# prefix is spliced in with `+` rather than an f-string for the same reason.
+def _search_web_desc(prefix: str) -> str:
+    return (
+        "Search the web. Use for unknown facts, current events, or verification.\n\n"
+        "Results include url/title/snippet + optional page metadata (headings, "
+        "description) for top results. Then use " + prefix + "fetch_page to read "
+        "full content.\n\n"
+        "Query: short keywords only (not sentences). Search operators are "
+        "supported and sharpen results — use them when they fit: site:domain.com "
+        '(restrict to one site), "exact phrase" (quoted), -word (exclude a term), '
+        "term OR term (alternatives), filetype:pdf (a file type). time_range: "
+        '"day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|'
+        '"it"|"social media"|"videos"|"images"|"music"|"files"|"map" '
+        "(comma-separate).\n"
+        "num_results/enrich_results: max counts (see per-arg caps; enrich fetches "
+        "metadata). page: result page (1-based, default 1) — set page=2 to get the "
+        "next batch of results for the SAME query when the first page wasn't "
+        "useful, instead of reformulating.\n\n"
+        "Returns JSON {query, time_range, category, page, results:[{url,title,"
+        "snippet,published_date?,page_title?,page_description?,page_headings?,"
+        "page_toc?}]}"
+    )
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake the failure for
@@ -147,7 +175,7 @@ async def _enrich_result(url: str | None) -> dict | None:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(description=_search_web_desc(server_settings.tool_prefix))
     async def search_web(
         query: str,
         time_range: str | None = None,
@@ -169,31 +197,14 @@ def register(mcp: FastMCP) -> None:
         ] = None,
         page: int | None = None,
     ) -> str:
-        """Search the web. Use for unknown facts, current events, or verification.
-
-        Results include url/title/snippet + optional page metadata (headings,
-        description) for top results. Then use mcp_fetch_page to read full content.
-
-        Query: short keywords only (not sentences). Search operators are
-        supported and sharpen results — use them when they fit: site:domain.com
-        (restrict to one site), "exact phrase" (quoted), -word (exclude a term),
-        term OR term (alternatives), filetype:pdf (a file type). time_range:
-        "day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|
-        "it"|"social media"|"videos"|"images"|"music"|"files"|"map"
-        (comma-separate).
-        num_results/enrich_results: max counts (see per-arg caps; enrich fetches
-        metadata). page: result page (1-based, default 1) — set page=2 to get the
-        next batch of results for the SAME query when the first page wasn't
-        useful, instead of reformulating.
+        """Search the web. The model-facing guidance lives in the
+        @mcp.tool(description=...) above.
 
         :param query: Keywords (operators supported: site:, "phrase", -exclude,
             OR, filetype:).
         :param time_range: Recency filter.
         :param category: Category (comma-separate).
         :param page: Result page number (1-based; default 1).
-        :return: JSON {query, time_range, category, page, results:[{url,title,
-            snippet,published_date?,page_title?,page_description?,page_headings?,
-            page_toc?}]}
         """
         log_call(
             log,

@@ -65,11 +65,15 @@ def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
 # renders in a real browser) instead of returning the challenge itself as if it
 # were content. Cloudflare is the common case, but it is not the only one:
 # PerimeterX/HUMAN, DataDome, and Akamai Bot Manager all serve a 403 (sometimes a
-# 200) whose body is a JS/CAPTCHA challenge bearing none of the Cloudflare
-# markers — so they must be matched explicitly or the fallback never fires.
+# 401, 429, or even a 200) whose body is a JS/CAPTCHA challenge bearing none of
+# the Cloudflare markers — so they must be matched explicitly or the fallback
+# never fires. DataDome in particular (e.g. Reuters) answers its interstitial
+# with HTTP 401, which is why 401 is a block status here even though it normally
+# means "authentication required": a plain 401 with no challenge marker/cookie
+# still falls through as not-blocked (the marker check below must also pass).
 # ---------------------------------------------------------------------------
 
-BLOCK_STATUS_CODES = {403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
+BLOCK_STATUS_CODES = {401, 403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
 CLOUDFLARE_MARKERS = (
     "cf-ray",
     "cf-chl",
@@ -80,6 +84,11 @@ CLOUDFLARE_MARKERS = (
     "challenge-platform",
     "please enable cookies",
     "/cdn-cgi/challenge-platform",
+    # Cloudflare's managed-challenge interstitial doesn't always carry a "just a
+    # moment" title or a cf-* token in a stripped/minimal response — but its
+    # visible body text is this. Distinctive enough not to false-positive on a
+    # real page (and the >=2-marker rule still guards the bare-200 case).
+    "enable javascript and cookies to continue",
 )
 # Markers for the other major bot walls. Kept separate from the Cloudflare set
 # only for clarity; detection treats them the same way.

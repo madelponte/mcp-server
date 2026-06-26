@@ -20,6 +20,8 @@ from tools.stock_data import (
     _resolve_symbol,
     _fetch_section,
     _gather_sections,
+    _scrub_secrets,
+    _provider_error,
 )
 from conftest import run
 
@@ -155,6 +157,80 @@ def test_retrieval_error_with_errors():
 def test_retrieval_error_without_errors():
     msg = _retrieval_error("quote", "AAPL", [])
     assert msg == "Could not retrieve quote for AAPL."
+
+
+# --------------------------- secret redaction ---------------------------
+
+def test_scrub_secrets_redacts_fmp_apikey():
+    raw = (
+        "402 Client Error: Payment Required for url: "
+        "https://financialmodelingprep.com/stable/income-statement"
+        "?symbol=BTC-USD&limit=4&apikey=SUPERSECRETKEY"
+    )
+    scrubbed = _scrub_secrets(raw)
+    assert "SUPERSECRETKEY" not in scrubbed
+    assert "apikey=REDACTED" in scrubbed
+    # Non-secret query params are preserved for diagnostics.
+    assert "symbol=BTC-USD" in scrubbed
+
+
+def test_scrub_secrets_redacts_finnhub_token():
+    raw = "HTTPError for url: https://finnhub.io/api/v1/quote?symbol=AAPL&token=abc123"
+    scrubbed = _scrub_secrets(raw)
+    assert "abc123" not in scrubbed
+    assert "token=REDACTED" in scrubbed
+
+
+def test_provider_error_redacts_embedded_key():
+    exc = Exception("boom for url: https://x/stable/q?apikey=LEAK&api_key=ALSOLEAK")
+    out = _provider_error("fmp", exc)
+    assert "LEAK" not in out and "ALSOLEAK" not in out
+    assert out.startswith("fmp: Exception:")
+
+
+# --------------------------- sections coercion ---------------------------
+
+def _capture_sections(monkeypatch):
+    """Stub _fetch_company so the tool's section normalization can be inspected
+    without resolving symbols or hitting any provider."""
+    captured = {}
+
+    async def fake_fetch(query, sections, *rest):
+        captured["sections"] = sections
+        return {"symbol": query, "sections": sections, "data": {}}
+
+    monkeypatch.setattr(stock, "_fetch_company", fake_fetch)
+    return captured
+
+
+def test_sections_accepts_comma_separated_string(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections="quote,profile,financials"))
+    assert captured["sections"] == ["quote", "profile", "financials"]
+
+
+def test_sections_accepts_list_with_comma_joined_entry(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=["quote,profile"]))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_plain_list_still_works(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=["quote", "profile"]))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_string_with_spaces_and_dupes_is_cleaned(monkeypatch, tool_fns):
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections=" Quote , profile ,quote"))
+    assert captured["sections"] == ["quote", "profile"]
+
+
+def test_sections_invalid_string_still_raises(monkeypatch, tool_fns):
+    _capture_sections(monkeypatch)
+    with pytest.raises(ToolError):
+        run(tool_fns["get_company_data"](symbol="AAPL", sections="quote,bogus"))
 
 
 # --------------------------- _resolve_symbol ---------------------------

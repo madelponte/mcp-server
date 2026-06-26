@@ -19,6 +19,7 @@ WebUI tool; per-user valves and status emitters were removed.
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -85,6 +86,25 @@ def _format_large_number(n: float | None) -> str | None:
     if abs_n >= 1e3:
         return f"{n / 1e3:.2f}K"
     return f"{n:.2f}"
+
+
+# Provider errors carry the failing request's exception string, which (for the
+# `requests`-backed providers) embeds the full URL — including the `apikey` /
+# `token` query parameter that authenticates us. That detail is surfaced to the
+# model in the `errors` map and in ToolError messages, so the secret must be
+# redacted before it ever leaves the process. Matches the known secret-bearing
+# query params and replaces their value with `REDACTED`.
+_SECRET_PARAM_RE = re.compile(r"(?i)\b(apikey|api_key|token)=[^&\s'\"]+")
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact API keys / tokens that leak through provider exception strings."""
+    return _SECRET_PARAM_RE.sub(r"\1=REDACTED", text)
+
+
+def _provider_error(provider: str, exc: Exception) -> str:
+    """Format a per-provider error string with any embedded secret redacted."""
+    return _scrub_secrets(f"{provider}: {type(exc).__name__}: {exc}")
 
 
 def _retrieval_error(what: str, symbol: str, errors: list[str]) -> str:
@@ -1192,14 +1212,14 @@ def _search_symbols(query: str, limit: int) -> tuple[list[dict], list[str], str 
             results = _finnhub_search(query, limit)
             provider = "finnhub"
         except Exception as e:
-            errors.append(f"finnhub: {type(e).__name__}: {e}")
+            errors.append(_provider_error("finnhub", e))
 
     if not results and (provider is None or cfg.prefer_yfinance_fallback):
         try:
             results = _yfinance_search(query, limit)
             provider = "yfinance"
         except Exception as e:
-            errors.append(f"yfinance: {type(e).__name__}: {e}")
+            errors.append(_provider_error("yfinance", e))
 
     return results, errors, provider
 
@@ -1293,13 +1313,13 @@ def _fetch_section(provider: str, primary: dict, yf_fn, args: tuple) -> tuple[di
     try:
         result = fn(*args)
     except Exception as e:
-        errors.append(f"{provider}: {type(e).__name__}: {e}")
+        errors.append(_provider_error(provider, e))
 
     if (not result) and cfg.prefer_yfinance_fallback and provider != "yfinance":
         try:
             result = yf_fn(*args)
         except Exception as e:
-            errors.append(f"yfinance: {type(e).__name__}: {e}")
+            errors.append(_provider_error("yfinance", e))
 
     return result, errors
 
@@ -1530,7 +1550,7 @@ def register(mcp: FastMCP) -> None:
                 "skipped). Pass an actual array, not the array written as a string."
             ),
         ],
-        sections: list[str] | None = None,
+        sections: list[str] | str | None = None,
         statement: Literal["income", "balance", "cashflow"] = "income",
         period: Literal["annual", "quarterly"] = "annual",
         periods: Annotated[
@@ -1589,7 +1609,9 @@ def register(mcp: FastMCP) -> None:
         peers, dividend history, ownership structure.
         Crypto/FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
 
-        :param sections: Sections to fetch (default: quote,profile).
+        :param sections: Sections to fetch (default: quote,profile). A list
+            (["quote","profile"]) is preferred, but a comma-separated string
+            ("quote,profile") is also accepted.
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
@@ -1649,7 +1671,16 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("A ticker symbol or company name is required.")
 
         # Validate the call-level params once — they apply to every symbol.
-        requested = sections if sections else list(DEFAULT_SECTIONS)
+        # `sections` is documented as a list, but small models routinely pass a
+        # comma-separated string ("quote,profile") or a list holding one
+        # ("quote,profile"). Coerce both to a flat list of section names rather
+        # than failing — matching the leniency the `symbol` param already affords.
+        if not sections:
+            requested = list(DEFAULT_SECTIONS)
+        elif isinstance(sections, str):
+            requested = sections.split(",")
+        else:
+            requested = [part for s in sections for part in (s or "").split(",")]
         normalized: list[str] = []
         for s in requested:
             key = (s or "").strip().lower()

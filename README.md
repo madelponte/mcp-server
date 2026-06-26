@@ -190,6 +190,19 @@ indented, human-readable JSON (instead of compact JSON) and each tool call emits
 verbose per-call logs to stdout. Useful for troubleshooting; leave it off in
 normal operation so responses stay compact in the model's context window.
 
+### Tool-name prefix in cross-references
+
+Some MCP clients prepend a namespace to every tool name before showing it to the
+model — Open WebUI, for example, forces an `mcp_` prefix, so `fetch_page` appears
+to the model as `mcp_fetch_page`. The server keeps its tool names **bare**
+(prefixing them here too would double it, e.g. `mcp_mcp_fetch_page`), but a few
+docstrings point one tool at another (e.g. `search_web` tells the model to use
+`fetch_page` to read a result). `MCP_TOOL_PREFIX` is the prefix spliced into
+those cross-references so they match what the model actually sees. It defaults to
+blank (no prefix); set it to `mcp_` when serving Open WebUI, or to whatever
+prefix your client adds. The value is inserted verbatim, so include any trailing
+separator (e.g. the `_`).
+
 ### Authentication
 
 Set `MCP_AUTH_TOKEN` to require a bearer token on every HTTP request. Clients

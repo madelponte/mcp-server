@@ -143,6 +143,27 @@ def test_document_no_content_raises(monkeypatch, tool_fns):
         run(tool_fns["fetch_page"](url="https://example.com/report.pdf"))
 
 
+def test_error_html_at_document_url_is_not_extracted(monkeypatch, tool_fns):
+    """A `.pdf` URL that returns an HTTP error with an HTML body (e.g. a bot wall
+    that slipped past block detection) must raise, not be Tika-extracted into
+    bogus document_text."""
+    _patch_fetch(
+        monkeypatch,
+        _fetched(
+            status=403,
+            content_type="text/html",
+            text="Enable JavaScript and cookies to continue",
+            body=b"Enable JavaScript and cookies to continue",
+        ),
+    )
+    # Tika should never be reached; make it loud if it is.
+    monkeypatch.setattr(
+        fp, "_tika_extract", lambda *a, **k: pytest.fail("Tika ran on an error page")
+    )
+    with pytest.raises(ToolError):
+        run(tool_fns["fetch_page"](url="https://example.com/report.pdf"))
+
+
 def test_mislabeled_pdf_sniffed_to_tika(monkeypatch, tool_fns):
     """A PDF served as octet-stream from an extensionless URL is routed by magic bytes."""
     _patch_fetch(
