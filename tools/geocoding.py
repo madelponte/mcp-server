@@ -155,6 +155,18 @@ _CATEGORY_ITEMS = sorted(_CATEGORY_FILTERS.items(), key=lambda kv: -len(kv[0]))
 # Food-place defaults used when only a diet is given (e.g. "vegan").
 _FOOD_FILTERS = ['["amenity"~"restaurant|cafe|fast_food"]']
 
+# POI tag keys a name/brand search (e.g. "Starbucks") is constrained to. A bare
+# `["name"~"…",i]` regex over node+way+relation has no indexed key for Overpass
+# to narrow on, so it must regex-match the name of EVERY element in the radius —
+# in a dense area that scans hundreds of thousands of elements and blows past the
+# query's own [timeout:N], returning nothing. Pairing the name regex with an
+# indexed key existence check (`["name"~"…",i]["amenity"]`) lets Overpass select
+# the small set of POIs first and regex only those, turning a 76s timeout into a
+# ~3s answer. Kept to the four keys that cover essentially every consumer-facing
+# named POI a brand search targets — each one adds a sub-query, and the extra
+# cost of rarer keys (office/craft) pushed the query back past the timeout.
+_NAME_SEARCH_KEYS = ("amenity", "shop", "tourism", "leisure")
+
 # Diet modifiers -> the OSM diet:* tag they imply.
 _DIET_TAGS: dict[str, str] = {
     "vegan": '["diet:vegan"~"yes|only"]',
@@ -203,7 +215,11 @@ def _build_filters(category: str) -> list[str]:
             term = re.sub(r'["\\]', "", category or "").strip()
             if not term:
                 return []
-            return [f'["name"~"{term}",i]']
+            # Constrain the name regex to elements carrying an indexed POI key so
+            # Overpass narrows by that key before regex-matching names, instead of
+            # scanning every element in the radius (which times out). See
+            # _NAME_SEARCH_KEYS.
+            return [f'["name"~"{term}",i]["{key}"]' for key in _NAME_SEARCH_KEYS]
 
     if diet_tag:
         return [bf + diet_tag for bf in base_filters]
@@ -702,12 +718,18 @@ def register(mcp: FastMCP) -> None:
             raise ToolError(f"Could not interpret the category '{category}'.")
 
         # Build the Overpass query: every filter against nodes, ways, and
-        # relations within the radius. `out center tags` yields a center point
-        # for ways/relations so each result has coordinates.
-        lines = []
-        for f in filters:
-            for elem in ("node", "way", "relation"):
-                lines.append(f"  {elem}{f}(around:{radius},{lat:.7f},{lon:.7f});")
+        # relations within the radius, via the `nwr` shorthand. `out center tags`
+        # yields a center point for ways/relations so each result has coordinates.
+        # `nwr` (one statement per filter) is used instead of three separate
+        # node/way/relation statements deliberately: they're logically identical,
+        # but for a name-regex filter the split form makes Overpass re-resolve the
+        # `around` spatial set per element type and is dramatically slower — a
+        # name search measured ~58s (past the timeout, returning nothing) split
+        # vs ~3s as nwr. Exact-match category filters are fast either way, so nwr
+        # is a safe win for both.
+        lines = [
+            f"  nwr{f}(around:{radius},{lat:.7f},{lon:.7f});" for f in filters
+        ]
         query_ql = (
             f"[out:json][timeout:{int(cfg.overpass_timeout_seconds)}];\n"
             "(\n" + "\n".join(lines) + "\n);\n"
