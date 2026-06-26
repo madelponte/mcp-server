@@ -8,9 +8,12 @@ from tools.web_extract import (
     _extract_jsonld,
     _headings_outline,
     _toc_from_jsonld,
+    _table_of_contents,
+    _description_from_jsonld,
     _page_title,
     _page_description,
     _structured_from_html,
+    _structured_section_from_html,
     _plain_text_from_html,
     _markdown_from_html,
     _norm_heading,
@@ -108,9 +111,11 @@ def test_toc_from_jsonld_recipe_step_dicts():
     assert _toc_from_jsonld(jsonld) == ["Step one", "Step two"]
 
 
-def test_toc_from_jsonld_article_headline():
+def test_toc_from_jsonld_ignores_article_headline():
+    # An Article headline is a description, not a table of contents — it must not
+    # surface as a bogus single-item toc (the reported bug).
     jsonld = [{"@type": "NewsArticle", "headline": "Big News"}]
-    assert _toc_from_jsonld(jsonld) == ["Big News"]
+    assert _toc_from_jsonld(jsonld) is None
 
 
 def test_toc_from_jsonld_empty_returns_none():
@@ -146,6 +151,53 @@ def test_page_description_none_when_absent():
     assert _page_description(_soup("<p>x</p>")) is None
 
 
+def test_page_description_meta_wins_over_jsonld():
+    jsonld = [{"@type": "Article", "description": "from jsonld"}]
+    html = '<meta name="description" content="from meta">'
+    assert _page_description(_soup(html), jsonld) == "from meta"
+
+
+def test_description_from_jsonld_prefers_description_field():
+    jsonld = [{"@type": "Article", "headline": "Title", "description": "A summary."}]
+    assert _description_from_jsonld(jsonld, title="Title") == "A summary."
+
+
+def test_description_from_jsonld_headline_when_it_differs_from_title():
+    # Wikipedia's pattern: no description field, short description in headline.
+    jsonld = [{"@type": "Article", "name": "Python (programming language)",
+               "headline": "general-purpose programming language"}]
+    desc = _description_from_jsonld(jsonld, title="Python (programming language) - Wikipedia")
+    assert desc == "general-purpose programming language"
+
+
+def test_description_from_jsonld_skips_headline_equal_to_title():
+    # A headline that merely restates the title is not a description.
+    jsonld = [{"@type": "NewsArticle", "headline": "Big News"}]
+    assert _description_from_jsonld(jsonld, title="Big News") is None
+
+
+def test_page_description_falls_back_to_jsonld():
+    jsonld = [{"@type": "Article", "name": "T", "headline": "the short description"}]
+    # No meta tags at all → JSON-LD fallback supplies the description.
+    assert _page_description(_soup("<p>x</p>"), jsonld, "T") == "the short description"
+
+
+# --------------------------- table of contents ---------------------------
+
+def test_table_of_contents_from_headings():
+    outline = [{"level": 2, "text": "History"}, {"level": 2, "text": "Naming"}]
+    assert _table_of_contents(outline, []) == ["History", "Naming"]
+
+
+def test_table_of_contents_falls_back_to_recipe_steps():
+    jsonld = [{"@type": "Recipe", "recipeInstructions": ["Mix", "Bake"]}]
+    assert _table_of_contents([], jsonld) == ["Mix", "Bake"]
+
+
+def test_table_of_contents_none_when_nothing():
+    assert _table_of_contents([], [{"@type": "Person"}]) is None
+
+
 # --------------------------- structured_from_html ---------------------------
 
 def test_structured_from_html_combines_fields():
@@ -161,13 +213,49 @@ def test_structured_from_html_combines_fields():
     assert out["description"] == "Desc"
     assert {"level": 1, "text": "Heading"} in out["headings"]
     assert out["jsonld"] == [{"@type": "Article", "headline": "H"}]
-    assert out["toc"] == ["H"]
+    # toc is the heading outline (the real table of contents), not the JSON-LD headline.
+    assert out["toc"] == ["Heading"]
 
 
 def test_structured_from_html_no_jsonld_is_none():
     out = _structured_from_html("<title>T</title>", "https://e.com")
     assert out["jsonld"] is None
     assert out["toc"] is None
+
+
+# ----------------------- structured_section_from_html -----------------------
+
+_SECTIONED_HTML = """
+<html><head><title>Doc</title></head><body>
+<h1>Doc</h1>
+<h2>History</h2><p>hist</p>
+<h2>Implementations</h2><p>impl</p>
+<h3>Reference</h3><p>ref</p>
+<h3>Other</h3><p>other</p>
+<h2>Naming</h2><p>name</p>
+</body></html>
+"""
+
+
+def test_structured_section_scopes_to_subtree():
+    # A section with its own subsections returns only that subtree, not the
+    # whole page's headings (the reported bug).
+    out, available = _structured_section_from_html(_SECTIONED_HTML, "u", "Implementations")
+    assert available == []
+    assert out["section"] == "Implementations"
+    assert [h["text"] for h in out["headings"]] == ["Implementations", "Reference", "Other"]
+    assert out["toc"] == ["Implementations", "Reference", "Other"]
+
+
+def test_structured_section_leaf_section_is_just_itself():
+    out, _ = _structured_section_from_html(_SECTIONED_HTML, "u", "History")
+    assert [h["text"] for h in out["headings"]] == ["History"]
+
+
+def test_structured_section_not_found_returns_available():
+    out, available = _structured_section_from_html(_SECTIONED_HTML, "u", "Nope")
+    assert out is None
+    assert "History" in available and "Implementations" in available
 
 
 # --------------------------- plain text ---------------------------
@@ -220,6 +308,41 @@ def test_markdown_strips_nav_and_images():
     assert "Content" in out
     assert "NavMenu" not in out
     assert "x.png" not in out
+
+
+# --------------------------- followable references ---------------------------
+
+# A [1]-style citation marker links to a footnote that holds the real source URL.
+_CITED_HTML = (
+    '<body><article>'
+    '<p>Claim<sup class="reference"><a href="#cite_note-1">[1]</a></sup> and a '
+    'note<sup class="reference"><a href="#cite_note-2">[2]</a></sup>.</p>'
+    '<ol class="references">'
+    '<li id="cite_note-1"><a rel="nofollow" class="external" href="https://src.example/doc">Doc</a></li>'
+    '<li id="cite_note-2">Plain explanatory note, no link.</li>'
+    '</ol></article></body>'
+)
+
+
+def test_markdown_resolves_citation_marker_to_source_url():
+    out = _markdown_from_html(_CITED_HTML, "https://en.wikipedia.org/wiki/X")
+    # The [1] marker now points at the footnote's external source URL.
+    assert "https://src.example/doc" in out
+    # A footnote with no external link stays plain text, not a dangling anchor.
+    assert "#cite_note-2" not in out
+
+
+def test_find_section_inlines_reference_urls():
+    html = (
+        '<body><h2>Background</h2>'
+        '<p>Fact<sup class="reference"><a href="#cite_note-9">[9]</a></sup>.</p>'
+        '<h2>References</h2>'
+        '<ol><li id="cite_note-9"><a href="https://src.example/ref9">Ref Nine</a></li></ol>'
+        '</body>'
+    )
+    sec = _find_section(_soup(html), "Background", "https://en.wikipedia.org/wiki/X")
+    # The citation URL is inlined into the plain-text section so it's followable.
+    assert "https://src.example/ref9" in sec["text"]
 
 
 # --------------------------- heading normalization ---------------------------
