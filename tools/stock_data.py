@@ -1609,9 +1609,9 @@ def register(mcp: FastMCP) -> None:
         peers, dividend history, ownership structure.
         Crypto/FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
 
-        :param sections: Sections to fetch (default: quote,profile). A list
-            (["quote","profile"]) is preferred, but a comma-separated string
-            ("quote,profile") is also accepted.
+        :param sections: Sections to fetch (default: quote,profile). Either an
+            array (["quote","profile"]) or a comma-separated string
+            ("quote,profile") works.
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
@@ -1671,16 +1671,28 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("A ticker symbol or company name is required.")
 
         # Validate the call-level params once — they apply to every symbol.
-        # `sections` is documented as a list, but small models routinely pass a
-        # comma-separated string ("quote,profile") or a list holding one
-        # ("quote,profile"). Coerce both to a flat list of section names rather
-        # than failing — matching the leniency the `symbol` param already affords.
+        # `sections` is documented as an array, but small models pass it several
+        # ways: a real list (["quote","profile"]), the array JSON-encoded as a
+        # *string* ('["quote","profile"]' — the same slip the `symbol` param
+        # guards against above), a comma-separated string ("quote,profile"), or a
+        # list holding one such string (["quote,profile"]). Coerce all of them to
+        # a flat list of names rather than failing on the documented format.
         if not sections:
             requested = list(DEFAULT_SECTIONS)
-        elif isinstance(sections, str):
-            requested = sections.split(",")
         else:
-            requested = [part for s in sections for part in (s or "").split(",")]
+            if isinstance(sections, str):
+                stripped = sections.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    try:
+                        decoded = json.loads(stripped)
+                    except (ValueError, TypeError):
+                        decoded = None
+                    if isinstance(decoded, list):
+                        sections = decoded
+            if isinstance(sections, str):
+                requested = sections.split(",")
+            else:
+                requested = [part for s in sections for part in (s or "").split(",")]
         normalized: list[str] = []
         for s in requested:
             key = (s or "").strip().lower()
