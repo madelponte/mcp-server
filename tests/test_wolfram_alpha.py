@@ -158,3 +158,25 @@ def test_structuring_extracts_assumptions(monkeypatch, patch_httpx, tool_fns):
     assert {"description": "a planet", "assumption": "*C.mercury-_*Planet-"} in alts
     # The verbose "To use as …" lines don't leak into the answer data.
     assert all("set assumption=" not in v for v in out["data"].values())
+
+
+# An Assumption block with a chosen interpretation but NO "To use as …"
+# alternatives — Wolfram emits this even for unambiguous queries.
+_NO_ALTERNATIVES_BODY = """Query:
+"2 + 2"
+
+Assumption:
+Assuming "2 + 2" is a sum
+
+Result:
+4"""
+
+
+def test_assumptions_omitted_when_no_alternatives(monkeypatch, patch_httpx, tool_fns):
+    # A used-only assumption block (no alternatives to retry with) is non-actionable
+    # bloat, so the field must be omitted entirely for unambiguous queries.
+    _set_appid(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, text=_NO_ALTERNATIVES_BODY))
+    out = json.loads(run(tool_fns["query_wolfram_alpha"](query="2 + 2")))
+    assert "assumptions" not in out
+    assert out["data"]["Result"] == "4"
