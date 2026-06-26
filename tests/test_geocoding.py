@@ -7,6 +7,7 @@ from fastmcp.exceptions import ToolError
 import tools.geocoding as geo
 from tools.geocoding import (
     _build_filters,
+    _NAME_SEARCH_KEYS,
     _haversine_m,
     _clamp,
     _compose_address,
@@ -45,13 +46,18 @@ def test_build_filters_bare_diet_implies_food():
 
 
 def test_build_filters_unknown_falls_back_to_name_search():
+    # A name/brand search pairs the name regex with each indexed POI key so
+    # Overpass can narrow by that key first (a bare name regex over every element
+    # in the radius times out). See _NAME_SEARCH_KEYS.
     out = _build_filters("Starbucks")
-    assert out == ['["name"~"Starbucks",i]']
+    assert out == [f'["name"~"Starbucks",i]["{key}"]' for key in _NAME_SEARCH_KEYS]
+    # Every filter constrains on the name AND an indexed key, never name alone.
+    assert all(f.startswith('["name"~"Starbucks",i]["') for f in out)
 
 
 def test_build_filters_strips_injection_chars():
     out = _build_filters('Star"bucks\\')
-    assert out == ['["name"~"Starbucks",i]']
+    assert out == [f'["name"~"Starbucks",i]["{key}"]' for key in _NAME_SEARCH_KEYS]
 
 
 def test_build_filters_empty_returns_empty():
@@ -457,3 +463,31 @@ def test_find_nearby_places_clamps_radius(monkeypatch, tool_fns):
         radius_m=10_000_000,
     )))
     assert out["radius_m"] == geo.cfg.max_radius_m
+    # The query uses the `nwr` shorthand (one statement per filter), not three
+    # separate node/way/relation statements — the split form is pathologically
+    # slow for a name-regex filter (see geocoding.py).
+    assert "nwr" in captured["ql"]
+    assert "\n  node" not in captured["ql"]
+
+
+def test_find_nearby_places_name_search_query_is_key_constrained(monkeypatch, tool_fns):
+    """A brand/name search must never emit a bare `["name"~...]` filter: without an
+    indexed key to narrow on, Overpass scans every element in the radius and times
+    out. Each name filter is paired with a POI key (see _NAME_SEARCH_KEYS)."""
+    import json as _json
+
+    captured = {}
+
+    async def fake_overpass(query_ql):
+        captured["ql"] = query_ql
+        return []
+
+    monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    fn = tool_fns["find_nearby_places"]
+    run(fn(category="Starbucks", latitude=45.0, longitude=-122.0))
+    ql = captured["ql"]
+    # The name regex appears, always immediately followed by an indexed key.
+    assert '["name"~"Starbucks",i]' in ql
+    assert '["name"~"Starbucks",i](' not in ql  # never name-only, then `(around:`
+    for key in geo._NAME_SEARCH_KEYS:
+        assert f'["name"~"Starbucks",i]["{key}"]' in ql
