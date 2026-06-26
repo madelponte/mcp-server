@@ -29,6 +29,42 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
+def _tool_by_name(server, name):
+    return next(t for t in _list_tools(server) if t.name == name)
+
+
+def test_tool_prefix_does_not_rename_tools(monkeypatch):
+    """MCP_TOOL_PREFIX must NOT rename the server's own tools — the client adds
+    its own prefix, so renaming here would double it (mcp_mcp_fetch_page)."""
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "mcp_")
+    built = server_mod.build_server()
+    names = {t.name for t in run(built.list_tools())}
+    assert names == EXPECTED_TOOLS
+
+
+def test_tool_prefix_interpolated_into_cross_references(monkeypatch):
+    """The configured prefix is spliced into the docstring cross-references so
+    they match what the model sees once the client has prefixed the names."""
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "owui_")
+    built = server_mod.build_server()
+    assert "owui_fetch_page" in _tool_by_name(built, "search_web").description
+    assert "owui_search_web" in _tool_by_name(built, "fetch_page").description
+
+
+def test_blank_tool_prefix_yields_bare_cross_references(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_prefix", "")
+    built = server_mod.build_server()
+    desc = _tool_by_name(built, "search_web").description
+    assert "fetch_page" in desc
+    assert "mcp_fetch_page" not in desc
+
+
 def test_find_nearby_places_description_interpolates_caps(server):
     import tools.geocoding as geo
 
