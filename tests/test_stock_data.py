@@ -221,6 +221,14 @@ def test_sections_plain_list_still_works(monkeypatch, tool_fns):
     assert captured["sections"] == ["quote", "profile"]
 
 
+def test_sections_accepts_json_encoded_string_array(monkeypatch, tool_fns):
+    # Small models often pass the array JSON-encoded as a string instead of an
+    # actual list; decode it rather than splitting it into bogus section names.
+    captured = _capture_sections(monkeypatch)
+    run(tool_fns["get_company_data"](symbol="AAPL", sections='["quote","profile"]'))
+    assert captured["sections"] == ["quote", "profile"]
+
+
 def test_sections_string_with_spaces_and_dupes_is_cleaned(monkeypatch, tool_fns):
     captured = _capture_sections(monkeypatch)
     run(tool_fns["get_company_data"](symbol="AAPL", sections=" Quote , profile ,quote"))
