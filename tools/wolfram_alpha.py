@@ -60,13 +60,19 @@ def _clean_body(text: str) -> str:
 
 
 def _parse_assumptions(body: str) -> dict | None:
-    """Structure an 'Assumption(s)' block into ``{used?, alternatives?}``.
+    """Structure an 'Assumption(s)' block into ``{used, alternatives}``, or None.
 
     The first line is ``Assuming "X" is <used>``; each following line is
     ``To use as <description> set assumption=<value>``. Pulling these out of the
     answer flow is the "suppress the boilerplate when an answer is available"
     fix: the chosen interpretation stays as a one-word ``used`` hint and the
     alternatives become structured retry values instead of six prose lines.
+
+    Returns None when there are no ``alternatives`` — Wolfram emits an Assumption
+    block even for unambiguous queries (just the chosen interpretation, nothing to
+    switch to), and a ``used``-only object is non-actionable metadata bloat. The
+    field is therefore present only when the query is genuinely ambiguous, i.e.
+    there's an alternative to retry with (matching the tool's documented contract).
     """
     used: str | None = None
     alternatives: list[dict] = []
@@ -79,12 +85,13 @@ def _parse_assumptions(body: str) -> dict | None:
         m = _USE_AS_RE.match(ln)
         if m:
             alternatives.append({"description": m.group(1).strip(), "assumption": m.group(2).strip()})
+    if not alternatives:
+        return None
     out: dict[str, Any] = {}
     if used:
         out["used"] = used
-    if alternatives:
-        out["alternatives"] = alternatives
-    return out or None
+    out["alternatives"] = alternatives
+    return out
 
 
 def _structure_result(body: str, query: str) -> dict:
