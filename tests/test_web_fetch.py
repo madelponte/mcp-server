@@ -1,11 +1,13 @@
 """Tests for tools/web_fetch.py — block detection, Tika routing, SSRF guard."""
 
+import asyncio
 import socket
 
 import httpx
 import pytest
 
 import tools.web_fetch as web_fetch
+from tools.cache import TTLCache
 from tools.web_fetch import (
     _is_blocked_response,
     _is_tika_document,
@@ -15,6 +17,7 @@ from tools.web_fetch import (
     _ip_of,
     _addr_is_blocked,
     _assert_url_allowed,
+    _cached_resilient_fetch,
     DownloadTooLargeError,
     SSRFError,
 )
@@ -238,6 +241,42 @@ def test_download_cap_zero_is_unbounded(patch_httpx):
         )
     )
     assert len(body) == 100000
+
+
+# --------------------------- full fetch cache coordination ---------------------------
+
+def test_cached_resilient_fetch_coalesces_concurrent_misses(monkeypatch):
+    calls = 0
+
+    async def fake_resilient_fetch(url, **kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {
+            "url": url,
+            "status": 200,
+            "content_type": "text/html",
+            "text": "<html>ok</html>",
+            "bytes": None,
+            "via": "direct",
+            "blocked_detected": False,
+        }
+
+    async def scenario():
+        return await asyncio.gather(
+            _cached_resilient_fetch("https://example.com/page"),
+            _cached_resilient_fetch("https://example.com/page"),
+            _cached_resilient_fetch("https://example.com/page"),
+        )
+
+    monkeypatch.setattr(web_fetch, "_page_cache", TTLCache(60, 8))
+    web_fetch._page_inflight.clear()
+    monkeypatch.setattr(web_fetch, "_resilient_fetch", fake_resilient_fetch)
+
+    results = run(scenario())
+    assert calls == 1
+    assert [r["url"] for r in results] == ["https://example.com/page"] * 3
+    assert web_fetch._page_inflight == {}
 
 
 # --------------------------- allowlist parsing ---------------------------

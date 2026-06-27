@@ -53,6 +53,17 @@ def test_max_entries_evicts_oldest():
     assert c.get("c") == 3
 
 
+def test_max_entries_refreshes_on_read():
+    c = TTLCache(ttl_seconds=60, max_entries=2)
+    c.set("a", 1)
+    c.set("b", 2)
+    assert c.get("a") == 1
+    c.set("c", 3)  # "b" is now least recently used.
+    assert c.get("a") == 1
+    assert c.get("b") is None
+    assert c.get("c") == 3
+
+
 def test_max_entries_zero_is_unbounded():
     c = TTLCache(ttl_seconds=60, max_entries=0)
     for i in range(100):
