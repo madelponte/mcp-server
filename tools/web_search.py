@@ -293,6 +293,13 @@ def register(mcp: FastMCP) -> None:
                     continue
                 if not data:
                     continue
+                # `_enrich_result` reports a fetch failure as {"error": ...} rather
+                # than raising, so surface it as page_meta_error instead of letting
+                # it fall through (which would set page_title/description to null and
+                # drop the reason).
+                if data.get("error"):
+                    results[i]["page_meta_error"] = data["error"]
+                    continue
                 headings = (data.get("headings") or [])[: cfg.max_enrich_headings]
                 results[i]["page_title"] = data.get("title")
                 results[i]["page_description"] = data.get("description")
