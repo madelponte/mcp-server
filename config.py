@@ -411,11 +411,16 @@ class GeocodingSettings(BaseSettings):
     )
     # Nominatim's public API allows at most 1 request/second. We serialize calls
     # and space them by this interval. Set to 0 when self-hosting to disable it.
+    # One throttle covers both OpenStreetMap backends (Nominatim and Overpass).
+    # The public APIs rate-limit aggressive callers (Nominatim caps at ~1/sec;
+    # Overpass rejects bursts with 429/504), so requests to both are serialized
+    # and spaced by this single interval. Set to 0 to disable when self-hosting.
     min_request_interval_seconds: float = Field(
         1.0,
         description=(
-            "Minimum seconds between Nominatim requests (the public API caps at "
-            "1/sec). Set to 0 to disable throttling when self-hosting."
+            "Minimum seconds between OpenStreetMap requests (Nominatim + Overpass "
+            "share one throttle; the public APIs cap aggressive callers). Set to 0 "
+            "to disable throttling when self-hosting."
         ),
     )
 
