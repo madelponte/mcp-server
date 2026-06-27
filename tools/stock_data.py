@@ -1619,7 +1619,8 @@ def register(mcp: FastMCP) -> None:
         Use for: current price, company fundamentals, financial statements,
         earnings reports, recent news, insider trading, price charts, sector
         peers, dividend history, ownership structure.
-        Crypto/FX/indices (BTC-USD, ^GSPC) only support quote/price_history.
+        Crypto/FX/indices (BTC-USD, ^GSPC): quote/price_history/profile/news
+        only (no fundamentals).
 
         :param sections: Sections to fetch (default: quote,profile). Either an
             array (["quote","profile"]) or a comma-separated string
