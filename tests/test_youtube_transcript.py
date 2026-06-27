@@ -63,6 +63,23 @@ def test_is_youtube_video_url_non_video_pages_false():
     assert is_youtube_video_url("https://example.com/video") is False
 
 
+def test_is_youtube_video_url_lookalike_domains_false():
+    # A domain that merely ends in "youtube.com" (notyoutube.com, …) is not
+    # YouTube; routing it to the transcript fetcher would skip its real content.
+    for host in ("notyoutube.com", "myyoutube.com", "evilyoutube.com"):
+        assert is_youtube_video_url(f"https://{host}/watch?v={VIDEO_ID}") is False
+
+
+def test_extract_video_id_lookalike_domain_raises():
+    with pytest.raises(ValueError):
+        _extract_video_id(f"https://notyoutube.com/watch?v={VIDEO_ID}")
+
+
+def test_extract_video_id_youtube_subdomains():
+    for host in ("m.youtube.com", "music.youtube.com"):
+        assert _extract_video_id(f"https://{host}/watch?v={VIDEO_ID}") == VIDEO_ID
+
+
 # --------------------------- _format_timestamp ---------------------------
 
 def test_format_timestamp_minutes_seconds():

@@ -188,6 +188,26 @@ def test_search_web_enriches_top_results(monkeypatch, tool_fns):
     assert out["results"][0]["page_description"] == "desc"
 
 
+def test_search_web_enrich_error_surfaces_as_page_meta_error(monkeypatch, tool_fns):
+    # `_enrich_result` reports a fetch failure as {"error": ...}; the tool should
+    # surface it as page_meta_error rather than emitting null page_title/description.
+    monkeypatch.setattr(ws.cfg, "max_enrich_results", 5)
+
+    async def fake_query(**kwargs):
+        return [{"url": "https://a.com", "title": "A", "snippet": "s"}]
+
+    async def fake_enrich(url):
+        return {"error": "boom"}
+
+    monkeypatch.setattr(ws, "_searxng_query", fake_query)
+    monkeypatch.setattr(ws, "_enrich_result", fake_enrich)
+    fn = tool_fns["search_web"]
+    out = json.loads(run(fn(query="test", enrich_results=1)))
+    assert out["results"][0]["page_meta_error"] == "boom"
+    assert "page_title" not in out["results"][0]
+    assert "page_description" not in out["results"][0]
+
+
 def test_search_web_no_results(monkeypatch, tool_fns):
     async def fake_query(**kwargs):
         return []
