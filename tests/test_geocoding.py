@@ -369,6 +369,7 @@ def test_find_nearby_places_place_details_rejects_relative(tool_fns):
 # --------------------------- _overpass (async, mocked) ---------------------------
 
 def test_overpass_success(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
     elements = [{"type": "node", "lat": 1.0, "lon": 2.0, "tags": {"name": "Cafe"}}]
     patch_httpx(lambda req: httpx.Response(200, json={"elements": elements}))
@@ -376,6 +377,7 @@ def test_overpass_success(monkeypatch, patch_httpx):
 
 
 def test_overpass_remark_error_raises(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
     patch_httpx(lambda req: httpx.Response(200, json={"remark": "runtime error: timeout"}))
     with pytest.raises(ToolError) as exc:
@@ -384,6 +386,7 @@ def test_overpass_remark_error_raises(monkeypatch, patch_httpx):
 
 
 def test_overpass_rate_limited_raises(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
     patch_httpx(lambda req: httpx.Response(429, text="too many"))
     with pytest.raises(ToolError):
@@ -391,10 +394,51 @@ def test_overpass_rate_limited_raises(monkeypatch, patch_httpx):
 
 
 def test_overpass_non_json_raises(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
     patch_httpx(lambda req: httpx.Response(200, text="Error: bad query"))
     with pytest.raises(ToolError):
         run(_overpass("bad query"))
+
+
+def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
+    """Concurrent acquires are queued and dispatched one per interval, in order,
+    rather than all firing at once (the burst that overloads Overpass)."""
+    import anyio as _anyio
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        # Advance the limiter's clock so the next waiter computes its own delay
+        # off the time this one "finished" — mimics real elapsed time.
+        clock[0] += seconds
+
+    clock = [1000.0]
+    monkeypatch.setattr(geo.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(geo.anyio, "sleep", fake_sleep)
+
+    limiter = geo._RateLimiter()
+
+    async def main():
+        # Five callers arrive together; the lock serializes them.
+        async with _anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(limiter.acquire, 1.0)
+
+    run(main())
+
+    # First caller doesn't wait; the next four are each spaced by ~1s.
+    assert len(sleeps) == 4
+    assert all(abs(s - 1.0) < 1e-9 for s in sleeps)
+
+
+def test_rate_limiter_disabled_when_interval_zero(monkeypatch):
+    slept = []
+    monkeypatch.setattr(geo.anyio, "sleep", lambda s: slept.append(s))
+    limiter = geo._RateLimiter()
+    run(limiter.acquire(0))
+    assert slept == []
 
 
 # --------------------------- find_nearby_places tool (validation) ---------------------------
