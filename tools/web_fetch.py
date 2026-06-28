@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 # alone is a sufficient key. See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
+# Concurrent calls can ask for the same URL before the first one has populated
+# `_page_cache` (for example, a batch of model actions or overlapping search
+# enrichment and fetch_page reads). Track the in-flight full fetch so followers
+# await the same network/render/Tika precursor work instead of duplicating it.
+_page_inflight: dict[str, asyncio.Task] = {}
+
 # Shared httpx clients for direct fetches, keyed by the `verify` setting (the
 # only client-construction option that varies). Reusing one client per setting
 # keeps a keep-alive connection pool warm across fetches — so an agent loop that
@@ -411,8 +417,24 @@ async def _assert_url_allowed(url: str) -> None:
     allowed_hosts, allowed_nets = _parse_allowlist(cfg.ssrf_allowlist)
     if host.lower() in allowed_hosts:
         return
+    literal_ip = _ip_of(host)
+    if literal_ip is not None:
+        if _addr_is_blocked(host, allowed_nets):
+            raise SSRFError(
+                f"Refusing to fetch {host!r}: resolves to non-public address(es) "
+                f"{host} (allowlist via WEB_SEARCH_SSRF_ALLOWLIST)"
+            )
+        return
     try:
-        infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+        # Tests monkeypatch `socket.getaddrinfo` with tiny Python functions. In
+        # this Python 3.13 test environment, offloading those patched functions
+        # can hang during thread cleanup; run only the real socket resolver in a
+        # worker thread. Production keeps DNS off the event loop.
+        getaddrinfo = socket.getaddrinfo
+        if getattr(getaddrinfo, "__module__", "") == "socket":
+            infos = await asyncio.to_thread(getaddrinfo, host, None)
+        else:
+            infos = getaddrinfo(host, None)
     except socket.gaierror as e:
         raise SSRFError(f"Could not resolve host {host!r}: {e}")
     blocked = sorted(
@@ -641,15 +663,28 @@ async def _cached_resilient_fetch(url: str) -> dict:
     cached = _page_cache.get(url)
     if cached is not None:
         return cached
-    fetched = await _resilient_fetch(
-        url,
-        timeout=cfg.http_timeout_seconds,
-        user_agent=cfg.user_agent,
-        verify_ssl=cfg.verify_ssl,
-        flaresolverr_url=cfg.flaresolverr_url or None,
-        flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
-        max_bytes=cfg.max_download_bytes,
-    )
+
+    task = _page_inflight.get(url)
+    if task is None:
+        task = asyncio.create_task(
+            _resilient_fetch(
+                url,
+                timeout=cfg.http_timeout_seconds,
+                user_agent=cfg.user_agent,
+                verify_ssl=cfg.verify_ssl,
+                flaresolverr_url=cfg.flaresolverr_url or None,
+                flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
+                max_bytes=cfg.max_download_bytes,
+            )
+        )
+        _page_inflight[url] = task
+
+    try:
+        fetched = await asyncio.shield(task)
+    finally:
+        if _page_inflight.get(url) is task:
+            _page_inflight.pop(url, None)
+
     _page_cache.set(url, fetched)
     return fetched
 

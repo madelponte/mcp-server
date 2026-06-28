@@ -45,26 +45,35 @@ log = logging.getLogger(__name__)
 # finished responses are cached. See the README "Caching" section.
 _cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 
-# Nominatim's public API permits at most one request per second. We serialize
-# calls through this lock and space them by the configured interval so a burst of
-# tool calls can't trip the rate limit. anyio primitives keep this on the event
-# loop without blocking it.
-_nominatim_lock = anyio.Lock()
-_last_nominatim_call = 0.0
+# Both OpenStreetMap backends (Nominatim and Overpass) rate-limit aggressive
+# callers (Nominatim caps at ~1 req/sec; Overpass returns 429/504 when its few
+# query slots are saturated). A model can fire several find_nearby_places calls at
+# once, so a single shared limiter serializes every request to either backend
+# through a lock and spaces them by the configured interval. anyio.Lock is
+# FIFO-fair, so concurrent callers are effectively queued and dispatched in
+# arrival order — a burst waits its turn instead of stampeding the APIs. anyio
+# primitives keep this on the event loop without blocking it. The limiter is
+# module-global so the spacing holds across every concurrent tool invocation.
+class _RateLimiter:
+    """Serializes calls and spaces consecutive ones by `interval` seconds."""
+
+    def __init__(self) -> None:
+        self._lock = anyio.Lock()
+        self._last_call = 0.0
+
+    async def acquire(self, interval: float) -> None:
+        """Block until at least `interval` seconds have passed since the previous
+        acquire (no-op when interval <= 0, e.g. when self-hosting)."""
+        if interval <= 0:
+            return
+        async with self._lock:
+            wait = self._last_call + interval - time.monotonic()
+            if wait > 0:
+                await anyio.sleep(wait)
+            self._last_call = time.monotonic()
 
 
-async def _throttle_nominatim() -> None:
-    """Block until at least min_request_interval_seconds has passed since the
-    last Nominatim call (no-op when the interval is 0, e.g. self-hosting)."""
-    global _last_nominatim_call
-    interval = cfg.min_request_interval_seconds
-    if interval <= 0:
-        return
-    async with _nominatim_lock:
-        wait = _last_nominatim_call + interval - time.monotonic()
-        if wait > 0:
-            await anyio.sleep(wait)
-        _last_nominatim_call = time.monotonic()
+_osm_limiter = _RateLimiter()
 
 
 # --------------------------- category mapping ---------------------------
@@ -389,7 +398,7 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
     url = cfg.nominatim_url.rstrip("/") + "/search"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _throttle_nominatim()
+    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
             resp = await client.get(url, params=params, headers=headers)
@@ -474,6 +483,12 @@ async def _overpass(query_ql: str) -> list[dict]:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+
+    # Space requests so a burst of concurrent tool calls is queued rather than
+    # stampeding Overpass (which answers a flood with 429/504). Shares the single
+    # OpenStreetMap limiter with Nominatim. Done after the cache check so a cache
+    # hit doesn't needlessly consume the rate budget.
+    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
 
     headers = {"User-Agent": cfg.user_agent}
     try:
