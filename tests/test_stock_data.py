@@ -22,6 +22,8 @@ from tools.stock_data import (
     _gather_sections,
     _scrub_secrets,
     _provider_error,
+    _coerce_string_list,
+    _filter_financials,
 )
 from conftest import run
 
@@ -188,6 +190,62 @@ def test_provider_error_redacts_embedded_key():
     assert out.startswith("fmp: Exception:")
 
 
+# --------------------------- financial metric filtering ---------------------------
+
+def test_coerce_string_list_accepts_common_shapes():
+    assert _coerce_string_list(["revenue", " Revenue ", "gross profit"]) == [
+        "revenue",
+        "gross profit",
+    ]
+    assert _coerce_string_list(["revenue, gross profit"]) == [
+        "revenue",
+        "gross profit",
+    ]
+    assert _coerce_string_list("revenue, gross profit") == [
+        "revenue",
+        "gross profit",
+    ]
+    assert _coerce_string_list('["revenue","free cash flow"]') == [
+        "revenue",
+        "free cash flow",
+    ]
+
+
+def test_filter_financials_matches_provider_label_styles():
+    result = {
+        "provider": "fmp",
+        "symbol": "AAPL",
+        "statement": "income",
+        "period": "annual",
+        "periods": [
+            {
+                "period_end": "2025-09-30",
+                "data": {
+                    "revenue": 100,
+                    "costOfRevenue": 60,
+                    "grossProfit": 40,
+                    "freeCashFlow": 25,
+                    "operatingExpenses": 10,
+                },
+            }
+        ],
+    }
+    filtered = _filter_financials(
+        result, ["Revenue", "gross profit", "free cash flow", "not a metric"]
+    )
+    assert filtered["periods"][0]["data"] == {
+        "revenue": 100,
+        "grossProfit": 40,
+        "freeCashFlow": 25,
+    }
+    assert filtered["metrics_filter"]["matched"] == {
+        "Revenue": ["revenue"],
+        "gross profit": ["grossProfit"],
+        "free cash flow": ["freeCashFlow"],
+    }
+    assert filtered["metrics_filter"]["unmatched"] == ["not a metric"]
+
+
 # --------------------------- sections coercion ---------------------------
 
 def _capture_sections(monkeypatch):
@@ -239,6 +297,26 @@ def test_sections_invalid_string_still_raises(monkeypatch, tool_fns):
     _capture_sections(monkeypatch)
     with pytest.raises(ToolError):
         run(tool_fns["get_company_data"](symbol="AAPL", sections="quote,bogus"))
+
+
+def test_financial_metrics_forwarded_from_tool(monkeypatch, tool_fns):
+    captured = {}
+
+    async def fake_fetch(query, sections, statement, period, periods, news_items,
+                         insider_weeks, history_bars, news_days, history_interval,
+                         financial_metrics):
+        captured["financial_metrics"] = financial_metrics
+        return {"symbol": query, "sections": sections, "data": {"financials": {}}}
+
+    monkeypatch.setattr(stock, "_fetch_company", fake_fetch)
+    run(
+        tool_fns["get_company_data"](
+            symbol="AAPL",
+            sections=["financials"],
+            financial_metrics="revenue, gross profit",
+        )
+    )
+    assert captured["financial_metrics"] == ["revenue", "gross profit"]
 
 
 # --------------------------- _resolve_symbol ---------------------------

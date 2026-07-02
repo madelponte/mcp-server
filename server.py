@@ -1,10 +1,11 @@
 """
 MCP server entrypoint.
 
-Bundles the Agentic Web Search, Stock Data, Wolfram Alpha, and Geocoding &
-Place Search tools into a single MCP server. (YouTube video transcripts are
-served by the fetch_page tool rather than a standalone tool.) Configuration
-comes entirely from environment variables — see config.py and .env.example.
+Bundles Agentic Web Search, Stock Data, Wolfram Alpha, Geocoding & Place
+Search, and send-only Email tools into a single MCP server. (YouTube video
+transcripts are served by the fetch_page tool rather than a standalone tool.)
+Configuration comes entirely from environment variables — see config.py and
+.env.example.
 
 Run locally:
     python server.py

@@ -1,9 +1,10 @@
 # openwebui-tools MCP server
 
-A single [MCP](https://modelcontextprotocol.io) server that bundles four tool
+A single [MCP](https://modelcontextprotocol.io) server that bundles five tool
 groups (originally written for Open WebUI), so they can be used from any
 MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
-support, etc.). `fetch_page` doubles as a YouTube transcript fetcher.
+support, etc.). `fetch_page` doubles as a YouTube transcript fetcher, and the
+email tool is send-only.
 
 Built on [FastMCP v3](https://github.com/jlowin/fastmcp). The
 default transport is **streamable-http**, so the server is reachable over the
@@ -17,6 +18,7 @@ network at `http://<host>:8000/mcp`.
 | **Stock Data**         | `get_company_data`                    |
 | **Wolfram Alpha**      | `query_wolfram_alpha`                 |
 | **Place Search**       | `find_nearby_places`                  |
+| **Email**              | `send_email`                          |
 
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
@@ -25,7 +27,7 @@ overwhelm a model's context window. Omitting a value uses the cap.
 
 ### Agentic Web Search
 
-`search_web(query, time_range=None, category=None, num_results=None, enrich_results=None)`
+`search_web(query, time_range=None, category=None, num_results=None, enrich_results=None, page=None)`
 — Search the web via SearXNG and return a ranked list of results. Each result
 carries a url, title, snippet, optional published date, and (for the top
 results) page metadata: a description plus a heading/JSON-LD table-of-contents
@@ -34,9 +36,10 @@ outline, so the model can decide which links are worth fetching in full.
 SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
 `videos`, `images`, `music`, `files`, `map`, comma-separated to combine).
 `enrich_results` controls how many top results get full page metadata (`0`
-skips enrichment).
+skips enrichment). `page` is a 1-based result page; use `page=2` with the same
+query to get the next batch before reformulating.
 
-`fetch_page(url, mode="text", section=None, query=None)` — Fetch the contents
+`fetch_page(url, mode="text", section=None, query=None, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
 to read several pages, call the tool once per URL. `mode="text"` returns the
 page as markdown — headings, lists, tables, and hyperlinks (resolved to absolute URLs)
@@ -50,16 +53,20 @@ just that section of an HTML page instead of the whole thing. Passing a `query`
 (a keyword, phrase, or regex) returns only the matching passages plus surrounding
 context instead of the full page — useful for pulling one topic from a long
 article, document, or transcript; for YouTube, matched segments keep their
-`[M:SS]` timestamps. A YouTube video URL returns the video's transcript rather
-than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
+`[M:SS]` timestamps. If a response is marked `truncated`, pass `offset` with the
+returned `next_offset` to read the next chunk; this works for HTML, documents,
+JSON, Reddit, and transcripts. A YouTube video URL returns the video's transcript
+rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
 
 Reddit URLs are automatically rewritten to Reddit's `.json` API and returned as
 compacted JSON (post + comments tree) rather than the HTML page.
 
 Fetching is resilient: a direct `httpx` request first, an automatic
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
-Cloudflare-blocked pages, and a short page cache so an agent loop that
-re-fetches the same URL skips the network round-trip.
+bot/CAPTCHA walls and JavaScript-empty pages, a Wayback Machine fallback when
+live content cannot be recovered, and a short page cache so an agent loop that
+re-fetches the same URL skips the network round-trip. Archived fallback content
+is flagged in the result with snapshot metadata and a staleness note.
 
 Fetching is also SSRF-guarded. Because a URL can come from search results or page
 content the model just read, it's attacker-influenceable via indirect prompt
@@ -73,10 +80,11 @@ a trusted local/private target you host, list its host, IP, or CIDR in
 
 ### Stock Data
 
-`get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None, history_bars=None)`
-— One company, only the sections you ask for. `symbol` accepts a ticker
-(`AAPL`) **or** a company name (`Apple`); a name is resolved to its ticker via
-symbol search before any data is fetched, so there's no separate lookup step.
+`get_company_data(symbol, sections=None, statement="income", period="annual", periods=None, news_items=None, insider_weeks=None, history_bars=None, news_days=None, history_interval="1d", financial_metrics=None)`
+— One company, or a short list of companies for comparison, with only the
+sections you ask for. `symbol` accepts a ticker (`AAPL`), company name (`Apple`),
+or a list of tickers/names; names are resolved to tickers via symbol search
+before any data is fetched, so there's no separate lookup step.
 Available `sections`:
 
 - `quote` — latest price, day's change, open/high/low/previous close, volume.
@@ -84,15 +92,23 @@ Available `sections`:
   fundamentals (P/E, EPS, dividend yield, 52-week range, beta, margins).
 - `financials` — income statement, balance sheet, or cash flow, controlled by
   `statement` (`income`/`balance`/`cashflow`) and `period`
-  (`annual`/`quarterly`); `periods` sets how many to return.
+  (`annual`/`quarterly`); `periods` sets how many to return. Set
+  `financial_metrics` to a list or comma-separated string (for example,
+  `["revenue", "gross profit", "free cash flow"]`) to return only matching
+  rows and keep the response compact. The response includes a `metrics_filter`
+  block listing matched and unmatched requested metrics.
 - `earnings` — historical earnings: actual vs. estimated EPS, surprise %,
   revenue. `periods` sets how many to return.
 - `news` — recent articles (headline, source, summary, url, published date).
-  `news_items` sets how many to return.
+  `news_items` sets how many to return; `news_days` sets the lookback window.
 - `insiders` — insider buying/selling with a buy/sell summary and individual
   transactions. `insider_weeks` sets how far back to look.
-- `price_history` — recent daily OHLC price bars (newest first); `history_bars`
-  sets how many trading days to return.
+- `price_history` — recent OHLC price bars (newest first); `history_bars` sets
+  how many bars to return, and `history_interval` controls bar size (`1d`,
+  `1wk`, or `1mo`).
+- `peers` — competitor/peer tickers in the same sector or industry (Finnhub).
+- `dividends` — dividend payment history plus stock splits (yfinance).
+- `ownership` — ownership summary and top institutional holders (yfinance).
 
 Defaults to `["quote", "profile"]` when `sections` is omitted. Data is sourced
 across providers (Finnhub / yfinance / FMP) with optional yfinance fallback. On
@@ -100,7 +116,9 @@ partial success the response includes an `errors` map listing sections that
 returned nothing; if every requested section fails, the call raises an error so
 a failure is never mistaken for data. When `symbol` was a company name, the
 response includes a `resolved_from` block naming the matched company (and any
-alternatives) so you can confirm the right ticker was used.
+alternatives) so you can confirm the right ticker was used. For a list input,
+the response is `{"results":[...]}` and one failed ticker does not sink the
+whole comparison unless every ticker fails.
 
 > **Note:** earlier versions exposed `get_stock_quote`, `get_company_profile`,
 > `get_financials`, `get_earnings`, `get_company_news`, and `search_symbol` as
@@ -112,13 +130,14 @@ alternatives) so you can confirm the right ticker was used.
 
 ### Wolfram Alpha
 
-`query_wolfram_alpha(query, assumption=None)` — Exact computation and
+`query_wolfram_alpha(query, assumption=None, units=None)` — Exact computation and
 authoritative reference data: math, unit/currency conversion, physics &
 chemistry, astronomy, geography & demographics, dates & times, finance,
 nutrition, weather history, linguistics, and structured entity comparisons.
 Queries should be English keyword-style (`"France population"`, not a full
 sentence). If a result returns assumptions, re-send the same input with the
-relevant `assumption` value to disambiguate.
+relevant `assumption` value to disambiguate. `units` may be `metric` or
+`nonmetric`; omit it to use the server default.
 
 ### YouTube transcripts (via `fetch_page`)
 
@@ -134,7 +153,7 @@ which helps smaller models avoid tool-selection paralysis.
 
 ### Place Search
 
-`find_nearby_places(category, near=None, latitude=None, longitude=None, radius_m=None, limit=None)`
+`find_nearby_places(category="", near=None, latitude=None, longitude=None, radius_m=None, limit=None, include_nearby_towns=False, nearby_towns_limit=None, place_details=False)`
 — Find points of interest near a location via OpenStreetMap
 [Overpass](https://overpass-api.de/). Specify the location either as `near` (a
 place name, geocoded for you via [Nominatim](https://nominatim.org/) — so "vegan
@@ -147,6 +166,14 @@ unrecognized category falls back to matching place names, so brands like
 `"Starbucks"` work too. Results are sorted nearest-first and include distance
 plus useful tags (cuisine, address, phone, website, opening hours) when
 available. An empty `results` list means nothing matched in range (not an error).
+Set `include_nearby_towns=true` to include nearby city/town/village centers that
+can seed follow-up searches in neighboring municipalities.
+
+Set `place_details=true` to look up rich information about the place named in
+`near` instead of searching for POIs around it. That mode returns coordinates,
+bounding box, address details, population when available, Wikidata/Wikipedia
+links, website, phone, and alternatives; it ignores `category`, `radius_m`, and
+`limit`.
 
 The server has no access to the user's location, so a relative `near` value
 ("near me", "nearby", "around here", etc.) is refused with a message telling the
@@ -177,11 +204,29 @@ for the full list with defaults. Key things to set:
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 - `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
-
 - `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
+- `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
+  `EMAIL_PASSWORD` must be a 16-character App Password, not the normal account
+  password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,
+  recipient cap, and attachment limits are configurable.
 
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
-`WOLFRAM_`, `YOUTUBE_`, `GEO_`.
+`WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`.
+
+### Email
+
+`send_email(recipients, subject, body, cc=None, bcc=None, reply_to=None, attachments=None)`
+sends a plain-text email through the configured SMTP account. It is send-only:
+it cannot read, list, or delete mailbox contents. `recipients`, `cc`, and `bcc`
+are lists of email addresses; BCC recipients are included in the SMTP envelope
+but not written into message headers. `attachments` is an optional list of local
+file paths, capped by `EMAIL_MAX_ATTACHMENTS` and `EMAIL_MAX_ATTACHMENT_BYTES`.
+
+The result reports `status` (`sent` or `partial`), intended recipients by field,
+attempted recipients, accepted recipients, refused recipients with SMTP codes and
+server responses, invalid addresses, dropped addresses, and attachment metadata.
+SMTP authentication, sender, connection, or total-recipient-refusal failures
+raise tool errors instead of being returned as successful sends.
 
 ### Debug mode
 
@@ -244,8 +289,9 @@ docker compose up --build
 The MCP endpoint is then available at `http://localhost:8000/mcp`.
 
 If you don't need web search, delete the `searxng` / `flaresolverr` / `tika`
-services (and the `depends_on` block) from `docker-compose.yml`. The other three
-tools have no local-service dependencies.
+services (and the `depends_on` block) from `docker-compose.yml`. The stock,
+Wolfram, geocoding, and email tools have no local-service dependencies, though
+they may need API keys, SMTP credentials, or internet access.
 
 > **SearXNG note:** JSON output must be enabled for `search_web` to work — the
 > bundled [searxng/settings.yml](https://github.com/madelponte/mcp-server/blob/main/searxng/settings.yml)
