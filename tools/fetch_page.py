@@ -322,19 +322,18 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
             "Try a simpler keyword or a different spelling, loosen the regex, or "
             "omit `query` to retrieve the full content."
         )
-    note = None
-    if total_windows > len(windows):
-        note = (
-            f"{total_windows} matching sections found; showing the first "
-            f"{len(windows)}. Refine `query` to narrow the results."
-        )
-    return {
+    payload = {
         "query": query,
         "match_count": match_count,
         "sections": len(windows),
         "content": _format_match_windows(windows),
-        "note": note,
     }
+    if total_windows > len(windows):
+        payload["note"] = (
+            f"{total_windows} matching sections found; showing the first "
+            f"{len(windows)}. Refine `query` to narrow the results."
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------

@@ -12,10 +12,12 @@ worker thread via `anyio.to_thread.run_sync` to avoid stalling the event loop
 """
 
 import logging
+import mimetypes
 import re
 import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
+from pathlib import Path
 from typing import Annotated
 
 import anyio
@@ -40,8 +42,8 @@ log = logging.getLogger(__name__)
 _ADDR_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
-def _normalize_recipients(recipients: list[str]) -> tuple[list[str], list[str]]:
-    """Split, dedupe, and validate recipient addresses.
+def _normalize_recipients(recipients: list[str] | None) -> tuple[list[str], list[str]]:
+    """Split, dedupe, and validate recipient addresses within one field.
 
     Returns ``(valid, invalid)`` preserving first-seen order. Surrounding
     whitespace is stripped; empties are ignored.
@@ -49,7 +51,7 @@ def _normalize_recipients(recipients: list[str]) -> tuple[list[str], list[str]]:
     valid: list[str] = []
     invalid: list[str] = []
     seen: set[str] = set()
-    for raw in recipients:
+    for raw in recipients or []:
         addr = (raw or "").strip()
         if not addr:
             continue
@@ -64,24 +66,116 @@ def _normalize_recipients(recipients: list[str]) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def _build_message(recipients: list[str], subject: str, body: str) -> EmailMessage:
+def _dedupe_address_entries(entries: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Dedupe recipients across To/Cc/Bcc, preserving the first occurrence."""
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = entry["address"].lower()
+        if key in seen:
+            dropped.append({**entry, "reason": "duplicate"})
+            continue
+        seen.add(key)
+        kept.append(entry)
+    return kept, dropped
+
+
+def _recipient_addresses(entries: list[dict], field: str) -> list[str]:
+    return [e["address"] for e in entries if e["field"] == field]
+
+
+def _format_refused(refused: dict | None) -> list[dict]:
+    """Turn smtplib's refused-recipient mapping into JSON-safe records."""
+    out: list[dict] = []
+    for address, detail in (refused or {}).items():
+        code = None
+        response = detail
+        if isinstance(detail, tuple) and len(detail) >= 2:
+            code, response = detail[0], detail[1]
+        if isinstance(response, bytes):
+            response = response.decode("utf-8", errors="replace")
+        out.append({"address": address, "code": code, "response": str(response)})
+    return out
+
+
+def _prepare_attachments(paths: list[str] | None) -> list[dict]:
+    """Validate attachment paths and read bytes for EmailMessage.add_attachment."""
+    if not paths:
+        return []
+    if not isinstance(paths, list):
+        raise ToolError("`attachments` must be a list of local file paths.")
+    if len(paths) > cfg.max_attachments:
+        raise ToolError(
+            f"`attachments` may include at most {cfg.max_attachments} files."
+        )
+
+    prepared: list[dict] = []
+    for raw in paths:
+        path = Path(str(raw or "").strip()).expanduser()
+        if not str(path):
+            continue
+        if not path.is_file():
+            raise ToolError(f"Attachment path is not a readable file: {path}")
+        size = path.stat().st_size
+        if size > cfg.max_attachment_bytes:
+            raise ToolError(
+                f"Attachment {path} is {size} bytes, above the "
+                f"{cfg.max_attachment_bytes}-byte per-file limit."
+            )
+        ctype, _ = mimetypes.guess_type(path.name)
+        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+        prepared.append(
+            {
+                "path": str(path),
+                "filename": path.name,
+                "content_type": ctype or "application/octet-stream",
+                "size_bytes": size,
+                "maintype": maintype,
+                "subtype": subtype,
+                "data": path.read_bytes(),
+            }
+        )
+    return prepared
+
+
+def _build_message(
+    to_recipients: list[str],
+    cc_recipients: list[str],
+    subject: str,
+    body: str,
+    *,
+    reply_to: str | None = None,
+    attachments: list[dict] | None = None,
+) -> EmailMessage:
     msg = EmailMessage()
     from_addr = (cfg.from_address or cfg.username).strip()
     msg["From"] = formataddr((cfg.from_name.strip(), from_addr)) if cfg.from_name.strip() else from_addr
-    msg["To"] = ", ".join(recipients)
+    msg["To"] = ", ".join(to_recipients)
+    if cc_recipients:
+        msg["Cc"] = ", ".join(cc_recipients)
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg["Subject"] = subject
     msg.set_content(body)
+    for att in attachments or []:
+        msg.add_attachment(
+            att["data"],
+            maintype=att["maintype"],
+            subtype=att["subtype"],
+            filename=att["filename"],
+        )
     return msg
 
 
-def _send(msg: EmailMessage) -> None:
+def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
     """Blocking SMTP send. Runs in a worker thread (see send_email)."""
     if cfg.use_ssl:
         with smtplib.SMTP_SSL(
             cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds
         ) as server:
             server.login(cfg.username, cfg.password)
-            server.send_message(msg)
+            return server.send_message(msg, to_addrs=envelope_recipients)
     else:
         with smtplib.SMTP(
             cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds
@@ -90,7 +184,7 @@ def _send(msg: EmailMessage) -> None:
             server.starttls()
             server.ehlo()
             server.login(cfg.username, cfg.password)
-            server.send_message(msg)
+            return server.send_message(msg, to_addrs=envelope_recipients)
 
 
 def register(mcp: FastMCP) -> None:
@@ -107,23 +201,59 @@ def register(mcp: FastMCP) -> None:
         ],
         subject: str,
         body: str,
+        cc: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    f"Optional CC recipient addresses. Total To+Cc+Bcc cap is "
+                    f"{cfg.max_recipients}; extras are dropped and reported."
+                ),
+            ),
+        ] = None,
+        bcc: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    f"Optional BCC recipient addresses. Total To+Cc+Bcc cap is "
+                    f"{cfg.max_recipients}; extras are dropped and reported. "
+                    "BCC addresses are not written into message headers."
+                ),
+            ),
+        ] = None,
+        reply_to: str | None = None,
+        attachments: Annotated[
+            list[str] | None,
+            Field(
+                description=(
+                    f"Optional local file paths to attach, up to "
+                    f"{cfg.max_attachments} files; each file max "
+                    f"{cfg.max_attachment_bytes} bytes."
+                ),
+            ),
+        ] = None,
     ) -> str:
         """Send a plain-text email from the server's configured account.
 
         Send-only: this delivers a message; no other interaction.
         Use it to notify a person of a result, forward a summary, or
-        deliver content you have already produced.
+        deliver content you have already produced. Supports CC, BCC, Reply-To,
+        and local file attachments.
 
         :param subject: The email subject line.
         :param body: The plain-text message body.
-        :return: JSON {"status":"sent","recipients":[...],"dropped":[...],"subject":...}.
+        :param reply_to: Optional Reply-To email address.
+        :return: JSON with status, intended/accepted/refused recipients,
+            invalid/dropped recipients, and attachment metadata.
         """
         log_call(
             log,
             "send_email",
             recipients=recipients,
+            cc=cc,
+            bcc=bcc,
             subject=subject,
             body_chars=len(body or ""),
+            attachment_count=len(attachments or []),
         )
 
         if not (cfg.username or "").strip() or not (cfg.password or "").strip():
@@ -135,28 +265,73 @@ def register(mcp: FastMCP) -> None:
 
         if not isinstance(recipients, list) or not recipients:
             raise ToolError("`recipients` must be a non-empty list of email addresses.")
+        if cc is not None and not isinstance(cc, list):
+            raise ToolError("`cc` must be a list of email addresses when provided.")
+        if bcc is not None and not isinstance(bcc, list):
+            raise ToolError("`bcc` must be a list of email addresses when provided.")
         if not (subject or "").strip():
             raise ToolError("`subject` must not be empty.")
         if not (body or "").strip():
             raise ToolError("`body` must not be empty.")
 
-        valid, invalid = _normalize_recipients(recipients)
-        if not valid:
+        to_valid, to_invalid = _normalize_recipients(recipients)
+        cc_valid, cc_invalid = _normalize_recipients(cc)
+        bcc_valid, bcc_invalid = _normalize_recipients(bcc)
+        invalid = (
+            [{"field": "to", "address": a} for a in to_invalid]
+            + [{"field": "cc", "address": a} for a in cc_invalid]
+            + [{"field": "bcc", "address": a} for a in bcc_invalid]
+        )
+
+        reply_to = (reply_to or "").strip() or None
+        if reply_to and not _ADDR_RE.match(reply_to):
+            raise ToolError(f"`reply_to` is not a valid email address: {reply_to}")
+
+        entries = (
+            [{"field": "to", "address": a} for a in to_valid]
+            + [{"field": "cc", "address": a} for a in cc_valid]
+            + [{"field": "bcc", "address": a} for a in bcc_valid]
+        )
+        entries, duplicate_dropped = _dedupe_address_entries(entries)
+        if not entries:
             raise ToolError(
-                "No valid recipient addresses. Rejected: " + ", ".join(invalid)
+                "No valid recipient addresses. Rejected: "
+                + ", ".join(e["address"] for e in invalid)
             )
 
         # Clamp to the configured cap (a context/abuse guard). Over-cap addresses
         # are dropped and reported rather than sent — see CLAUDE.md caps convention.
-        dropped = list(invalid)
-        if len(valid) > cfg.max_recipients:
-            dropped.extend(valid[cfg.max_recipients :])
-            valid = valid[: cfg.max_recipients]
+        over_limit_dropped: list[dict] = []
+        if len(entries) > cfg.max_recipients:
+            over_limit_dropped = [
+                {**e, "reason": "over_recipient_limit"}
+                for e in entries[cfg.max_recipients :]
+            ]
+            entries = entries[: cfg.max_recipients]
 
-        msg = _build_message(valid, subject, body)
+        if not entries:
+            raise ToolError(
+                f"No recipients remained after applying the {cfg.max_recipients}-recipient cap."
+            )
+
+        to_final = _recipient_addresses(entries, "to")
+        cc_final = _recipient_addresses(entries, "cc")
+        bcc_final = _recipient_addresses(entries, "bcc")
+        envelope_recipients = [e["address"] for e in entries]
+
+        prepared_attachments = _prepare_attachments(attachments)
+
+        msg = _build_message(
+            to_final,
+            cc_final,
+            subject,
+            body,
+            reply_to=reply_to,
+            attachments=prepared_attachments,
+        )
 
         try:
-            await anyio.to_thread.run_sync(_send, msg)
+            refused_raw = await anyio.to_thread.run_sync(_send, msg, envelope_recipients)
         except smtplib.SMTPAuthenticationError as exc:
             raise ToolError(
                 "SMTP authentication failed. Check EMAIL_USERNAME and EMAIL_PASSWORD. "
@@ -165,7 +340,8 @@ def register(mcp: FastMCP) -> None:
             )
         except smtplib.SMTPRecipientsRefused as exc:
             raise ToolError(
-                f"All recipients were refused by the server: {exc.recipients}"
+                "All recipients were refused by the server: "
+                + to_json({"refused_recipients": _format_refused(exc.recipients)})
             )
         except smtplib.SMTPSenderRefused as exc:
             raise ToolError(
@@ -179,10 +355,34 @@ def register(mcp: FastMCP) -> None:
                 f"Could not connect to the SMTP server {cfg.smtp_host}:{cfg.smtp_port}: {exc}"
             )
 
-        payload = {
-            "status": "sent",
-            "recipients": valid,
-            "dropped": dropped,
+        refused = _format_refused(refused_raw)
+        refused_set = {r["address"].lower() for r in refused}
+        accepted = [a for a in envelope_recipients if a.lower() not in refused_set]
+        payload: dict = {
+            "status": "partial" if refused else "sent",
             "subject": subject,
+            "recipients": {
+                "to": to_final,
+                "cc": cc_final,
+                "bcc": bcc_final,
+            },
+            "attempted_recipients": envelope_recipients,
+            "accepted_recipients": accepted,
+            "refused_recipients": refused,
+            "invalid_recipients": invalid,
+            "dropped_recipients": duplicate_dropped + over_limit_dropped,
+            "attachments": [
+                {
+                    "path": att["path"],
+                    "filename": att["filename"],
+                    "content_type": att["content_type"],
+                    "size_bytes": att["size_bytes"],
+                }
+                for att in prepared_attachments
+            ],
+            # Backward-compatible flat summary for older callers.
+            "dropped": [e["address"] for e in invalid + duplicate_dropped + over_limit_dropped],
         }
+        if refused and not accepted:
+            payload["status"] = "failed"
         return log_result(log, "send_email", to_json(payload))

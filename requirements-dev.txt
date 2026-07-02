@@ -4,4 +4,4 @@
 
 # Test runner. The suite is offline (httpx MockTransport + monkeypatching) and
 # drives async code with asyncio.run, so no async pytest plugin is required.
-pytest>=8
+pytest>=9.1.1
