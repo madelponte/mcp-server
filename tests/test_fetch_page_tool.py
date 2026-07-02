@@ -143,6 +143,7 @@ def test_query_filters_matching_passages(monkeypatch, tool_fns):
     assert out["query"] == "dog"
     assert out["match_count"] >= 1
     assert "dog ran fast" in out["content"]
+    assert "note" not in out
 
 
 def test_query_no_match_raises(monkeypatch, tool_fns):
