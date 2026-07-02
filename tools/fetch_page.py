@@ -679,7 +679,6 @@ async def _fetch_one(
             "url": url,
             **_provenance(url, url, 200, None, None),
             "format": "youtube_transcript",
-            "content": transcript,
         }
         if query:
             # Keep the metadata header (video id/language/source) for context
@@ -690,7 +689,14 @@ async def _fetch_one(
             )
             filtered = f"{header}{sep}{qres.pop('content')}" if sep else qres.pop("content")
             payload.update(qres)
-            payload["content"] = filtered
+            _set_content(payload, filtered, offset=offset, hint=False)
+        else:
+            _set_content(payload, transcript, offset=offset, hint=False)
+        if payload.get("truncated"):
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "To jump straight to relevant transcript lines instead, retry with `query=`.",
+            )
         return payload
 
     mode = (mode or "text").lower().strip()

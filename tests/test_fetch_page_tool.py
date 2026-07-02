@@ -296,3 +296,40 @@ def test_youtube_url_returns_transcript(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")))
     assert out["format"] == "youtube_transcript"
     assert "hello world" in out["content"]
+
+
+def test_youtube_transcript_uses_truncation(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 10)
+
+    async def fake_transcript(url, force_timestamps=False):
+        return "0123456789ABCDEFGHIJ"
+
+    monkeypatch.setattr(fp, "fetch_transcript", fake_transcript)
+    out = json.loads(run(tool_fns["fetch_page"](url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")))
+    assert out["format"] == "youtube_transcript"
+    assert out["content"].startswith("0123456789")
+    assert "truncated at 10 chars" in out["content"]
+    assert out["truncated"] is True
+    assert out["next_offset"] == 10
+    assert "query=" in out["note"]
+
+
+def test_youtube_transcript_respects_offset(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 10)
+
+    async def fake_transcript(url, force_timestamps=False):
+        return "0123456789ABCDEFGHIJ"
+
+    monkeypatch.setattr(fp, "fetch_transcript", fake_transcript)
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                offset=10,
+            )
+        )
+    )
+    assert out["format"] == "youtube_transcript"
+    assert out["content"] == "ABCDEFGHIJ"
+    assert out["offset"] == 10
+    assert "truncated" not in out
