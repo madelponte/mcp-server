@@ -560,6 +560,20 @@ class EmailSettings(BaseSettings):
             "send to; addresses past this are dropped and reported, not sent."
         ),
     )
+    max_attachments: int = Field(
+        5,
+        description=(
+            "Maximum number of file attachments a single send_email call will "
+            "include; extra attachment paths are rejected."
+        ),
+    )
+    max_attachment_bytes: int = Field(
+        10485760,
+        description=(
+            "Maximum size in bytes for each individual email attachment "
+            "(default 10 MiB)."
+        ),
+    )
 
 
 # Singletons imported by the tool modules and the server entrypoint.

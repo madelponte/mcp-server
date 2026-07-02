@@ -143,6 +143,141 @@ def _clamp_amount(requested: int | None, maximum: int) -> int:
     return min(requested, maximum)
 
 
+def _coerce_string_list(value: list[str] | str | None) -> list[str]:
+    """Accept a real list, comma-separated string, or JSON string array."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                decoded = json.loads(stripped)
+            except (ValueError, TypeError):
+                decoded = None
+            if isinstance(decoded, list):
+                value = decoded
+            else:
+                value = stripped
+        if isinstance(value, str):
+            parts = value.split(",")
+        else:
+            parts = value
+    else:
+        parts = value
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        for piece in str(item or "").split(","):
+            text = piece.strip()
+            if text and text.lower() not in seen:
+                seen.add(text.lower())
+                out.append(text)
+    return out
+
+
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _metric_key(text: str) -> str:
+    """Normalize financial metric labels from FMP/yfinance/Finnhub for matching."""
+    spaced = _CAMEL_BOUNDARY_RE.sub(" ", str(text or ""))
+    return re.sub(r"[^a-z0-9]+", "", spaced.lower())
+
+
+_FINANCIAL_METRIC_ALIASES = {
+    "revenue": {"revenue", "totalrevenue", "revenues"},
+    "sales": {"revenue", "totalrevenue", "sales"},
+    "grossprofit": {"grossprofit"},
+    "freecashflow": {"freecashflow", "freecashflows"},
+    "fcf": {"freecashflow"},
+    "operatingcashflow": {
+        "operatingcashflow",
+        "totalcashfromoperatingactivities",
+        "netcashprovidedbyoperatingactivities",
+    },
+    "capex": {
+        "capitalexpenditure",
+        "capitalexpenditures",
+        "capitalexpendituresecurities",
+    },
+    "operatingincome": {"operatingincome", "incomefromoperations"},
+    "netincome": {"netincome", "netincomeloss"},
+    "ebitda": {"ebitda"},
+    "eps": {"eps", "epsdiluted", "dilutedeps", "basiceps"},
+}
+
+
+def _metric_targets(metric: str) -> set[str]:
+    key = _metric_key(metric)
+    return {key, *_FINANCIAL_METRIC_ALIASES.get(key, set())}
+
+
+def _metric_matches(label: str, targets: set[str]) -> bool:
+    label_key = _metric_key(label)
+    for target in targets:
+        if not target:
+            continue
+        if label_key == target or label_key in target:
+            return True
+        if target == "revenue":
+            # "revenue" should catch Total/Operating Revenue, but not
+            # CostOfRevenue, which is a different expense line.
+            if label_key.endswith("revenue") and not label_key.startswith("costof"):
+                return True
+            continue
+        if target in label_key:
+            return True
+    return False
+
+
+def _filter_financials(result: dict | None, metrics: list[str]) -> dict | None:
+    """Keep only requested financial statement rows in a provider result.
+
+    Matching is deliberately forgiving across providers: FMP emits camelCase
+    fields (`grossProfit`), yfinance title-cased labels (`Gross Profit`), and
+    Finnhub report labels/concepts. The original provider keys are preserved in
+    the returned `data` maps so the model can still see source-native names.
+    """
+    if not result or not metrics:
+        return result
+
+    targets_by_metric = {metric: _metric_targets(metric) for metric in metrics}
+    matched_by_metric: dict[str, set[str]] = {metric: set() for metric in metrics}
+    filtered_periods = []
+    for period in result.get("periods") or []:
+        data = period.get("data") or {}
+        kept: dict[str, Any] = {}
+        for key, value in data.items():
+            hit = [
+                metric
+                for metric, targets in targets_by_metric.items()
+                if _metric_matches(key, targets)
+            ]
+            if hit:
+                kept[key] = value
+                for metric in hit:
+                    matched_by_metric[metric].add(str(key))
+        period_copy = dict(period)
+        period_copy["data"] = kept
+        filtered_periods.append(period_copy)
+
+    out = dict(result)
+    out["periods"] = filtered_periods
+    out["metrics_filter"] = {
+        "requested": metrics,
+        "matched": {
+            metric: sorted(labels)
+            for metric, labels in matched_by_metric.items()
+            if labels
+        },
+        "unmatched": [
+            metric for metric, labels in matched_by_metric.items() if not labels
+        ],
+    }
+    return out
+
+
 # -------------------------- Cache + HTTP --------------------------
 
 # Unbounded (max_entries=0) to preserve the original behavior; quote/profile
@@ -1358,12 +1493,13 @@ def _section_profile(symbol: str, opts: dict):
 
 
 def _section_financials(symbol: str, opts: dict):
-    return _fetch_section(
+    result, errors = _fetch_section(
         _resolve_provider(cfg.financials_provider, for_financials=True),
         {"fmp": _fmp_financials, "yfinance": _yfinance_financials, "finnhub": _finnhub_financials},
         _yfinance_financials,
         (symbol, opts["statement"], opts["period"], opts["financial_periods"]),
     )
+    return _filter_financials(result, opts["financial_metrics"]), errors
 
 
 def _section_earnings(symbol: str, opts: dict):
@@ -1455,6 +1591,7 @@ async def _gather_sections(
     history_bars: int | None,
     news_days: int | None,
     history_interval: str,
+    financial_metrics: list[str] | None = None,
 ):
     """Fetch every requested section concurrently.
 
@@ -1482,6 +1619,7 @@ async def _gather_sections(
         "insider_weeks": _clamp_amount(insider_weeks, cfg.max_insider_lookback_weeks),
         "history_bars": _clamp_amount(history_bars, cfg.max_history_bars),
         "history_interval": history_interval,
+        "financial_metrics": financial_metrics or [],
         # Pure server-side caps (no model-tunable param) for the open-ended
         # peers / dividends / ownership sections.
         "peers": cfg.max_peers,
@@ -1515,6 +1653,7 @@ async def _fetch_company(
     history_bars: int | None,
     news_days: int | None,
     history_interval: str,
+    financial_metrics: list[str] | None = None,
 ) -> dict:
     """Resolve one ticker-or-name and fetch its requested sections.
 
@@ -1528,7 +1667,7 @@ async def _fetch_company(
     data, errors = await _gather_sections(
         symbol, sections, statement, period,
         periods, news_items, insider_weeks, history_bars,
-        news_days, history_interval,
+        news_days, history_interval, financial_metrics or [],
     )
     if not data:
         # Every requested section failed — surface as a ToolError so the failure
@@ -1602,6 +1741,16 @@ def register(mcp: FastMCP) -> None:
             ),
         ] = None,
         history_interval: Literal["1d", "1wk", "1mo"] = "1d",
+        financial_metrics: Annotated[
+            list[str] | str | None,
+            Field(
+                description=(
+                    "Optional financials-only filter: metric names/rows to keep "
+                    "in the financials section, e.g. ['revenue','gross profit',"
+                    "'free cash flow']; accepts an array or comma-separated string."
+                ),
+            ),
+        ] = None,
     ) -> str:
         """Get stock/company data. symbol=ticker or name (auto-resolved); pass a
         list of tickers/names to compare several companies in one call.
@@ -1615,6 +1764,8 @@ def register(mcp: FastMCP) -> None:
         periods, news_items, insider_weeks, history_bars, news_days (all capped;
         omit=max). history_interval(1d|1wk|1mo): bar size for price_history —
         use 1wk/1mo to cover months/years within the same bar budget.
+        financial_metrics filters financials rows by name to keep responses
+        compact (e.g. revenue, gross profit, free cash flow).
 
         Use for: current price, company fundamentals, financial statements,
         earnings reports, recent news, insider trading, price charts, sector
@@ -1645,6 +1796,7 @@ def register(mcp: FastMCP) -> None:
             history_bars=history_bars,
             news_days=news_days,
             history_interval=history_interval,
+            financial_metrics=financial_metrics,
         )
         # Accept a single ticker/name (string) or several (list). A bare string
         # returns one company object unchanged; a list returns {"results": [...]}
@@ -1730,6 +1882,7 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("period must be 'annual' or 'quarterly'")
         if history_interval not in ("1d", "1wk", "1mo"):
             raise ToolError("history_interval must be one of: 1d, 1wk, 1mo")
+        resolved_financial_metrics = _coerce_string_list(financial_metrics)
 
         # Context-budget cap on how many companies per call. Extra symbols are
         # reported as skipped rather than silently dropped.
@@ -1740,7 +1893,7 @@ def register(mcp: FastMCP) -> None:
         args = (
             normalized, statement, period,
             periods, news_items, insider_weeks, history_bars,
-            news_days, history_interval,
+            news_days, history_interval, resolved_financial_metrics,
         )
 
         if single_input and not skipped:
