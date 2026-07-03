@@ -22,6 +22,7 @@ import logging
 import math
 import re
 import time
+import asyncio
 from typing import Annotated
 
 import anyio
@@ -35,6 +36,20 @@ from .cache import TTLCache
 from .serialize import to_json, log_call, log_result
 
 log = logging.getLogger(__name__)
+
+# Reuse async clients per event loop to keep API calls from paying repeated
+# connection setup. The client class id keeps tests that monkeypatch
+# httpx.AsyncClient isolated from clients created under earlier patches.
+_http_clients: dict[tuple[int, int], httpx.AsyncClient] = {}
+
+
+def _http_client() -> httpx.AsyncClient:
+    key = (id(asyncio.get_running_loop()), id(httpx.AsyncClient))
+    client = _http_clients.get(key)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient()
+        _http_clients[key] = client
+    return client
 
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake a failure for a
@@ -400,8 +415,13 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
 
     await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
-        async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
-            resp = await client.get(url, params=params, headers=headers)
+        client = _http_client()
+        resp = await client.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=cfg.http_timeout_seconds,
+        )
     except httpx.TimeoutException:
         raise ToolError(f"Geocoding request timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
@@ -492,10 +512,13 @@ async def _overpass(query_ql: str) -> list[dict]:
 
     headers = {"User-Agent": cfg.user_agent}
     try:
-        async with httpx.AsyncClient(timeout=cfg.overpass_timeout_seconds) as client:
-            resp = await client.post(
-                cfg.overpass_url, data={"data": query_ql}, headers=headers
-            )
+        client = _http_client()
+        resp = await client.post(
+            cfg.overpass_url,
+            data={"data": query_ql},
+            headers=headers,
+            timeout=cfg.overpass_timeout_seconds,
+        )
     except httpx.TimeoutException:
         raise ToolError(
             f"Overpass request timed out after {cfg.overpass_timeout_seconds}s. "

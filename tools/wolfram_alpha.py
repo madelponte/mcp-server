@@ -11,6 +11,7 @@ boilerplate (the echoed query, image URLs, the verbose "Assuming …" lines).
 
 import logging
 import re
+import asyncio
 from typing import Any, Literal
 
 import httpx
@@ -34,6 +35,20 @@ BASE_URL = "https://www.wolframalpha.com/api/v1/llm-api"
 # surprisingly often, so we cache the finished response. See the README
 # "Caching" section.
 _result_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
+
+# The Wolfram endpoint is often queried in short bursts. Reuse a loop-local
+# AsyncClient so repeated calls keep the connection pool warm. Include the
+# current AsyncClient class id for test isolation when httpx is monkeypatched.
+_http_clients: dict[tuple[int, int], httpx.AsyncClient] = {}
+
+
+def _http_client() -> httpx.AsyncClient:
+    key = (id(asyncio.get_running_loop()), id(httpx.AsyncClient))
+    client = _http_clients.get(key)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient()
+        _http_clients[key] = client
+    return client
 
 
 # --------------------------- Response structuring ---------------------------
@@ -220,12 +235,13 @@ def register(mcp: FastMCP) -> None:
             return log_result(log, "query_wolfram_alpha", cached)
 
         try:
-            async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
-                response = await client.get(
-                    BASE_URL,
-                    params=params,
-                    headers={"User-Agent": "MCP-WolframAlpha/1.0"},
-                )
+            client = _http_client()
+            response = await client.get(
+                BASE_URL,
+                params=params,
+                headers={"User-Agent": "MCP-WolframAlpha/1.0"},
+                timeout=cfg.http_timeout_seconds,
+            )
         except httpx.TimeoutException:
             raise ToolError(
                 f"Wolfram Alpha request timed out after {cfg.http_timeout_seconds}s."

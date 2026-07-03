@@ -41,6 +41,12 @@ _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 # await the same network/render/Tika precursor work instead of duplicating it.
 _page_inflight: dict[str, asyncio.Task] = {}
 
+# Lean search-result enrichment has its own in-flight map. It deliberately does
+# not use the full fetch path because enrichment skips browser/Wayback fallbacks,
+# but concurrent enrichment of the same URL should still share the one direct,
+# byte-capped download.
+_enrich_inflight: dict[str, asyncio.Task] = {}
+
 # Shared httpx clients for direct fetches, keyed by the `verify` setting (the
 # only client-construction option that varies). Reusing one client per setting
 # keeps a keep-alive connection pool warm across fetches — so an agent loop that
@@ -689,28 +695,8 @@ async def _cached_resilient_fetch(url: str) -> dict:
     return fetched
 
 
-async def _enrich_fetch(url: str) -> dict | None:
-    """Lean fetch used only to enrich a search result with page metadata.
-
-    Enrichment wants a hit's title/description/heading outline — all in the
-    document head — not its whole body, and it isn't worth a multi-second browser
-    render. So unlike `_cached_resilient_fetch` this:
-
-    * reuses an already-cached full fetch when one exists (so a later
-      ``fetch_page`` read and this share a download), but
-    * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
-      fetch through the same SSRF-guarded redirect path — and **skips** the
-      FlareSolverr and Wayback fallbacks, so one bot-walled result among the top
-      hits can't stall the whole ``search_web`` call.
-
-    A page larger than the cap returns ``None`` (left un-enriched) rather than
-    being pulled in full. Only a complete, textlike, un-blocked result is written
-    to the shared page cache — never a truncated/blocked one, which would poison a
-    later real ``fetch_page`` read. Returns a raw-fetch-shaped dict, or ``None``.
-    """
-    cached = _page_cache.get(url)
-    if cached is not None:
-        return cached
+async def _direct_enrich_fetch(url: str) -> dict | None:
+    """One direct, byte-capped enrichment fetch. Call via `_enrich_fetch`."""
     await _assert_url_allowed(url)
     try:
         status, headers, body, ctype = await _httpx_fetch(
@@ -751,6 +737,50 @@ async def _enrich_fetch(url: str) -> dict | None:
     if is_textlike and not blocked:
         _page_cache.set(url, result)
     return result
+
+
+async def _enrich_fetch(url: str) -> dict | None:
+    """Lean cached/coalesced fetch used only to enrich a search result with page metadata.
+
+    Enrichment wants a hit's title/description/heading outline — all in the
+    document head — not its whole body, and it isn't worth a multi-second browser
+    render. So unlike `_cached_resilient_fetch` this:
+
+    * reuses an already-cached full fetch when one exists (so a later
+      ``fetch_page`` read and this share a download), but
+    * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
+      fetch through the same SSRF-guarded redirect path — and **skips** the
+      FlareSolverr and Wayback fallbacks, so one bot-walled result among the top
+      hits can't stall the whole ``search_web`` call.
+
+    A page larger than the cap returns ``None`` (left un-enriched) rather than
+    being pulled in full. Only a complete, textlike, un-blocked result is written
+    to the shared page cache — never a truncated/blocked one, which would poison a
+    later real ``fetch_page`` read. Returns a raw-fetch-shaped dict, or ``None``.
+    """
+    cached = _page_cache.get(url)
+    if cached is not None:
+        return cached
+
+    # If a full fetch_page read for this URL is already in progress, use it
+    # rather than starting a second direct download. That preserves fetch_page's
+    # richer fallback behavior and shares the final raw result.
+    full_task = _page_inflight.get(url)
+    if full_task is not None:
+        fetched = await asyncio.shield(full_task)
+        _page_cache.set(url, fetched)
+        return fetched
+
+    task = _enrich_inflight.get(url)
+    if task is None:
+        task = asyncio.create_task(_direct_enrich_fetch(url))
+        _enrich_inflight[url] = task
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if _enrich_inflight.get(url) is task:
+            _enrich_inflight.pop(url, None)
 
 
 async def _render_with_flaresolverr(url: str) -> dict:
