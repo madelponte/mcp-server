@@ -90,6 +90,35 @@ def test_searxng_query_empty_results(patch_httpx):
     assert out == []
 
 
+def test_searxng_query_reuses_client_within_event_loop(monkeypatch):
+    created = 0
+
+    def handler(request):
+        return httpx.Response(200, json={"results": []})
+
+    class CountingClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            nonlocal created
+            created += 1
+            kwargs.pop("verify", None)
+            super().__init__(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", CountingClient)
+    ws._searxng_clients.clear()
+
+    async def scenario():
+        for _ in range(2):
+            await _searxng_query(
+                "http://searxng:8080", "test",
+                num_results=5, categories="general", language="en",
+                time_range="", safe_search=0, timeout=5,
+                verify_ssl=True, user_agent="t",
+            )
+
+    run(scenario())
+    assert created == 1
+
+
 # --------------------------- _enrich_result (async, mocked) ---------------------------
 
 def test_enrich_result_none_url():
