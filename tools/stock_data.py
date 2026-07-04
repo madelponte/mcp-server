@@ -716,6 +716,9 @@ def _yfinance_profile(symbol: str) -> dict | None:
 
     market_cap = _safe_float(info.get("marketCap"))
     dividend_yield = _safe_float(info.get("dividendYield"))
+    profit_margins = _safe_float(info.get("profitMargins"))
+    operating_margins = _safe_float(info.get("operatingMargins"))
+    return_on_equity = _safe_float(info.get("returnOnEquity"))
     return {
         "provider": "yfinance",
         "symbol": symbol,
@@ -749,18 +752,18 @@ def _yfinance_profile(symbol: str) -> dict | None:
             "50_day_avg": _safe_float(info.get("fiftyDayAverage")),
             "200_day_avg": _safe_float(info.get("twoHundredDayAverage")),
             "profit_margin_percent": (
-                _safe_float(info.get("profitMargins")) * 100
-                if _safe_float(info.get("profitMargins")) is not None
+                profit_margins * 100
+                if profit_margins is not None
                 else None
             ),
             "operating_margin_percent": (
-                _safe_float(info.get("operatingMargins")) * 100
-                if _safe_float(info.get("operatingMargins")) is not None
+                operating_margins * 100
+                if operating_margins is not None
                 else None
             ),
             "return_on_equity_percent": (
-                _safe_float(info.get("returnOnEquity")) * 100
-                if _safe_float(info.get("returnOnEquity")) is not None
+                return_on_equity * 100
+                if return_on_equity is not None
                 else None
             ),
             "debt_to_equity": _safe_float(info.get("debtToEquity")),

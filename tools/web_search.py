@@ -28,6 +28,23 @@ from .web_extract import _structured_from_html, _trim
 
 log = logging.getLogger(__name__)
 
+# SearXNG is queried repeatedly during agent loops. Keep one async client per
+# event loop / verify setting so calls reuse keep-alive connections without
+# binding a client to the wrong loop in tests or alternate server runners. The
+# client class is part of the key so tests that monkeypatch httpx.AsyncClient get
+# a fresh mock-backed client.
+_searxng_clients: dict[tuple[int, bool, int], httpx.AsyncClient] = {}
+
+
+def _searxng_client(verify_ssl: bool) -> httpx.AsyncClient:
+    loop_id = id(asyncio.get_running_loop())
+    key = (loop_id, verify_ssl, id(httpx.AsyncClient))
+    client = _searxng_clients.get(key)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(verify=verify_ssl)
+        _searxng_clients[key] = client
+    return client
+
 
 # The model-facing tool description. Built at registration time so the sibling
 # tool reference (fetch_page) carries the client's tool-name prefix — the same
@@ -124,15 +141,15 @@ async def _searxng_query(
 
     url = base_url.rstrip("/") + "/search"
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
-    async with httpx.AsyncClient(timeout=timeout, verify=verify_ssl, headers=headers) as client:
-        resp = await client.get(url, params=params)
-        if resp.status_code == 403:
-            raise RuntimeError(
-                "SearXNG returned 403. Make sure `search.formats` in its settings.yml "
-                "includes `json`."
-            )
-        resp.raise_for_status()
-        data = resp.json()
+    client = _searxng_client(verify_ssl)
+    resp = await client.get(url, params=params, headers=headers, timeout=timeout)
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "SearXNG returned 403. Make sure `search.formats` in its settings.yml "
+            "includes `json`."
+        )
+    resp.raise_for_status()
+    data = resp.json()
 
     items = data.get("results") or []
     out: list[dict] = []

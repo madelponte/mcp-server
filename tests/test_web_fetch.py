@@ -279,6 +279,40 @@ def test_cached_resilient_fetch_coalesces_concurrent_misses(monkeypatch):
     assert web_fetch._page_inflight == {}
 
 
+def test_enrich_fetch_coalesces_concurrent_misses(monkeypatch):
+    calls = 0
+
+    async def fake_direct_enrich(url):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {
+            "url": url,
+            "status": 200,
+            "content_type": "text/html",
+            "text": "<html><title>ok</title></html>",
+            "bytes": None,
+            "via": "direct",
+            "blocked_detected": False,
+        }
+
+    async def scenario():
+        return await asyncio.gather(
+            web_fetch._enrich_fetch("https://example.com/page"),
+            web_fetch._enrich_fetch("https://example.com/page"),
+            web_fetch._enrich_fetch("https://example.com/page"),
+        )
+
+    monkeypatch.setattr(web_fetch, "_page_cache", TTLCache(60, 8))
+    web_fetch._enrich_inflight.clear()
+    monkeypatch.setattr(web_fetch, "_direct_enrich_fetch", fake_direct_enrich)
+
+    results = run(scenario())
+    assert calls == 1
+    assert [r["url"] for r in results] == ["https://example.com/page"] * 3
+    assert web_fetch._enrich_inflight == {}
+
+
 # --------------------------- allowlist parsing ---------------------------
 
 def test_parse_allowlist_separates_hosts_and_nets():
