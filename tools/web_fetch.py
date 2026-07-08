@@ -242,6 +242,60 @@ def _sniff_document_bytes(body: bytes | None) -> bool:
     return False
 
 
+def _declared_textlike(ctype: str) -> bool:
+    """True when the Content-Type header declares a text/HTML/XML/JSON body."""
+    ctype = (ctype or "").lower()
+    return (
+        ctype.startswith("text/")
+        or "json" in ctype
+        or "xml" in ctype
+        or "html" in ctype
+    )
+
+
+def _generic_binary_ctype(ctype: str) -> bool:
+    """True for missing/generic types that often hide HTML or JSON downloads."""
+    base = (ctype or "").split(";", 1)[0].strip().lower()
+    return base in {
+        "",
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/download",
+        "application/x-download",
+    }
+
+
+def _sniff_textlike_ctype(body: bytes | None, ctype: str = "") -> str | None:
+    """A synthetic content type if generic bytes look like HTML, XML, or JSON.
+
+    Some sites serve ordinary HTML/JSON from extensionless download endpoints as
+    ``application/octet-stream`` or with no Content-Type. Without this sniff the
+    caller sees only ``bytes`` and may waste time on browser/archive fallbacks.
+    Keep the sniff conservative: it only applies to missing/generic content
+    types and only recognizes unambiguous leading syntax.
+    """
+    if not body or not _generic_binary_ctype(ctype):
+        return None
+    sample = body[:4096]
+    if sample.startswith(codecs.BOM_UTF8):
+        sample = sample[len(codecs.BOM_UTF8):]
+    sample = sample.lstrip()
+    if not sample:
+        return None
+    head = sample[:256].lower()
+    if head.startswith((b"<!doctype html", b"<html")):
+        return "text/html"
+    if head.startswith((b"<?xml", b"<rss", b"<feed", b"<urlset")):
+        return "application/xml"
+    if head[:1] in (b"{", b"["):
+        try:
+            sample.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return "application/json"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Charset-aware decoding
 #
@@ -588,15 +642,17 @@ async def _resilient_fetch(
     # content-type/extension OR by a magic-byte sniff, which also catches a
     # document mislabelled with a text/* or octet-stream content-type.
     is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
+    sniffed_ctype = (
+        None
+        if is_document or _declared_textlike(ctype)
+        else _sniff_textlike_ctype(body, ctype)
+    )
     is_textlike = (
         not is_document
-        and (
-            ctype.startswith("text/")
-            or "json" in ctype
-            or "xml" in ctype
-            or "html" in ctype
-        )
+        and (_declared_textlike(ctype) or sniffed_ctype is not None)
     )
+    if sniffed_ctype:
+        ctype = sniffed_ctype
 
     if not is_textlike:
         return {
@@ -711,15 +767,17 @@ async def _direct_enrich_fetch(url: str) -> dict | None:
         return None
 
     is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
+    sniffed_ctype = (
+        None
+        if is_document or _declared_textlike(ctype)
+        else _sniff_textlike_ctype(body, ctype)
+    )
     is_textlike = (
         not is_document
-        and (
-            ctype.startswith("text/")
-            or "json" in ctype
-            or "xml" in ctype
-            or "html" in ctype
-        )
+        and (_declared_textlike(ctype) or sniffed_ctype is not None)
     )
+    if sniffed_ctype:
+        ctype = sniffed_ctype
     text = _decode_body(body, ctype) if is_textlike else None
     blocked = _is_blocked_response(status, text or "", headers)
     result = {

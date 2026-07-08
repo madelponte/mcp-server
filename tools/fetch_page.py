@@ -637,13 +637,42 @@ async def _archived_text_payload(
         _set_content(payload, plain, offset=offset)
     # Tag after content is set, so it survives the query path's `update()` and
     # merges onto (not under) any truncation note from `_set_content`.
-    payload["archived_snapshot"] = meta
-    payload["note"] = _join_note(
-        payload.get("note"),
-        f"{reason}; this is an archived snapshot from {meta['date']} via the "
-        "Wayback Machine and may be out of date.",
-    )
+    _tag_archived_payload(payload, meta, reason)
     return payload
+
+
+def _archive_note(reason: str, meta: dict) -> str:
+    """Human note attached to payloads recovered from archive.org."""
+    return (
+        f"{reason}; this is an archived snapshot from {meta['date']} via the "
+        "Wayback Machine and may be out of date."
+    )
+
+
+def _tag_archived_payload(payload: dict, meta: dict, reason: str) -> None:
+    """Add archive provenance fields to a payload built from Wayback HTML."""
+    payload["archived_snapshot"] = meta
+    payload["note"] = _join_note(payload.get("note"), _archive_note(reason, meta))
+
+
+def _unsupported_media_error(
+    fetch_url: str, status: int | None, ctype: str, size: int | None
+) -> ToolError:
+    """Actionable ToolError for fetched bytes this tool cannot extract."""
+    details = []
+    if status is not None:
+        details.append(f"HTTP {status}")
+    details.append(f"Content-Type {ctype!r}" if ctype else "no Content-Type header")
+    if size is not None:
+        details.append(f"{size} bytes")
+    return ToolError(
+        f"{fetch_url} was fetched successfully ({', '.join(details)}), but this "
+        "tool cannot extract that media type. fetch_page can read HTML/text/JSON, "
+        "YouTube transcripts, and document files such as PDF, Word, Excel, "
+        "PowerPoint, OpenDocument, RTF, and EPUB via Tika. Use a browser/direct "
+        "download for this file, or fetch a text/HTML/document version of the "
+        "same content."
+    )
 
 
 async def _fetch_one(
@@ -826,6 +855,11 @@ async def _fetch_one(
             _set_content(doc_payload, extracted, offset=offset)
         return doc_payload
 
+    if fetched.get("bytes") is not None and fetched.get("text") is None:
+        raise _unsupported_media_error(
+            fetch_url, status, ctype, len(fetched.get("bytes") or b"")
+        )
+
     text = fetched.get("text") or ""
 
     # Reddit / JSON responses
@@ -848,6 +882,79 @@ async def _fetch_one(
     # HTML / text
     # `query` is a content search, so it overrides "structured" (which would
     # return only metadata); structured mode applies only without a query.
+    archive_meta = None
+    archive_reason = None
+    try:
+        soup_title, plain, text_format = await anyio.to_thread.run_sync(
+            _render_text_mode, text, fetch_url
+        )
+    except Exception as e:
+        raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+
+    # Empty-shell handling. Check this before section/structured parsing, since
+    # a static JS shell can otherwise look like "section not found" or sparse
+    # metadata even though a browser/archive fallback can recover the page body.
+    tried_render = False
+    if _is_contentless(plain) and via != "flaresolverr" and cfg.flaresolverr_url:
+        tried_render = True
+        try:
+            rendered = await _render_with_flaresolverr(fetch_url)
+        except Exception:
+            rendered = None
+        if rendered and rendered.get("text") and not rendered.get("blocked_detected"):
+            text = rendered["text"]
+            status = rendered["status"]
+            ctype = (rendered.get("content_type") or ctype).lower()
+            via = rendered.get("via")
+            try:
+                soup_title, plain, text_format = await anyio.to_thread.run_sync(
+                    _render_text_mode, text, fetch_url
+                )
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+
+    tried_wayback = False
+    if _is_contentless(plain) and cfg.wayback_fallback:
+        tried_wayback = True
+        wb = await _wayback_content(fetch_url)
+        if wb:
+            text = wb["text"]
+            plain = wb["plain"]
+            text_format = wb["format"]
+            status = wb["status"]
+            ctype = (wb.get("content_type") or ctype).lower()
+            via = "archive.org"
+            archive_meta = wb["meta"]
+            archive_reason = "The live page had no readable content"
+            soup_title = _page_title(BeautifulSoup(text, "lxml"))
+
+    if _is_contentless(plain) and not (mode == "structured" and not query):
+        tried = [
+            name
+            for name, used in (
+                ("the FlareSolverr browser fallback", tried_render),
+                ("the Wayback Machine archive", tried_wayback),
+            )
+            if used
+        ]
+        if tried:
+            hint = (
+                f"Even {' and '.join(tried)} produced no readable text, so the "
+                "content is loaded by a script that wasn't captured or no usable "
+                "archive exists. Try another source."
+            )
+        else:
+            hint = (
+                "Enable the FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) or Wayback "
+                "(WEB_SEARCH_WAYBACK_FALLBACK) fallbacks to recover JavaScript-"
+                "rendered or archived pages, or fetch the article from another source."
+            )
+        titled = f" (page title: {soup_title!r})" if soup_title else ""
+        raise ToolError(
+            f"{fetch_url} returned HTTP {status} but no extractable text content — "
+            f"the page renders its content client-side with JavaScript.{titled} {hint}"
+        )
+
     if mode == "structured" and not query:
         # With a `section`, scope the metadata to that heading's subtree so the
         # headings/toc describe just that section, not the whole page.
@@ -879,12 +986,15 @@ async def _fetch_one(
             structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
         if structured.get("toc"):
             structured["toc"] = structured["toc"][: cfg.max_enrich_headings]
-        return {
+        payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype, via),
             "format": "structured",
             "content": structured,
         }
+        if archive_meta:
+            _tag_archived_payload(payload, archive_meta, archive_reason or "")
+        return payload
 
     # mode == "text"
     if section:
@@ -922,90 +1032,9 @@ async def _fetch_one(
         else:
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
         _set_content(section_payload, section_body, offset=offset)
+        if archive_meta:
+            _tag_archived_payload(section_payload, archive_meta, archive_reason or "")
         return section_payload
-
-    try:
-        soup_title, plain, text_format = await anyio.to_thread.run_sync(
-            _render_text_mode, text, fetch_url
-        )
-    except Exception as e:
-        raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
-    # Empty-shell handling. A 200 whose HTML renders to no text is the signature
-    # of a client-side-rendered (JavaScript) page — e.g. MSN, many news SPAs —
-    # whose article body is loaded by an XHR after page load, so the static HTML
-    # this tool fetched is an empty shell. It isn't a bot wall (no challenge for
-    # _is_blocked_response to catch). When FlareSolverr is configured and we
-    # fetched directly, retry through it: it renders in a real browser that runs
-    # the page's JS, which often materializes the body. Re-render from whatever it
-    # returns. (Checked before the query/title paths so an empty page reports as
-    # empty rather than as "query matched nothing".)
-    tried_render = False
-    if _is_contentless(plain) and via != "flaresolverr" and cfg.flaresolverr_url:
-        tried_render = True
-        try:
-            rendered = await _render_with_flaresolverr(fetch_url)
-        except Exception:
-            rendered = None
-        if rendered and rendered.get("text") and not rendered.get("blocked_detected"):
-            text = rendered["text"]
-            status = rendered["status"]
-            ctype = (rendered.get("content_type") or ctype).lower()
-            via = rendered.get("via")
-            try:
-                soup_title, plain, text_format = await anyio.to_thread.run_sync(
-                    _render_text_mode, text, fetch_url
-                )
-            except Exception as e:
-                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
-    # Last resort: the live page (even rendered) still has no readable text. Try
-    # the Wayback Machine — a snapshot may have captured content the live SPA
-    # hides behind JS, or the page may since have changed/disappeared. Archived
-    # content is potentially stale, so it's used only after the live attempts
-    # failed, only when it actually has content, and is clearly flagged below
-    # (via="archive.org" + archived_snapshot + a staleness note).
-    tried_wayback = False
-    if _is_contentless(plain) and cfg.wayback_fallback:
-        tried_wayback = True
-        wb = await _wayback_content(fetch_url)
-        if wb:
-            return await _archived_text_payload(
-                url, fetch_url, wb, query=query, offset=offset,
-                reason="The live page had no readable content",
-            )
-
-    # Still no readable text after every fallback (or none was possible):
-    # returning the bare <title> or stray render noise ("; ;") as `content` would
-    # look like a real-but-empty article, so signal the retrieval failure instead,
-    # per the error convention. The recovered title (if any) is surfaced as a
-    # breadcrumb so the model at least knows what the page was about.
-    if _is_contentless(plain):
-        tried = [
-            name
-            for name, used in (
-                ("the FlareSolverr browser fallback", tried_render),
-                ("the Wayback Machine archive", tried_wayback),
-            )
-            if used
-        ]
-        if tried:
-            hint = (
-                f"Even {' and '.join(tried)} produced no readable text, so the "
-                "content is loaded by a script that wasn't captured or no usable "
-                "archive exists. Try another source."
-            )
-        else:
-            hint = (
-                "Enable the FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) or Wayback "
-                "(WEB_SEARCH_WAYBACK_FALLBACK) fallbacks to recover JavaScript-"
-                "rendered or archived pages, or fetch the article from another source."
-            )
-        titled = f" (page title: {soup_title!r})" if soup_title else ""
-        raise ToolError(
-            f"{fetch_url} returned HTTP {status} but no extractable text content — "
-            f"the page renders its content client-side with JavaScript.{titled} {hint}"
-        )
 
     # An undetected/bypassed block can't reach here: a detected wall on the
     # direct response already raised above, and a FlareSolverr success has
@@ -1028,6 +1057,9 @@ async def _fetch_one(
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
         _set_content(text_payload, plain, offset=offset)
+
+    if archive_meta:
+        _tag_archived_payload(text_payload, archive_meta, archive_reason or "")
 
     return text_payload
 
