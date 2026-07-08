@@ -22,6 +22,27 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "max_page_chars", 100000)
 
 
+@pytest.fixture(autouse=True)
+def inline_fetch_page_thread_offloads(monkeypatch):
+    """Run fetch_page CPU offload targets inline for deterministic unit tests.
+
+    These tests patch the network layer and assert routing/formatting behavior;
+    they do not need real worker threads. The local Python 3.13 test environment
+    can hang during thread cleanup, so keep this file focused on fetch_page logic.
+    """
+    async def run_sync(func, *args, **kwargs):
+        kwargs.pop("abandon_on_cancel", None)
+        kwargs.pop("cancellable", None)
+        kwargs.pop("limiter", None)
+        return func(*args, **kwargs)
+
+    async def to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(fp.anyio.to_thread, "run_sync", run_sync)
+    monkeypatch.setattr(fp.asyncio, "to_thread", to_thread)
+
+
 def _fetched(text=None, *, status=200, content_type="text/html",
              body=None, via="direct", blocked=False):
     return {
@@ -284,6 +305,62 @@ def test_contentless_without_fallback_raises(monkeypatch, tool_fns):
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://example.com"))
     assert "client-side" in str(exc.value) or "no extractable text" in str(exc.value)
+
+
+def test_contentless_section_tries_browser_render_first(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
+    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
+
+    async def fake_render(url):
+        return _fetched(
+            text=(
+                "<html><body><article><h2>Details</h2>"
+                "<p>Rendered section body.</p></article></body></html>"
+            ),
+            via="flaresolverr",
+        )
+
+    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com", section="Details")))
+    assert out["format"] == "section"
+    assert out["via"] == "flaresolverr"
+    assert "Rendered section body." in out["content"]
+
+
+def test_contentless_structured_tries_browser_render_first(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
+    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
+
+    async def fake_render(url):
+        return _fetched(
+            text=(
+                "<html><head><title>Rendered</title></head>"
+                "<body><main><h1>Loaded Heading</h1></main></body></html>"
+            ),
+            via="flaresolverr",
+        )
+
+    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com", mode="structured"))
+    )
+    assert out["format"] == "structured"
+    assert out["via"] == "flaresolverr"
+    assert out["content"]["title"] == "Rendered"
+    assert out["content"]["headings"][0]["text"] == "Loaded Heading"
+
+
+def test_unsupported_binary_media_raises_actionable_error(monkeypatch, tool_fns):
+    _patch_fetch(
+        monkeypatch,
+        _fetched(content_type="image/png", body=b"\x89PNG\r\n\x1a\nbinary", text=None),
+    )
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://example.com/image.png"))
+    msg = str(exc.value)
+    assert "cannot extract that media type" in msg
+    assert "image/png" in msg
+    assert "direct download" in msg
 
 
 # --------------------------- YouTube routing ---------------------------
