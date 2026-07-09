@@ -1,8 +1,8 @@
 # MCP server framework (FastMCP v3 + streamable-http transport).
 # fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
-fastmcp>=3.4.2
+fastmcp>=3.4.4
 starlette>=1.3.1
-uvicorn>=0.49.0
+uvicorn>=0.51.0
 
 # Config / settings
 pydantic>=2.13.4
