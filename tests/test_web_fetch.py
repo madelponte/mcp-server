@@ -194,6 +194,96 @@ def test_decode_empty_body():
     assert _decode_body(b"", "text/html") == ""
 
 
+def test_resilient_fetch_sniffs_octet_stream_html(monkeypatch, patch_httpx):
+    """HTML served as octet-stream should still be decoded as page text."""
+    _clear_allowlist(monkeypatch)
+    monkeypatch.setattr(
+        web_fetch.socket, "getaddrinfo",
+        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"<!doctype html><html><body><p>Generic typed page.</p></body></html>",
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    patch_httpx(handler)
+    out = run(
+        web_fetch._resilient_fetch(
+            "https://example.com/generic",
+            timeout=5,
+            user_agent="t",
+            verify_ssl=False,
+            flaresolverr_url=None,
+            flaresolverr_timeout_ms=1000,
+        )
+    )
+    assert out["text"] is not None
+    assert "Generic typed page" in out["text"]
+    assert out["bytes"] is None
+
+
+def test_resilient_fetch_sniffs_octet_stream_json(monkeypatch, patch_httpx):
+    _clear_allowlist(monkeypatch)
+    monkeypatch.setattr(
+        web_fetch.socket, "getaddrinfo",
+        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"ok": true}',
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    patch_httpx(handler)
+    out = run(
+        web_fetch._resilient_fetch(
+            "https://example.com/generic-json",
+            timeout=5,
+            user_agent="t",
+            verify_ssl=False,
+            flaresolverr_url=None,
+            flaresolverr_timeout_ms=1000,
+        )
+    )
+    assert out["content_type"] == "application/json"
+    assert out["text"] == '{"ok": true}'
+    assert out["bytes"] is None
+
+
+def test_resilient_fetch_leaves_unsupported_binary_as_bytes(monkeypatch, patch_httpx):
+    _clear_allowlist(monkeypatch)
+    monkeypatch.setattr(
+        web_fetch.socket, "getaddrinfo",
+        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"\x89PNG\r\n\x1a\nbinary image",
+            headers={"content-type": "image/png"},
+        )
+
+    patch_httpx(handler)
+    out = run(
+        web_fetch._resilient_fetch(
+            "https://example.com/image.png",
+            timeout=5,
+            user_agent="t",
+            verify_ssl=False,
+            flaresolverr_url=None,
+            flaresolverr_timeout_ms=1000,
+        )
+    )
+    assert out["text"] is None
+    assert out["bytes"].startswith(b"\x89PNG")
+
+
 # --------------------------- download size cap ---------------------------
 
 def test_download_cap_aborts_oversized_body(patch_httpx):
