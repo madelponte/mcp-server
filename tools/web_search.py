@@ -14,6 +14,7 @@ Translated from the Open WebUI tool; status/citation event emitters were removed
 import asyncio
 import logging
 from typing import Annotated
+from urllib.parse import urlparse
 
 import anyio
 import httpx
@@ -62,7 +63,7 @@ def _search_web_desc(prefix: str) -> str:
         '(restrict to one site), "exact phrase" (quoted), -word (exclude a term), '
         "term OR term (alternatives), filetype:pdf (a file type). time_range: "
         '"day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|'
-        '"it"|"social media"|"videos"|"images"|"music"|"files"|"map" '
+        '"it"|"social media"|"videos"|"map" '
         "(comma-separate).\n"
         "num_results/enrich_results: max counts (see per-arg caps; enrich fetches "
         "metadata). page: result page (1-based, default 1) — set page=2 to get the "
@@ -83,6 +84,9 @@ def _search_web_desc(prefix: str) -> str:
 # We also accept a few friendly synonyms for "no restriction" from the model.
 SEARXNG_TIME_RANGES = {"", "day", "week", "month", "year"}
 _TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
+_YOUTUBE_ENGINE_SELECTOR = "!yt"
+_YOUTUBE_ENGINE_ALIASES = ("!yt", "!youtube")
+_YOUTUBE_HOSTS = ("youtube.com", "youtube-nocookie.com", "youtu.be")
 
 
 def _clamp_count(
@@ -112,6 +116,33 @@ def _clamp_count(
     if requested < minimum:
         return minimum
     return min(requested, maximum)
+
+
+def _category_includes_videos(categories: str) -> bool:
+    """True when a comma-separated SearXNG category list includes videos."""
+    return any(part.strip().lower() == "videos" for part in categories.split(","))
+
+
+def _youtube_engine_query(query: str) -> str:
+    """Restrict a video search to SearXNG's YouTube engine."""
+    lowered = query.strip().lower()
+    if any(
+        lowered == alias or lowered.startswith(f"{alias} ")
+        for alias in _YOUTUBE_ENGINE_ALIASES
+    ):
+        return query
+    return f"{_YOUTUBE_ENGINE_SELECTOR} {query}"
+
+
+def _is_youtube_result_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    host = host.lower()
+    return any(host == allowed or host.endswith(f".{allowed}") for allowed in _YOUTUBE_HOSTS)
 
 
 async def _searxng_query(
@@ -261,9 +292,14 @@ def register(mcp: FastMCP) -> None:
         resolved_page = page if isinstance(page, int) and page > 1 else 1
 
         try:
+            search_query = (
+                _youtube_engine_query(query)
+                if _category_includes_videos(resolved_categories)
+                else query
+            )
             results = await _searxng_query(
                 base_url=cfg.searxng_url,
-                query=query,
+                query=search_query,
                 num_results=_clamp_count(num_results, cfg.max_num_results, minimum=1),
                 categories=resolved_categories,
                 language=cfg.searxng_language,
@@ -287,6 +323,9 @@ def register(mcp: FastMCP) -> None:
             return log_result(
                 log, "search_web", to_json({"query": query, **applied, "results": []})
             )
+
+        if _category_includes_videos(resolved_categories):
+            results = [r for r in results if _is_youtube_result_url(r.get("url"))]
 
         for r in results:
             if r.get("snippet"):
