@@ -34,7 +34,9 @@ results) page metadata: a description plus a heading/JSON-LD table-of-contents
 outline, so the model can decide which links are worth fetching in full.
 `time_range` accepts `day`/`week`/`month`/`year`/`all`; `category` accepts
 SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
-`videos`, `images`, `music`, `files`, `map`, comma-separated to combine).
+`videos`, `map`, comma-separated to combine). Video searches use
+SearXNG's YouTube engine and discard non-YouTube URLs, because `fetch_page` can
+only read transcripts from YouTube video results.
 `enrich_results` controls how many top results get full page metadata (`0`
 skips enrichment). `page` is a 1-based result page; use `page=2` with the same
 query to get the next batch before reformulating.
