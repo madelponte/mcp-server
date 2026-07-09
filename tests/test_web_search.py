@@ -7,7 +7,14 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 import tools.web_search as ws
-from tools.web_search import _clamp_count, _searxng_query, _enrich_result
+from tools.web_search import (
+    _category_includes_videos,
+    _clamp_count,
+    _enrich_result,
+    _is_youtube_result_url,
+    _searxng_query,
+    _youtube_engine_query,
+)
 from conftest import run
 
 
@@ -36,6 +43,25 @@ def test_clamp_count_below_minimum():
 
 def test_clamp_count_invalid_uses_max():
     assert _clamp_count("abc", 5, minimum=1) == 5
+
+
+def test_category_includes_videos():
+    assert _category_includes_videos("general,videos") is True
+    assert _category_includes_videos("Videos") is True
+    assert _category_includes_videos("general,images") is False
+
+
+def test_youtube_engine_query():
+    assert _youtube_engine_query("python talks") == "!yt python talks"
+    assert _youtube_engine_query("!yt python talks") == "!yt python talks"
+    assert _youtube_engine_query("!youtube python talks") == "!youtube python talks"
+
+
+def test_is_youtube_result_url():
+    assert _is_youtube_result_url("https://www.youtube.com/watch?v=abc12345678") is True
+    assert _is_youtube_result_url("https://youtu.be/abc12345678") is True
+    assert _is_youtube_result_url("https://notyoutube.com/watch?v=abc12345678") is False
+    assert _is_youtube_result_url("https://peer.tube/w/abc") is False
 
 
 # --------------------------- _searxng_query (async, mocked) ---------------------------
@@ -197,6 +223,25 @@ def test_search_web_happy_path_no_enrich(monkeypatch, tool_fns):
     assert out["results"][0]["url"] == "https://a.com"
     # No enrichment requested -> no page metadata fields.
     assert "page_title" not in out["results"][0]
+
+
+def test_search_web_videos_category_restricts_query_to_youtube(monkeypatch, tool_fns):
+    seen = {}
+
+    async def fake_query(**kwargs):
+        seen.update(kwargs)
+        return [
+            {"url": "https://www.youtube.com/watch?v=abc12345678", "title": "A", "snippet": "s"},
+            {"url": "https://peer.tube/w/abc", "title": "B", "snippet": "s"},
+        ]
+
+    monkeypatch.setattr(ws, "_searxng_query", fake_query)
+    fn = tool_fns["search_web"]
+    out = json.loads(run(fn(query="python talks", category="videos", enrich_results=0)))
+    assert seen["query"] == "!yt python talks"
+    assert out["query"] == "python talks"
+    assert out["category"] == "videos"
+    assert [r["url"] for r in out["results"]] == ["https://www.youtube.com/watch?v=abc12345678"]
 
 
 def test_search_web_enriches_top_results(monkeypatch, tool_fns):
