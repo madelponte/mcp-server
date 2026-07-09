@@ -159,8 +159,10 @@ which helps smaller models avoid tool-selection paralysis.
 — Find points of interest near a location via OpenStreetMap
 [Overpass](https://overpass-api.de/). Specify the location either as `near` (a
 place name, geocoded for you via [Nominatim](https://nominatim.org/) — so "vegan
-restaurants in Portland" is a single call) or as explicit `latitude`/`longitude`
-(which win if both are given). `category` is plain language, not OSM tags:
+restaurants in Portland" is a single call), as `near="lat,lon"`, as a map URL
+containing coordinates, as an OpenStreetMap node/way/relation URL, or as
+explicit `latitude`/`longitude` (which win if both are given). `category` is
+plain language, not OSM tags:
 `restaurant`, `coffee`, `pharmacy`, `atm`, `hotel`, `museum`, `gas station`, etc.
 A food category can be prefixed with a diet — `vegan`, `vegetarian`, `halal`,
 `kosher`, or `gluten free` (`"vegan restaurant"`, or just `"vegan"`). An
@@ -172,7 +174,8 @@ Set `include_nearby_towns=true` to include nearby city/town/village centers that
 can seed follow-up searches in neighboring municipalities.
 
 Set `place_details=true` to look up rich information about the place named in
-`near` instead of searching for POIs around it. That mode returns coordinates,
+`near` or at the supplied coordinates instead of searching for POIs around it.
+That mode returns coordinates,
 bounding box, address details, population when available, Wikidata/Wikipedia
 links, website, phone, and alternatives; it ignores `category`, `radius_m`, and
 `limit`.

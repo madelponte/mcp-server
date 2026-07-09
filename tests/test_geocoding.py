@@ -15,6 +15,8 @@ from tools.geocoding import (
     _parse_population,
     _parse_bbox,
     _parse_float,
+    _parse_coordinates,
+    _parse_osm_object_url,
     _format_place,
     _is_relative_location,
     _geocode,
@@ -201,6 +203,39 @@ def test_format_place_minimal_entry():
     assert out == {"name": "X", "latitude": 1.0, "longitude": 2.0}
 
 
+# --------------------------- _parse_coordinates ---------------------------
+
+def test_parse_coordinates_plain_text():
+    assert _parse_coordinates("45.515118,-122.679485") == (45.515118, -122.679485)
+    assert _parse_coordinates("45.515118 -122.679485") == (45.515118, -122.679485)
+
+
+def test_parse_coordinates_map_urls():
+    apple = "https://maps.apple.com/place?ll=45.515118%2C-122.679485"
+    osm = "https://openstreetmap.org/#map=18/45.5044526/-122.5494963"
+    assert _parse_coordinates(apple) == (45.515118, -122.679485)
+    assert _parse_coordinates(osm) == (45.5044526, -122.5494963)
+
+
+def test_parse_coordinates_rejects_invalid_ranges():
+    assert _parse_coordinates("123.0,-122.0") is None
+    assert _parse_coordinates("45.0,-222.0") is None
+    assert _parse_coordinates("Portland, OR") is None
+
+
+def test_parse_osm_object_url():
+    assert _parse_osm_object_url("https://openstreetmap.org/node/13252567900") == (
+        "N", "13252567900"
+    )
+    assert _parse_osm_object_url("https://www.openstreetmap.org/way/5013364") == (
+        "W", "5013364"
+    )
+    assert _parse_osm_object_url("https://openstreetmap.org/relation/7444") == (
+        "R", "7444"
+    )
+    assert _parse_osm_object_url("https://example.com/node/13252567900") is None
+
+
 # --------------------------- _is_relative_location ---------------------------
 
 @pytest.mark.parametrize("near", ["me", "here", "near me", "around here", "my location", "MY LOCATION"])
@@ -352,6 +387,37 @@ def test_find_nearby_places_place_details_happy_path(monkeypatch, tool_fns):
     assert out["place"]["population"] == 650000
 
 
+def test_find_nearby_places_place_details_accepts_coordinates(monkeypatch, tool_fns):
+    import json as _json
+
+    async def fake_reverse_geocode(lat, lon, detailed=False):
+        return {"name": "Downtown Portland", "latitude": lat, "longitude": lon,
+                "category": "place", "type": "neighbourhood",
+                "address": {"city": "Portland"}, "extratags": {}, "namedetails": {}}
+
+    monkeypatch.setattr(geo, "_reverse_geocode", fake_reverse_geocode)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(near="45.515118,-122.679485", place_details=True)))
+    assert out["query"] == "45.5151180,-122.6794850"
+    assert out["place"]["name"] == "Downtown Portland"
+
+
+def test_find_nearby_places_place_details_accepts_osm_url(monkeypatch, tool_fns):
+    import json as _json
+
+    async def fake_lookup_osm_object(osm_type, osm_id, detailed=False):
+        assert (osm_type, osm_id, detailed) == ("W", "5013364", True)
+        return {"name": "Eiffel Tower", "latitude": 48.8582637, "longitude": 2.2942401,
+                "category": "tourism", "type": "attraction",
+                "address": {"city": "Paris"}, "extratags": {}, "namedetails": {}}
+
+    monkeypatch.setattr(geo, "_lookup_osm_object", fake_lookup_osm_object)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(near="https://openstreetmap.org/way/5013364", place_details=True)))
+    assert out["query"] == "W5013364"
+    assert out["place"]["name"] == "Eiffel Tower"
+
+
 def test_find_nearby_places_place_details_requires_near(tool_fns):
     fn = tool_fns["find_nearby_places"]
     with pytest.raises(ToolError) as exc:
@@ -488,6 +554,56 @@ def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
     # Results are sorted nearest-first.
     assert out["results"][0]["name"] == "Near Cafe"
     assert out["results"][0]["distance_m"] <= out["results"][1]["distance_m"]
+
+
+def test_find_nearby_places_accepts_coordinates_in_near(monkeypatch, tool_fns):
+    import json as _json
+
+    captured = {}
+
+    async def fake_overpass(query_ql):
+        captured["ql"] = query_ql
+        return [
+            {"type": "node", "lat": 45.5150268, "lon": -122.6799045,
+             "tags": {"name": "Starbucks", "amenity": "cafe"}},
+        ]
+
+    monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(
+        category="coffee",
+        near="https://maps.apple.com/place?ll=45.515118%2C-122.679485",
+        radius_m=1000,
+    )))
+    assert out["center"]["latitude"] == 45.515118
+    assert out["center"]["longitude"] == -122.679485
+    assert "(around:1000,45.5151180,-122.6794850)" in captured["ql"]
+
+
+def test_find_nearby_places_accepts_osm_url_as_center(monkeypatch, tool_fns):
+    import json as _json
+
+    async def fake_lookup_osm_object(osm_type, osm_id, detailed=False):
+        assert (osm_type, osm_id, detailed) == ("N", "13252567900", False)
+        return {"name": "Portland Lux Coffee", "latitude": 45.5044526,
+                "longitude": -122.5494963}
+
+    captured = {}
+
+    async def fake_overpass(query_ql):
+        captured["ql"] = query_ql
+        return []
+
+    monkeypatch.setattr(geo, "_lookup_osm_object", fake_lookup_osm_object)
+    monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(
+        category="coffee",
+        near="https://openstreetmap.org/node/13252567900",
+        radius_m=1000,
+    )))
+    assert out["center"]["name"] == "Portland Lux Coffee"
+    assert "(around:1000,45.5044526,-122.5494963)" in captured["ql"]
 
 
 def test_find_nearby_places_clamps_radius(monkeypatch, tool_fns):

@@ -4,14 +4,15 @@ Place Search MCP tool (OpenStreetMap).
 Exposes a single tool, ``find_nearby_places(category, near=None, latitude=None,
 longitude=None, radius_m=None, limit=None)``, which finds nearby points of
 interest (restaurants, cafes, pharmacies, ATMs, …) via **Overpass**. ``near``
-accepts a place name that is geocoded internally via **Nominatim**, so a query
-like "vegan restaurants in Portland" needs only one tool call; alternatively the
-caller passes explicit ``latitude``/``longitude``.
+accepts a place name that is geocoded internally via **Nominatim**, a coordinate
+string, a map URL with coordinates, an OpenStreetMap object URL, or the caller
+can pass explicit ``latitude`` / ``longitude``.
 
 Passing ``place_details=True`` switches the tool into a place-lookup mode: rather
 than searching for POIs, it returns rich structured info *about* the place named
-in ``near`` (coordinates, bounding box, address breakdown, population, wikidata/
-wikipedia links, website) — the "where/what is X" question.
+in ``near`` or at the supplied coordinates (coordinates, bounding box, address
+breakdown, population, wikidata/wikipedia links, website) — the "where/what is
+X" question.
 
 By default it uses the public OpenStreetMap APIs. Set ``GEO_NOMINATIM_URL`` /
 ``GEO_OVERPASS_URL`` to self-host. Nominatim's usage policy (a descriptive
@@ -24,6 +25,7 @@ import re
 import time
 import asyncio
 from typing import Annotated
+from urllib.parse import parse_qs, unquote, urlparse
 
 import anyio
 import httpx
@@ -347,6 +349,68 @@ def _parse_float(value) -> float | None:
         return None
 
 
+def _valid_lat_lon(lat: float, lon: float) -> bool:
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+
+def _parse_coordinates(text: str | None) -> tuple[float, float] | None:
+    """Extract latitude/longitude from plain text or common map URLs.
+
+    Supports values a model is likely to lift from map search results:
+    ``45.515118,-122.679485``, ``45.515118 -122.679485``, Apple Maps ``ll=``,
+    and OpenStreetMap ``#map=zoom/lat/lon`` fragments.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    parsed = urlparse(raw)
+    query = parse_qs(parsed.query)
+    for key in ("ll", "sll"):
+        values = query.get(key)
+        if values:
+            coords = _parse_coordinates(values[0])
+            if coords:
+                return coords
+
+    fragment = unquote(parsed.fragment or "")
+    match = re.search(
+        r"(?:^|/)map=\d+(?:\.\d+)?/([-+]?\d+(?:\.\d+)?)/([-+]?\d+(?:\.\d+)?)",
+        fragment,
+    )
+    if match:
+        lat, lon = float(match.group(1)), float(match.group(2))
+        if _valid_lat_lon(lat, lon):
+            return lat, lon
+
+    match = re.search(
+        r"(?<![-+\d.])([-+]?\d+(?:\.\d+)?)\s*[,/ ]\s*([-+]?\d+(?:\.\d+)?)(?![\d.])",
+        raw,
+    )
+    if not match:
+        return None
+    lat, lon = float(match.group(1)), float(match.group(2))
+    if _valid_lat_lon(lat, lon):
+        return lat, lon
+    return None
+
+
+def _parse_osm_object_url(text: str | None) -> tuple[str, str] | None:
+    """Extract a Nominatim lookup id from openstreetmap.org node/way/relation URLs."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host not in {"openstreetmap.org", "www.openstreetmap.org"}:
+        return None
+    match = re.search(r"/(node|way|relation)/(\d+)(?:/|$)", parsed.path)
+    if not match:
+        return None
+    prefix = {"node": "N", "way": "W", "relation": "R"}[match.group(1)]
+    return prefix, match.group(2)
+
+
 def _format_place(entry: dict) -> dict:
     """Build the rich place-details payload from a detailed `_geocode` entry.
 
@@ -470,6 +534,172 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
     return results
 
 
+async def _reverse_geocode(lat: float, lon: float, detailed: bool = False) -> dict:
+    """Reverse-geocode coordinates via Nominatim."""
+    if not _valid_lat_lon(lat, lon):
+        raise ToolError(
+            f"Invalid coordinates: latitude {lat!r}, longitude {lon!r}. "
+            "Latitude must be -90..90 and longitude -180..180."
+        )
+
+    cache_key = "reverse_geocode\x00" + "\x00".join(
+        (f"{lat:.7f}", f"{lon:.7f}", cfg.language, "d" if detailed else "")
+    )
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "lat": f"{lat:.7f}",
+        "lon": f"{lon:.7f}",
+        "format": "jsonv2",
+        "addressdetails": 1,
+    }
+    if detailed:
+        params["extratags"] = 1
+        params["namedetails"] = 1
+    if cfg.nominatim_email.strip():
+        params["email"] = cfg.nominatim_email.strip()
+
+    url = cfg.nominatim_url.rstrip("/") + "/reverse"
+    headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
+
+    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
+    try:
+        client = _http_client()
+        resp = await client.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=cfg.http_timeout_seconds,
+        )
+    except httpx.TimeoutException:
+        raise ToolError(
+            f"Reverse geocoding request timed out after {cfg.http_timeout_seconds}s."
+        )
+    except httpx.HTTPError as exc:
+        raise ToolError(f"Network error contacting the geocoder: {exc}")
+
+    if resp.status_code == 429:
+        raise ToolError(
+            "The geocoder rate-limited the request (HTTP 429). The public "
+            "Nominatim API allows ~1 request/second; slow down or self-host."
+        )
+    if resp.status_code >= 400:
+        raise ToolError(
+            f"Geocoder error (HTTP {resp.status_code}): {resp.text[:200]}"
+        )
+
+    try:
+        item = resp.json()
+    except ValueError:
+        raise ToolError("Geocoder returned a non-JSON response.")
+
+    if item.get("error"):
+        raise ToolError(f"Could not reverse-geocode {lat:.7f}, {lon:.7f}: {item['error']}")
+
+    entry = {
+        "name": item.get("display_name"),
+        "latitude": _parse_float(item.get("lat")) or lat,
+        "longitude": _parse_float(item.get("lon")) or lon,
+        "category": item.get("category") or item.get("class"),
+        "type": item.get("type"),
+        "address": item.get("address"),
+    }
+    if detailed:
+        entry["bounding_box"] = _parse_bbox(item.get("boundingbox"))
+        entry["extratags"] = item.get("extratags") or {}
+        entry["namedetails"] = item.get("namedetails") or {}
+        entry["importance"] = item.get("importance")
+        entry["osm_type"] = item.get("osm_type")
+        entry["osm_id"] = item.get("osm_id")
+
+    _cache.set(cache_key, entry)
+    return entry
+
+
+async def _lookup_osm_object(osm_type: str, osm_id: str, detailed: bool = False) -> dict:
+    """Look up one OSM node/way/relation through Nominatim's lookup endpoint."""
+    osm_ref = f"{osm_type}{osm_id}"
+    cache_key = "lookup_osm_object\x00" + "\x00".join(
+        (osm_ref, cfg.language, "d" if detailed else "")
+    )
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "osm_ids": osm_ref,
+        "format": "jsonv2",
+        "addressdetails": 1,
+    }
+    if detailed:
+        params["extratags"] = 1
+        params["namedetails"] = 1
+    if cfg.nominatim_email.strip():
+        params["email"] = cfg.nominatim_email.strip()
+
+    url = cfg.nominatim_url.rstrip("/") + "/lookup"
+    headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
+
+    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
+    try:
+        client = _http_client()
+        resp = await client.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=cfg.http_timeout_seconds,
+        )
+    except httpx.TimeoutException:
+        raise ToolError(f"OSM object lookup timed out after {cfg.http_timeout_seconds}s.")
+    except httpx.HTTPError as exc:
+        raise ToolError(f"Network error contacting the geocoder: {exc}")
+
+    if resp.status_code == 429:
+        raise ToolError(
+            "The geocoder rate-limited the request (HTTP 429). The public "
+            "Nominatim API allows ~1 request/second; slow down or self-host."
+        )
+    if resp.status_code >= 400:
+        raise ToolError(
+            f"Geocoder error (HTTP {resp.status_code}): {resp.text[:200]}"
+        )
+
+    try:
+        data = resp.json()
+    except ValueError:
+        raise ToolError("Geocoder returned a non-JSON response.")
+
+    if not data:
+        raise ToolError(f"Could not find OpenStreetMap object {osm_ref}.")
+    item = data[0]
+    try:
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+    except (KeyError, TypeError, ValueError):
+        raise ToolError(f"OpenStreetMap object {osm_ref} did not include coordinates.")
+
+    entry = {
+        "name": item.get("display_name"),
+        "latitude": lat,
+        "longitude": lon,
+        "category": item.get("category") or item.get("class"),
+        "type": item.get("type"),
+        "address": item.get("address"),
+    }
+    if detailed:
+        entry["bounding_box"] = _parse_bbox(item.get("boundingbox"))
+        entry["extratags"] = item.get("extratags") or {}
+        entry["namedetails"] = item.get("namedetails") or {}
+        entry["importance"] = item.get("importance")
+        entry["osm_type"] = item.get("osm_type")
+        entry["osm_id"] = item.get("osm_id")
+
+    _cache.set(cache_key, entry)
+    return entry
+
+
 async def _place_lookup(query: str) -> dict:
     """Resolve a place name/address to rich structured info (the top match) plus
     a few lighter alternatives. Raises ToolError when nothing matches."""
@@ -492,6 +722,16 @@ async def _place_lookup(query: str) -> dict:
     if alternatives:
         payload["alternatives"] = alternatives
     return payload
+
+
+async def _place_lookup_coords(lat: float, lon: float) -> dict:
+    entry = await _reverse_geocode(lat, lon, detailed=True)
+    return {"query": f"{lat:.7f},{lon:.7f}", "place": _format_place(entry)}
+
+
+async def _place_lookup_osm_object(osm_type: str, osm_id: str) -> dict:
+    entry = await _lookup_osm_object(osm_type, osm_id, detailed=True)
+    return {"query": f"{osm_type}{osm_id}", "place": _format_place(entry)}
 
 
 # -------------------------------- Overpass -------------------------------
@@ -631,15 +871,18 @@ _PLACE_RETURN_SCHEMA = (
 def register(mcp: FastMCP) -> None:
     description = (
         "Find places via OpenStreetMap. Default: search POIs of `category` near a "
-        'location — near="city/address" OR latitude+longitude (no "near me"; ask '
-        "the user). category is plain language (restaurant, coffee, pharmacy, atm, "
+        'location — near="city/address", near="lat,lon", map URL with coords, '
+        "OpenStreetMap node/way/relation URL, OR latitude+longitude (no "
+        '"near me"; ask the user). category is plain language (restaurant, coffee, '
+        "pharmacy, atm, "
         "hotel, park, gym, …); prefix food with a diet (vegan/vegetarian/halal/"
         'kosher/gluten-free); unknown words match names ("Starbucks"). '
         f"include_nearby_towns=true also lists towns within {cfg.nearby_towns_radius_m} m "
         "to recenter a follow-up search.\n"
         "place_details=true: ignore category/radius/limit and return rich info "
-        "ABOUT the place in `near` (coords, bounding box, address, population, "
-        "wikidata/wikipedia, website) — answers 'where/what is X'.\n"
+        "ABOUT the place in `near` or at latitude+longitude (coords, bounding "
+        "box, address, population, wikidata/wikipedia, website) — answers "
+        "'where/what is X'.\n"
         f"{_RETURN_SCHEMA}\n{_PLACE_RETURN_SCHEMA}"
     )
 
@@ -679,7 +922,7 @@ def register(mcp: FastMCP) -> None:
         the @mcp.tool(description=...) above (built with the live caps from cfg).
 
         :param category: What to find (plain language). Ignored when place_details=true.
-        :param near: Place/address (geocoded). Required when place_details=true.
+        :param near: Place/address (geocoded), "lat,lon", or map URL with coords.
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
         :param include_nearby_towns: Also return surrounding towns to recenter on.
@@ -700,14 +943,33 @@ def register(mcp: FastMCP) -> None:
             place_details=place_details,
         )
 
+        if (latitude is None) != (longitude is None):
+            raise ToolError("Provide both `latitude` and `longitude`, or neither.")
+
         # place_details mode: look up rich info ABOUT a place rather than POIs
-        # around it. Requires a name/address in `near` (this server has no user
-        # location, and coords-to-place reverse lookup is out of scope here).
+        # around it. Accepts a name/address or coordinates, including coordinates
+        # embedded in common map URLs returned by map search engines.
         if place_details:
+            coords = None
+            osm_object = None
+            if latitude is not None and longitude is not None:
+                coords = (float(latitude), float(longitude))
+            elif near and near.strip():
+                coords = _parse_coordinates(near)
+                osm_object = _parse_osm_object_url(near) if not coords else None
+
+            if coords:
+                payload = await _place_lookup_coords(*coords)
+                return log_result(log, "find_nearby_places", to_json(payload))
+            if osm_object:
+                payload = await _place_lookup_osm_object(*osm_object)
+                return log_result(log, "find_nearby_places", to_json(payload))
+
             if not (near and near.strip()):
                 raise ToolError(
-                    "place_details lookup needs a place name or address in `near` "
-                    "(e.g. 'Portland, OR' or 'Eiffel Tower')."
+                    "place_details lookup needs a place name/address in `near`, "
+                    "a coordinate string like '45.515,-122.679', or "
+                    "`latitude` and `longitude`."
                 )
             if _is_relative_location(near):
                 raise ToolError(
@@ -725,23 +987,37 @@ def register(mcp: FastMCP) -> None:
         center_name = None
         if latitude is not None and longitude is not None:
             lat, lon = float(latitude), float(longitude)
+            if not _valid_lat_lon(lat, lon):
+                raise ToolError(
+                    f"Invalid coordinates: latitude {lat!r}, longitude {lon!r}. "
+                    "Latitude must be -90..90 and longitude -180..180."
+                )
         elif near and near.strip():
-            if _is_relative_location(near):
+            coords = _parse_coordinates(near)
+            if coords:
+                lat, lon = coords
+            elif osm_object := _parse_osm_object_url(near):
+                match = await _lookup_osm_object(*osm_object)
+                lat = match["latitude"]
+                lon = match["longitude"]
+                center_name = match["name"]
+            elif _is_relative_location(near):
                 raise ToolError(
                     f"'{near.strip()}' is a relative location, and this server "
                     "has no access to the user's location. Ask the user which "
                     "place to search and pass it as `near` (e.g. 'Portland, OR'), "
                     "or pass `latitude` and `longitude` directly."
                 )
-            matches = await _geocode(near, 1)
-            if not matches:
-                raise ToolError(
-                    f"Could not find a location for '{near.strip()}'. Try a more "
-                    "specific place name, or pass latitude/longitude directly."
-                )
-            lat = matches[0]["latitude"]
-            lon = matches[0]["longitude"]
-            center_name = matches[0]["name"]
+            else:
+                matches = await _geocode(near, 1)
+                if not matches:
+                    raise ToolError(
+                        f"Could not find a location for '{near.strip()}'. Try a more "
+                        "specific place name, or pass latitude/longitude directly."
+                    )
+                lat = matches[0]["latitude"]
+                lon = matches[0]["longitude"]
+                center_name = matches[0]["name"]
         else:
             raise ToolError(
                 "No location given. Provide `near` (a place name) or both "
