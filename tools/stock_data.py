@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
@@ -284,21 +285,35 @@ def _filter_financials(result: dict | None, metrics: list[str]) -> dict | None:
 # responses are small and the TTL is short.
 _cache = TTLCache(cfg.cache_ttl_seconds)
 
-# A single shared Session so the many calls a multi-section request makes to the
-# same host (Finnhub's profile alone is two calls; FMP/Finnhub get hit 4-6 times
-# across sections) reuse one keep-alive connection pool instead of paying a fresh
-# TCP+TLS handshake each time. Section fetchers run in worker threads, but
-# urllib3's pool — and read-only use of the Session — is safe under that fan-out.
-_session = requests.Session()
-_session.headers.update({"User-Agent": "MCP-StockDataTool/1.0"})
+# requests.Session mutates cookie and connection state and is not thread-safe.
+# Keep one session per AnyIO worker thread: calls within a section still reuse
+# connections, while concurrently fetched sections never race on one Session.
+_http_state = threading.local()
+
+
+def _session_for_thread() -> requests.Session:
+    session = getattr(_http_state, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "MCP-StockDataTool/1.0"})
+        _http_state.session = session
+    return session
 
 
 def _http_get_json(url: str, params: dict | None = None) -> Any:
-    cache_key = f"GET::{url}::{json.dumps(params or {}, sort_keys=True)}"
+    # Credentials affect authorization, not the resource identity. Keeping them
+    # in a process-wide cache key needlessly retains secrets in memory and makes
+    # a key rotation miss otherwise reusable data.
+    cache_params = {
+        key: value
+        for key, value in (params or {}).items()
+        if key.lower() not in {"apikey", "api_key", "token"}
+    }
+    cache_key = f"GET::{url}::{json.dumps(cache_params, sort_keys=True)}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    resp = _session.get(url, params=params, timeout=cfg.request_timeout)
+    resp = _session_for_thread().get(url, params=params, timeout=cfg.request_timeout)
     resp.raise_for_status()
     data = resp.json()
     _cache.set(cache_key, data)

@@ -55,7 +55,9 @@ just that section of an HTML page instead of the whole thing. Passing a `query`
 (a keyword, phrase, or regex) returns only the matching passages plus surrounding
 context instead of the full page — useful for pulling one topic from a long
 article, document, or transcript; for YouTube, matched segments keep their
-`[M:SS]` timestamps. If a response is marked `truncated`, pass `offset` with the
+`[M:SS]` timestamps. Regex evaluation has a hard total time budget; a pattern
+that exceeds it raises a tool error instead of returning an incomplete scan. If
+a response is marked `truncated`, pass `offset` with the
 returned `next_offset` to read the next chunk; this works for HTML, documents,
 JSON, Reddit, and transcripts. A YouTube video URL returns the video's transcript
 rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).

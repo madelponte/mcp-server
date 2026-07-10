@@ -115,9 +115,24 @@ def _prepare_attachments(paths: list[str] | None) -> list[dict]:
         path = Path(str(raw or "").strip()).expanduser()
         if not str(path):
             continue
-        if not path.is_file():
-            raise ToolError(f"Attachment path is not a readable file: {path}")
-        size = path.stat().st_size
+        try:
+            if not path.is_file():
+                raise ToolError(f"Attachment path is not a readable file: {path}")
+            declared_size = path.stat().st_size
+            if declared_size > cfg.max_attachment_bytes:
+                raise ToolError(
+                    f"Attachment {path} is {declared_size} bytes, above the "
+                    f"{cfg.max_attachment_bytes}-byte per-file limit."
+                )
+            # Read at most one byte past the limit. The file can change between
+            # stat() and open(), so the metadata check alone is not a memory cap.
+            with path.open("rb") as stream:
+                data = stream.read(cfg.max_attachment_bytes + 1)
+        except ToolError:
+            raise
+        except OSError as exc:
+            raise ToolError(f"Attachment path is not a readable file: {path}: {exc}")
+        size = len(data)
         if size > cfg.max_attachment_bytes:
             raise ToolError(
                 f"Attachment {path} is {size} bytes, above the "
@@ -133,7 +148,7 @@ def _prepare_attachments(paths: list[str] | None) -> list[dict]:
                 "size_bytes": size,
                 "maintype": maintype,
                 "subtype": subtype,
-                "data": path.read_bytes(),
+                "data": data,
             }
         )
     return prepared
@@ -166,6 +181,27 @@ def _build_message(
             filename=att["filename"],
         )
     return msg
+
+
+def _prepare_message(
+    to_recipients: list[str],
+    cc_recipients: list[str],
+    subject: str,
+    body: str,
+    reply_to: str | None,
+    attachment_paths: list[str] | None,
+) -> tuple[list[dict], EmailMessage]:
+    """Read attachments and build MIME content outside the async event loop."""
+    attachments = _prepare_attachments(attachment_paths)
+    message = _build_message(
+        to_recipients,
+        cc_recipients,
+        subject,
+        body,
+        reply_to=reply_to,
+        attachments=attachments,
+    )
+    return attachments, message
 
 
 def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
@@ -271,6 +307,8 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("`bcc` must be a list of email addresses when provided.")
         if not (subject or "").strip():
             raise ToolError("`subject` must not be empty.")
+        if "\r" in subject or "\n" in subject:
+            raise ToolError("`subject` must not contain newline characters.")
         if not (body or "").strip():
             raise ToolError("`body` must not be empty.")
 
@@ -319,16 +357,22 @@ def register(mcp: FastMCP) -> None:
         bcc_final = _recipient_addresses(entries, "bcc")
         envelope_recipients = [e["address"] for e in entries]
 
-        prepared_attachments = _prepare_attachments(attachments)
-
-        msg = _build_message(
-            to_final,
-            cc_final,
-            subject,
-            body,
-            reply_to=reply_to,
-            attachments=prepared_attachments,
-        )
+        try:
+            prepared_attachments, msg = await anyio.to_thread.run_sync(
+                _prepare_message,
+                to_final,
+                cc_final,
+                subject,
+                body,
+                reply_to,
+                attachments,
+            )
+        except ToolError:
+            raise
+        except (TypeError, ValueError) as exc:
+            # EmailMessage rejects newline-bearing headers and other malformed
+            # values. Surface that as a tool failure instead of an internal error.
+            raise ToolError(f"Invalid email header value: {exc}")
 
         try:
             refused_raw = await anyio.to_thread.run_sync(_send, msg, envelope_recipients)
