@@ -30,6 +30,7 @@ from youtube_transcript_api._errors import (
 
 from config import youtube_settings as cfg
 from .cache import TTLCache
+from .serialize import redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -264,4 +265,9 @@ async def fetch_transcript(
             "YOUTUBE_HTTP_PROXY_URL environment variables to work around it."
         )
     except Exception as exc:
-        raise ToolError(f"Error fetching transcript: {type(exc).__name__}: {exc}")
+        detail = redact_secrets(
+            exc,
+            cfg.webshare_proxy_password,
+            cfg.http_proxy_url,
+        )
+        raise ToolError(f"Error fetching transcript: {type(exc).__name__}: {detail}")

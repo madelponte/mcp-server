@@ -184,6 +184,15 @@ class WebSearchSettings(BaseSettings):
     cache_max_entries: int = Field(
         128, description="Max number of cached pages before the oldest is evicted (0 = unbounded)."
     )
+    cache_max_item_bytes: int = Field(
+        5242880,  # 5 MiB
+        description=(
+            "Maximum size of one raw fetched page retained in the process cache "
+            "(0 = unbounded). Larger pages are still returned normally but are "
+            "not cached, preventing a handful of large downloads from exhausting "
+            "memory before the entry-count limit is reached."
+        ),
+    )
 
     markdown: bool = Field(
         True,

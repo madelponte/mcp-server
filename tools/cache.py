@@ -32,6 +32,15 @@ class TTLCache:
         self._data: "OrderedDict[str, tuple[float, Any]]" = OrderedDict()
         self._lock = RLock()
 
+    def _prune_expired(self, now: float) -> None:
+        """Remove expired entries so an unbounded cache does not retain them."""
+        expired = [
+            key for key, (timestamp, _) in self._data.items()
+            if now - timestamp > self.ttl
+        ]
+        for key in expired:
+            self._data.pop(key, None)
+
     def get(self, key: str) -> Any | None:
         """Return the cached value, or None if absent, expired, or caching is off.
 
@@ -45,7 +54,7 @@ class TTLCache:
             if entry is None:
                 return None
             ts, value = entry
-            if time.time() - ts > self.ttl:
+            if time.monotonic() - ts > self.ttl:
                 self._data.pop(key, None)
                 return None
             self._data.move_to_end(key)
@@ -56,7 +65,9 @@ class TTLCache:
         if self.ttl <= 0:
             return
         with self._lock:
-            self._data[key] = (time.time(), value)
+            now = time.monotonic()
+            self._prune_expired(now)
+            self._data[key] = (now, value)
             self._data.move_to_end(key)
             if self.max_entries > 0:
                 while len(self._data) > self.max_entries:

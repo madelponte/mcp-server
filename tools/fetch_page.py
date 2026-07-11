@@ -25,12 +25,13 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 import anyio
+import regex as safe_regex
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
 from config import web_search_settings as cfg, server_settings
-from .serialize import to_json, log_call, log_result, debug_enabled
+from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     _cached_resilient_fetch,
@@ -107,7 +108,7 @@ def _fetch_page_desc(prefix: str) -> str:
 
 # Statuses that mean the URL itself is gone/unavailable rather than bot-walled:
 # 404 (not found), 410 (gone), 451 (unavailable for legal reasons). On these,
-# fetch_page tries the Wayback Machine before returning the live error page, since
+# fetch_page tries the Wayback Machine before raising the live HTTP error, since
 # archive.org may still hold the original content. (Block/throttle statuses are
 # handled separately by `_is_blocked_response`, not here.)
 _GONE_STATUSES = {404, 410, 451}
@@ -181,12 +182,13 @@ def _set_content(
 
 # ReDoS guard. The model's `query` is compiled as arbitrary regex and run over
 # every segment of a page, so a pathological pattern (catastrophic backtracking)
-# against a long page could pin the CPU and — since the server is single-process
-# — stall every other in-flight tool call. Two bounds keep that in check:
+# against a long page could pin the CPU. Three bounds keep that in check:
 #   * patterns that are over-long or contain a classically dangerous shape are
 #     refused as regex and matched as a literal substring instead (see
 #     `_compile_query`), and
-#   * the per-call scan is given a wall-clock budget (see `_extract_matches`).
+#   * every `regex` search receives the remaining per-call wall-clock budget, so
+#     even one pathological segment is interrupted inside the engine, and
+#   * exhausting that budget raises rather than returning incomplete results.
 # The matching itself is also offloaded to a worker thread (`_query_payload`),
 # consistent with the sync-in-async convention.
 _MAX_REGEX_QUERY_CHARS = 200
@@ -197,17 +199,21 @@ _MAX_REGEX_QUERY_CHARS = 200
 # exponential match.
 _NESTED_QUANTIFIER_RE = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]")
 
-# Wall-clock budget for a single query's scan over a page's segments. A bound on
-# total matching work even when no individual pattern is pathological (e.g. a
-# very long page); on hitting it we return the matches found so far.
+# Wall-clock budget for a single query's complete scan over a page's segments.
+# Each search receives only the remaining time, so the bound covers one
+# catastrophic match as well as cumulative work across a long page.
 _QUERY_MATCH_BUDGET_SECONDS = 2.0
 
 
-def _compile_query(query: str) -> re.Pattern:
+class QueryMatchTimeoutError(RuntimeError):
+    """A model-supplied query exhausted its total regex matching budget."""
+
+
+def _compile_query(query: str):
     """Compile the model's `query` into a case-insensitive pattern.
 
     The query may be a plain keyword/phrase or a regular expression. It is matched
-    as a literal substring (via ``re.escape``) when it is not valid regex (e.g.
+    as a literal substring (via ``regex.escape``) when it is not valid regex (e.g.
     unbalanced brackets in `cost (usd)`), or when it trips the ReDoS guard — too
     long, or containing a nested-quantifier shape prone to catastrophic
     backtracking — so a naive query still works while a dangerous one can't stall
@@ -215,10 +221,10 @@ def _compile_query(query: str) -> re.Pattern:
     """
     if len(query) <= _MAX_REGEX_QUERY_CHARS and not _NESTED_QUANTIFIER_RE.search(query):
         try:
-            return re.compile(query, re.IGNORECASE)
-        except re.error:
+            return safe_regex.compile(query, safe_regex.IGNORECASE)
+        except safe_regex.error:
             pass
-    return re.compile(re.escape(query), re.IGNORECASE)
+    return safe_regex.compile(safe_regex.escape(query), safe_regex.IGNORECASE)
 
 
 def _segment_text(text: str) -> list[str]:
@@ -249,18 +255,24 @@ def _extract_matches(
         return [], 0, 0
 
     pattern = _compile_query(query)
-    # Scan under a wall-clock budget: if matching is taking too long (a long page,
-    # or a query that slipped past the compile-time guard), stop and use what we
-    # have rather than block the single-process server. The literal/nested-
-    # quantifier guard in `_compile_query` prevents a single segment from blowing
-    # up; this bounds the total across many segments.
+    # Give every search only the time remaining in the shared budget. Unlike a
+    # deadline check after `re.search`, `regex` can interrupt catastrophic
+    # backtracking within a single segment. Never return partial scan results.
     deadline = time.monotonic() + _QUERY_MATCH_BUDGET_SECONDS
     match_idxs = []
     for i, seg in enumerate(segments):
-        if pattern.search(seg):
-            match_idxs.append(i)
-        if time.monotonic() > deadline:
-            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise QueryMatchTimeoutError(
+                f"Query matching exceeded {_QUERY_MATCH_BUDGET_SECONDS:g} seconds."
+            )
+        try:
+            if pattern.search(seg, timeout=remaining):
+                match_idxs.append(i)
+        except TimeoutError as exc:
+            raise QueryMatchTimeoutError(
+                f"Query matching exceeded {_QUERY_MATCH_BUDGET_SECONDS:g} seconds."
+            ) from exc
     if not match_idxs:
         return [], 0, 0
 
@@ -307,15 +319,21 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
     The regex matching runs in a worker thread (sync-in-async convention) so a
     slow scan can't block the event loop along with every other in-flight call.
     """
-    windows, match_count, total_windows = await anyio.to_thread.run_sync(
-        partial(
-            _extract_matches,
-            text,
-            query,
-            context=cfg.query_context_segments,
-            max_windows=cfg.max_query_matches,
+    try:
+        windows, match_count, total_windows = await anyio.to_thread.run_sync(
+            partial(
+                _extract_matches,
+                text,
+                query,
+                context=cfg.query_context_segments,
+                max_windows=cfg.max_query_matches,
+            )
         )
-    )
+    except QueryMatchTimeoutError:
+        raise ToolError(
+            f"Query regex {query!r} took too long to evaluate on {url}. "
+            "Use a simpler regex or a literal keyword/phrase."
+        )
     if not windows:
         raise ToolError(
             f"No {kind} matching query {query!r} found on {url}. "
@@ -740,7 +758,13 @@ async def _fetch_one(
     try:
         fetched = await _cached_resilient_fetch(fetch_url)
     except Exception as e:
-        raise ToolError(f"Fetch failed for {fetch_url}: {e}")
+        backend_passwords = tuple(
+            urlparse(endpoint).password or ""
+            for endpoint in (cfg.flaresolverr_url, cfg.tika_url)
+            if endpoint
+        )
+        detail = redact_secrets(e, *backend_passwords)
+        raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
@@ -795,10 +819,8 @@ async def _fetch_one(
         )
 
     # A dead/removed/legally-unavailable URL (404 Gone-style, 410, 451): the live
-    # page is no longer there, but archive.org very likely still holds the
-    # original article. Try the Wayback Machine before falling through to return
-    # the (error) page body as if it were content. Skipped when Wayback finds
-    # nothing usable, in which case the normal handling below runs as before.
+    # page is no longer there, but archive.org may still hold the original.
+    # Try that recovery before applying the consistent HTTP-error rule below.
     if status in _GONE_STATUSES and cfg.wayback_fallback:
         wb = await _wayback_content(fetch_url)
         if wb:
@@ -806,6 +828,21 @@ async def _fetch_one(
                 url, fetch_url, wb, query=query, offset=offset,
                 reason=f"The live page is unavailable (HTTP {status})",
             )
+
+    # Never return an HTTP error document as page content. Besides violating the
+    # tool's error contract, doing so lets a CDN/proxy error page masquerade as
+    # the requested article, JSON payload, or document. Gone statuses get the
+    # archive recovery attempt above; all unrecovered 4xx/5xx responses fail here.
+    if status is not None and status >= 400:
+        archive_detail = (
+            " No usable archived snapshot was found."
+            if status in _GONE_STATUSES and cfg.wayback_fallback
+            else ""
+        )
+        raise ToolError(
+            f"{fetch_url} returned HTTP {status}; page content was not returned."
+            f"{archive_detail}"
+        )
 
     # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
     # routed to Apache Tika and returned as plain text, regardless of the
@@ -818,30 +855,19 @@ async def _fetch_one(
             body = fetched["text"].encode("utf-8", errors="replace")
         if not body:
             raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
-        # Guard against an error/challenge page masquerading as the document: a
-        # genuine document endpoint answers 200 with the document's bytes. When
-        # the only reason we're here is the URL's extension (e.g. ".../x.pdf"),
-        # the server returned an HTTP error, and the body is HTML that doesn't
-        # carry a document's magic bytes, it's an error page (a 403 bot wall, a
-        # "not found" stub) — extracting it would dress a failure up as document
-        # text, the exact thing the error convention forbids. Raise instead.
-        if (
-            status
-            and status >= 400
-            and "html" in ctype
-            and not _sniff_document_bytes(body)
-        ):
-            raise ToolError(
-                f"{fetch_url} returned HTTP {status} with an HTML error page, not "
-                "the expected document. The document could not be retrieved."
+        try:
+            extracted = await asyncio.to_thread(
+                _tika_extract,
+                body,
+                cfg.tika_url,
+                timeout=cfg.tika_timeout_seconds,
+                ocr_strategy=cfg.tika_ocr_strategy,
+                max_output_bytes=cfg.max_download_bytes,
             )
-        extracted = await asyncio.to_thread(
-            _tika_extract,
-            body,
-            cfg.tika_url,
-            timeout=cfg.tika_timeout_seconds,
-            ocr_strategy=cfg.tika_ocr_strategy,
-        )
+        except Exception as exc:
+            tika_password = urlparse(cfg.tika_url).password or ""
+            detail = redact_secrets(exc, tika_password)
+            raise ToolError(f"Document extraction failed for {fetch_url}: {detail}")
         doc_payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),

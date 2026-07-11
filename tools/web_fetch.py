@@ -13,6 +13,7 @@ each caller formats it for its own needs.
 import asyncio
 import codecs
 import ipaddress
+import json
 import logging
 import re
 import socket
@@ -54,6 +55,20 @@ _enrich_inflight: dict[str, asyncio.Task] = {}
 # reopening it each time — while per-request headers/timeout still vary per call.
 # Built lazily so tests that patch `httpx.AsyncClient` are still honored.
 _fetch_clients: dict[bool, httpx.AsyncClient] = {}
+
+
+def _cache_page(url: str, fetched: dict) -> None:
+    """Cache a raw fetch only when one entry cannot dominate process memory."""
+    limit = cfg.cache_max_item_bytes
+    if limit > 0:
+        body = fetched.get("bytes")
+        if body is not None:
+            size = len(body)
+        else:
+            size = len((fetched.get("text") or "").encode("utf-8"))
+        if size > limit:
+            return
+    _page_cache.set(url, fetched)
 
 
 def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
@@ -372,6 +387,7 @@ def _tika_extract(
     *,
     timeout: float = 90.0,
     ocr_strategy: str = "no_ocr",
+    max_output_bytes: int = 0,
 ) -> str:
     """Extract plain text from a document byte stream via Apache Tika.
 
@@ -387,18 +403,29 @@ def _tika_extract(
     headers = {"Accept": "text/plain"}
     if ocr_strategy:
         headers["X-Tika-PDFOcrStrategy"] = ocr_strategy
-    try:
-        resp = httpx.put(
-            f"{tika_url.rstrip('/')}/tika",
-            content=data,
-            headers=headers,
-            timeout=timeout,
-        )
+    chunks: list[bytes] = []
+    total = 0
+    with httpx.stream(
+        "PUT",
+        f"{tika_url.rstrip('/')}/tika",
+        content=data,
+        headers=headers,
+        timeout=timeout,
+    ) as resp:
         resp.raise_for_status()
-        text = resp.text.strip()
-        return text if text else "[Document contained no extractable text]"
-    except Exception as e:
-        return f"[Document extraction failed: {e}]"
+        for chunk in resp.iter_bytes():
+            total += len(chunk)
+            if max_output_bytes and total > max_output_bytes:
+                raise DownloadTooLargeError(
+                    "Tika extraction output exceeds the configured "
+                    f"{max_output_bytes}-byte download cap."
+                )
+            chunks.append(chunk)
+        encoding = resp.encoding or "utf-8"
+    text = b"".join(chunks).decode(encoding, errors="replace").strip()
+    if not text:
+        raise RuntimeError("Document contained no extractable text.")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +524,11 @@ async def _assert_url_allowed(url: str) -> None:
             infos = getaddrinfo(host, None)
     except socket.gaierror as e:
         raise SSRFError(f"Could not resolve host {host!r}: {e}")
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        raise SSRFError(f"Could not resolve host {host!r}: no addresses returned")
     blocked = sorted(
-        {info[4][0] for info in infos if _addr_is_blocked(info[4][0], allowed_nets)}
+        address for address in addresses if _addr_is_blocked(address, allowed_nets)
     )
     if blocked:
         raise SSRFError(
@@ -562,24 +592,50 @@ async def _httpx_fetch(
 
 
 async def _flaresolverr_fetch(
-    url: str, flaresolverr_url: str, max_timeout_ms: int, http_timeout: float
+    url: str,
+    flaresolverr_url: str,
+    max_timeout_ms: int,
+    http_timeout: float,
+    max_bytes: int = 0,
 ) -> tuple[int, dict, str]:
-    """Use FlareSolverr to fetch a Cloudflare-protected page."""
+    """Use FlareSolverr to fetch a page without bypassing the download cap."""
     endpoint = flaresolverr_url.rstrip("/") + "/v1"
     payload = {"cmd": "request.get", "url": url, "maxTimeout": max_timeout_ms}
     async with httpx.AsyncClient(timeout=http_timeout) as client:
-        resp = await client.post(
-            endpoint, json=payload, headers={"Content-Type": "application/json"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        async with client.stream(
+            "POST", endpoint, json=payload, headers={"Content-Type": "application/json"}
+        ) as resp:
+            resp.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            # FlareSolverr wraps the rendered body in JSON, so permit modest
+            # protocol overhead beyond the configured body limit.
+            response_limit = max_bytes + 1048576 if max_bytes else 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if response_limit and total > response_limit:
+                    raise DownloadTooLargeError(
+                        f"FlareSolverr response for {url!r} exceeds the configured "
+                        f"{max_bytes}-byte download cap."
+                    )
+                chunks.append(chunk)
+        data = json.loads(b"".join(chunks))
+    if not isinstance(data, dict):
+        raise RuntimeError("FlareSolverr returned a JSON value that is not an object.")
     if data.get("status") != "ok":
-        msg = data.get("message", "unknown FlareSolverr error")
+        msg = str(data.get("message", "unknown FlareSolverr error"))[:500]
         raise RuntimeError(f"FlareSolverr failed: {msg}")
     sol = data.get("solution") or {}
     status = int(sol.get("status") or 0)
     hdrs = sol.get("headers") or {}
     body = sol.get("response") or ""
+    if not isinstance(body, str):
+        raise RuntimeError("FlareSolverr returned a non-text response body.")
+    if max_bytes and len(body.encode("utf-8")) > max_bytes:
+        raise DownloadTooLargeError(
+            f"Rendered response from {url!r} exceeds the configured "
+            f"{max_bytes}-byte download cap."
+        )
     return status, hdrs, body
 
 
@@ -616,6 +672,7 @@ async def _resilient_fetch(
                     flaresolverr_url=flaresolverr_url,
                     max_timeout_ms=flaresolverr_timeout_ms,
                     http_timeout=max(timeout, flaresolverr_timeout_ms / 1000 + 10),
+                    max_bytes=max_bytes,
                 )
                 return {
                     "url": url,
@@ -675,6 +732,7 @@ async def _resilient_fetch(
                 flaresolverr_url=flaresolverr_url,
                 max_timeout_ms=flaresolverr_timeout_ms,
                 http_timeout=max(timeout, flaresolverr_timeout_ms / 1000 + 10),
+                max_bytes=max_bytes,
             )
             # FlareSolverr returning a page isn't the same as a bypass: an
             # interactive wall (PerimeterX "Press & Hold", a CAPTCHA) renders as
@@ -747,7 +805,7 @@ async def _cached_resilient_fetch(url: str) -> dict:
         if _page_inflight.get(url) is task:
             _page_inflight.pop(url, None)
 
-    _page_cache.set(url, fetched)
+    _cache_page(url, fetched)
     return fetched
 
 
@@ -793,7 +851,7 @@ async def _direct_enrich_fetch(url: str) -> dict | None:
     # can reuse it. A blocked direct response must not be cached: fetch_page would
     # then reuse it and skip its own FlareSolverr attempt.
     if is_textlike and not blocked:
-        _page_cache.set(url, result)
+        _cache_page(url, result)
     return result
 
 
@@ -826,7 +884,7 @@ async def _enrich_fetch(url: str) -> dict | None:
     full_task = _page_inflight.get(url)
     if full_task is not None:
         fetched = await asyncio.shield(full_task)
-        _page_cache.set(url, fetched)
+        _cache_page(url, fetched)
         return fetched
 
     task = _enrich_inflight.get(url)
@@ -865,6 +923,7 @@ async def _render_with_flaresolverr(url: str) -> dict:
         flaresolverr_url=flaresolverr_url,
         max_timeout_ms=cfg.flaresolverr_timeout_ms,
         http_timeout=max(cfg.http_timeout_seconds, cfg.flaresolverr_timeout_ms / 1000 + 10),
+        max_bytes=cfg.max_download_bytes,
     )
     result = {
         "url": url,
@@ -876,7 +935,7 @@ async def _render_with_flaresolverr(url: str) -> dict:
         "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
     }
     if fs_html and not result["blocked_detected"]:
-        _page_cache.set(url, result)
+        _cache_page(url, result)
     return result
 
 
@@ -915,7 +974,14 @@ async def _fetch_from_wayback(url: str) -> dict | None:
     except Exception:
         return None
 
-    snap = ((data or {}).get("archived_snapshots") or {}).get("closest") or {}
+    if not isinstance(data, dict):
+        return None
+    snapshots = data.get("archived_snapshots") or {}
+    if not isinstance(snapshots, dict):
+        return None
+    snap = snapshots.get("closest") or {}
+    if not isinstance(snap, dict):
+        return None
     timestamp = snap.get("timestamp") or ""
     # Accept a snapshot only when it is available and (per the API) was a 200
     # capture; some snapshots omit `status`, which we tolerate.

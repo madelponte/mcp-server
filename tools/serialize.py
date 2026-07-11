@@ -16,6 +16,7 @@ Decimals, etc.) serialize instead of raising.
 
 import json
 import logging
+import math
 from typing import Any
 
 from config import server_settings
@@ -26,6 +27,28 @@ def debug_enabled() -> bool:
     return server_settings.debug
 
 
+def _replace_nonfinite(value: Any) -> Any:
+    """Replace NaN/Infinity recursively so every emitted payload is valid JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _replace_nonfinite(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_replace_nonfinite(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_nonfinite(item) for item in value)
+    return value
+
+
+def redact_secrets(text: Any, *secrets: str) -> str:
+    """Redact configured credential values before an exception reaches a tool."""
+    rendered = str(text)
+    for secret in secrets:
+        if secret:
+            rendered = rendered.replace(secret, "REDACTED")
+    return rendered
+
+
 def to_json(payload: Any, *, default=str) -> str:
     """Serialize a tool result to a JSON string.
 
@@ -33,10 +56,17 @@ def to_json(payload: Any, *, default=str) -> str:
     this for every structured tool result instead of calling ``json.dumps``
     directly so the compact/pretty switch stays centralized.
     """
+    payload = _replace_nonfinite(payload)
     if server_settings.debug:
-        return json.dumps(payload, ensure_ascii=False, indent=2, default=default)
+        return json.dumps(
+            payload, ensure_ascii=False, indent=2, default=default, allow_nan=False
+        )
     return json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":"), default=default
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=default,
+        allow_nan=False,
     )
 
 

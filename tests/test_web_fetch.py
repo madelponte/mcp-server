@@ -1,6 +1,7 @@
 """Tests for tools/web_fetch.py — block detection, Tika routing, SSRF guard."""
 
 import asyncio
+import json
 import socket
 
 import httpx
@@ -333,6 +334,71 @@ def test_download_cap_zero_is_unbounded(patch_httpx):
     assert len(body) == 100000
 
 
+def test_flaresolverr_rendered_body_obeys_download_cap(patch_httpx):
+    payload = {
+        "status": "ok",
+        "solution": {"status": 200, "headers": {}, "response": "x" * 100},
+    }
+    patch_httpx(lambda request: httpx.Response(200, content=json.dumps(payload).encode()))
+    with pytest.raises(DownloadTooLargeError):
+        run(
+            web_fetch._flaresolverr_fetch(
+                "https://example.com",
+                "http://flaresolverr:8191",
+                max_timeout_ms=1000,
+                http_timeout=5,
+                max_bytes=10,
+            )
+        )
+
+
+def test_tika_output_obeys_download_cap(monkeypatch):
+    class Response:
+        encoding = "utf-8"
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"1234"
+            yield b"5678"
+
+    class Stream:
+        def __enter__(self):
+            return Response()
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(web_fetch.httpx, "stream", lambda *args, **kwargs: Stream())
+    with pytest.raises(DownloadTooLargeError):
+        web_fetch._tika_extract(
+            b"%PDF",
+            "http://tika:9998",
+            max_output_bytes=5,
+        )
+
+
+def test_page_cache_skips_oversized_entry(monkeypatch):
+    cache = TTLCache(60, 8)
+    monkeypatch.setattr(web_fetch, "_page_cache", cache)
+    monkeypatch.setattr(web_fetch.cfg, "cache_max_item_bytes", 5)
+    web_fetch._cache_page(
+        "https://example.com/large",
+        {"text": "123456", "bytes": None},
+    )
+    assert cache.get("https://example.com/large") is None
+
+
+def test_page_cache_keeps_entry_within_item_limit(monkeypatch):
+    cache = TTLCache(60, 8)
+    monkeypatch.setattr(web_fetch, "_page_cache", cache)
+    monkeypatch.setattr(web_fetch.cfg, "cache_max_item_bytes", 6)
+    fetched = {"text": "123456", "bytes": None}
+    web_fetch._cache_page("https://example.com/small", fetched)
+    assert cache.get("https://example.com/small") is fetched
+
+
 # --------------------------- full fetch cache coordination ---------------------------
 
 def test_cached_resilient_fetch_coalesces_concurrent_misses(monkeypatch):
@@ -539,6 +605,13 @@ def test_assert_url_unresolvable_host_raises(monkeypatch):
     monkeypatch.setattr(web_fetch.socket, "getaddrinfo", _fail)
     with pytest.raises(SSRFError):
         run(_assert_url_allowed("https://nonexistent.invalid/x"))
+
+
+def test_assert_url_empty_resolution_raises(monkeypatch):
+    _clear_allowlist(monkeypatch)
+    monkeypatch.setattr(web_fetch.socket, "getaddrinfo", lambda host, port: [])
+    with pytest.raises(SSRFError):
+        run(_assert_url_allowed("https://empty-resolution.invalid/x"))
 
 
 # --------------------------- redirect SSRF re-validation ---------------------------
