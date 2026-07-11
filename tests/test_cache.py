@@ -31,7 +31,7 @@ def test_negative_ttl_disables_cache():
 
 def test_expiry(monkeypatch):
     now = [1000.0]
-    monkeypatch.setattr(cache_mod.time, "time", lambda: now[0])
+    monkeypatch.setattr(cache_mod.time, "monotonic", lambda: now[0])
     c = TTLCache(ttl_seconds=10)
     c.set("k", "v")
     assert c.get("k") == "v"
@@ -41,6 +41,17 @@ def test_expiry(monkeypatch):
     assert c.get("k") is None
     # Expired entry is evicted on read.
     assert "k" not in c._data
+
+
+def test_set_prunes_expired_entries(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(cache_mod.time, "monotonic", lambda: now[0])
+    c = TTLCache(ttl_seconds=10, max_entries=0)
+    c.set("old", "value")
+    now[0] += 11
+    c.set("new", "value")
+    assert "old" not in c._data
+    assert c.get("new") == "value"
 
 
 def test_max_entries_evicts_oldest():

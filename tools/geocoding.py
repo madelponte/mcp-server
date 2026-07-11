@@ -35,7 +35,7 @@ from pydantic import Field
 
 from config import geocoding_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result
+from .serialize import to_json, log_call, log_result, redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,15 @@ log = logging.getLogger(__name__)
 # connection setup. The client class id keeps tests that monkeypatch
 # httpx.AsyncClient isolated from clients created under earlier patches.
 _http_clients: dict[tuple[int, int], httpx.AsyncClient] = {}
+
+
+def _backend_error(exc: Exception, endpoint: str) -> str:
+    """Format an HTTP error without exposing basic-auth URL credentials."""
+    try:
+        password = urlparse(endpoint).password or ""
+    except ValueError:
+        password = ""
+    return redact_secrets(exc, password)
 
 
 def _http_client() -> httpx.AsyncClient:
@@ -489,7 +498,9 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
     except httpx.TimeoutException:
         raise ToolError(f"Geocoding request timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
-        raise ToolError(f"Network error contacting the geocoder: {exc}")
+        raise ToolError(
+            f"Network error contacting the geocoder: {_backend_error(exc, url)}"
+        )
 
     if resp.status_code == 429:
         raise ToolError(
@@ -505,9 +516,13 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
         data = resp.json()
     except ValueError:
         raise ToolError("Geocoder returned a non-JSON response.")
+    if not isinstance(data, list):
+        raise ToolError("Geocoder returned an unexpected JSON response shape.")
 
     results = []
     for item in data:
+        if not isinstance(item, dict):
+            continue
         try:
             lat = float(item["lat"])
             lon = float(item["lon"])
@@ -578,7 +593,9 @@ async def _reverse_geocode(lat: float, lon: float, detailed: bool = False) -> di
             f"Reverse geocoding request timed out after {cfg.http_timeout_seconds}s."
         )
     except httpx.HTTPError as exc:
-        raise ToolError(f"Network error contacting the geocoder: {exc}")
+        raise ToolError(
+            f"Network error contacting the geocoder: {_backend_error(exc, url)}"
+        )
 
     if resp.status_code == 429:
         raise ToolError(
@@ -594,6 +611,8 @@ async def _reverse_geocode(lat: float, lon: float, detailed: bool = False) -> di
         item = resp.json()
     except ValueError:
         raise ToolError("Geocoder returned a non-JSON response.")
+    if not isinstance(item, dict):
+        raise ToolError("Geocoder returned an unexpected JSON response shape.")
 
     if item.get("error"):
         raise ToolError(f"Could not reverse-geocode {lat:.7f}, {lon:.7f}: {item['error']}")
@@ -654,7 +673,9 @@ async def _lookup_osm_object(osm_type: str, osm_id: str, detailed: bool = False)
     except httpx.TimeoutException:
         raise ToolError(f"OSM object lookup timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
-        raise ToolError(f"Network error contacting the geocoder: {exc}")
+        raise ToolError(
+            f"Network error contacting the geocoder: {_backend_error(exc, url)}"
+        )
 
     if resp.status_code == 429:
         raise ToolError(
@@ -671,9 +692,13 @@ async def _lookup_osm_object(osm_type: str, osm_id: str, detailed: bool = False)
     except ValueError:
         raise ToolError("Geocoder returned a non-JSON response.")
 
+    if not isinstance(data, list):
+        raise ToolError("Geocoder returned an unexpected JSON response shape.")
     if not data:
         raise ToolError(f"Could not find OpenStreetMap object {osm_ref}.")
     item = data[0]
+    if not isinstance(item, dict):
+        raise ToolError(f"OpenStreetMap object {osm_ref} was malformed.")
     try:
         lat = float(item["lat"])
         lon = float(item["lon"])
@@ -765,7 +790,10 @@ async def _overpass(query_ql: str) -> list[dict]:
             "Try a smaller radius or a more specific category."
         )
     except httpx.HTTPError as exc:
-        raise ToolError(f"Network error contacting Overpass: {exc}")
+        raise ToolError(
+            "Network error contacting Overpass: "
+            f"{_backend_error(exc, cfg.overpass_url)}"
+        )
 
     if resp.status_code == 429:
         raise ToolError(
@@ -785,12 +813,16 @@ async def _overpass(query_ql: str) -> list[dict]:
     except ValueError:
         # Overpass emits plain-text error pages for malformed queries.
         raise ToolError(f"Overpass returned a non-JSON response: {resp.text[:200]}")
+    if not isinstance(data, dict):
+        raise ToolError("Overpass returned an unexpected JSON response shape.")
 
     remark = data.get("remark", "")
     if remark and "error" in remark.lower():
         raise ToolError(f"Overpass reported an error: {remark.strip()}")
 
     elements = data.get("elements", [])
+    if not isinstance(elements, list):
+        raise ToolError("Overpass returned a non-list `elements` value.")
     _cache.set(cache_key, elements)
     return elements
 

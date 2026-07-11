@@ -20,7 +20,7 @@ from fastmcp.exceptions import ToolError
 
 from config import wolfram_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result
+from .serialize import to_json, log_call, log_result, redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -247,7 +247,8 @@ def register(mcp: FastMCP) -> None:
                 f"Wolfram Alpha request timed out after {cfg.http_timeout_seconds}s."
             )
         except httpx.HTTPError as exc:
-            raise ToolError(f"Network error contacting Wolfram Alpha: {exc}")
+            detail = redact_secrets(exc, cfg.app_id)
+            raise ToolError(f"Network error contacting Wolfram Alpha: {detail}")
 
         status = response.status_code
         body = response.text or ""

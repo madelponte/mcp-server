@@ -175,6 +175,19 @@ def test_query_no_match_raises(monkeypatch, tool_fns):
     assert "matching query" in str(exc.value)
 
 
+def test_query_timeout_surfaces_as_tool_error(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp, "_QUERY_MATCH_BUDGET_SECONDS", 0.01)
+    html = f"<body><article><p>{'a' * 10_000}!</p></article></body>"
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    with pytest.raises(ToolError) as exc:
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com", query=r"(a|aa)+$"
+            )
+        )
+    assert "took too long" in str(exc.value)
+
+
 # --------------------------- document (Tika) ---------------------------
 
 def test_document_routed_to_tika(monkeypatch, tool_fns):
@@ -189,6 +202,18 @@ def test_document_no_content_raises(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(content_type="application/pdf", body=None, text=None))
     with pytest.raises(ToolError):
         run(tool_fns["fetch_page"](url="https://example.com/report.pdf"))
+
+
+def test_document_extraction_failure_raises(monkeypatch, tool_fns):
+    _patch_fetch(monkeypatch, _fetched(content_type="application/pdf", body=b"%PDF-1.4..."))
+
+    def fail_extract(*args, **kwargs):
+        raise RuntimeError("Tika unavailable")
+
+    monkeypatch.setattr(fp, "_tika_extract", fail_extract)
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://example.com/report.pdf"))
+    assert "document extraction failed" in str(exc.value).lower()
 
 
 def test_error_html_at_document_url_is_not_extracted(monkeypatch, tool_fns):
@@ -227,7 +252,7 @@ def test_mislabeled_pdf_sniffed_to_tika(monkeypatch, tool_fns):
 # --------------------------- gone-status Wayback fallback ---------------------------
 
 def test_gone_status_falls_back_to_wayback(monkeypatch, tool_fns):
-    """A 404/410/451 page tries the Wayback Machine before returning the error body."""
+    """A 404/410/451 page tries the Wayback Machine before raising an error."""
     monkeypatch.setattr(fp.cfg, "wayback_fallback", True)
     _patch_fetch(
         monkeypatch,
@@ -252,8 +277,8 @@ def test_gone_status_falls_back_to_wayback(monkeypatch, tool_fns):
     assert "unavailable (HTTP 404)" in out["note"]
 
 
-def test_gone_status_without_wayback_hit_returns_error_page(monkeypatch, tool_fns):
-    """When no usable snapshot exists, fall through to the normal (error-page) handling."""
+def test_gone_status_without_wayback_hit_raises(monkeypatch, tool_fns):
+    """An unrecovered gone response is an error, never page content."""
     monkeypatch.setattr(fp.cfg, "wayback_fallback", True)
     _patch_fetch(
         monkeypatch,
@@ -264,9 +289,24 @@ def test_gone_status_without_wayback_hit_returns_error_page(monkeypatch, tool_fn
         return None
 
     monkeypatch.setattr(fp, "_wayback_content", no_wayback)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/dead")))
-    assert out["status"] == 404
-    assert "Page not found here." in out["content"]
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://example.com/dead"))
+    assert "HTTP 404" in str(exc.value)
+    assert "archived snapshot" in str(exc.value)
+
+
+def test_server_error_raises_instead_of_returning_error_page(monkeypatch, tool_fns):
+    _patch_fetch(
+        monkeypatch,
+        _fetched(
+            text="<html><body><p>Upstream service unavailable.</p></body></html>",
+            status=502,
+        ),
+    )
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://example.com/article"))
+    assert "HTTP 502" in str(exc.value)
+    assert "Upstream service unavailable" not in str(exc.value)
 
 
 # --------------------------- Reddit / JSON ---------------------------

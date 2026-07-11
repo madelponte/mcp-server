@@ -2,9 +2,10 @@
 
 import json
 import logging
+import math
 
 import tools.serialize as serialize
-from tools.serialize import to_json, log_call, log_result, debug_enabled
+from tools.serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
 
 
 def _set_debug(monkeypatch, value):
@@ -41,6 +42,20 @@ def test_to_json_default_str_for_unserializable(monkeypatch):
 
     out = to_json({"x": Weird()})
     assert "weird-value" in out
+
+
+def test_to_json_replaces_nonfinite_floats(monkeypatch):
+    _set_debug(monkeypatch, False)
+    out = to_json({"values": [math.nan, math.inf, -math.inf, 1.5]})
+    assert out == '{"values":[null,null,null,1.5]}'
+    assert json.loads(out) == {"values": [None, None, None, 1.5]}
+
+
+def test_redact_secrets_replaces_every_configured_value():
+    out = redact_secrets("token=abc proxy=http://user:pass@host", "abc", "pass")
+    assert "abc" not in out
+    assert "pass" not in out
+    assert out == "token=REDACTED proxy=http://user:REDACTED@host"
 
 
 def test_debug_enabled_reflects_setting(monkeypatch):

@@ -23,7 +23,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
-from .serialize import to_json, log_call, log_result
+from .serialize import to_json, log_call, log_result, redact_secrets
 from .web_fetch import _enrich_fetch, _is_tika_document
 from .web_extract import _structured_from_html, _trim
 
@@ -181,10 +181,16 @@ async def _searxng_query(
         )
     resp.raise_for_status()
     data = resp.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("SearXNG returned a JSON value that is not an object.")
 
     items = data.get("results") or []
+    if not isinstance(items, list):
+        raise RuntimeError("SearXNG returned a non-list `results` value.")
     out: list[dict] = []
     for r in items[:num_results]:
+        if not isinstance(r, dict):
+            continue
         item = {
             "url": r.get("url"),
             "title": r.get("title"),
@@ -311,7 +317,9 @@ def register(mcp: FastMCP) -> None:
                 page=resolved_page,
             )
         except Exception as e:
-            raise ToolError(f"SearXNG query failed for {query!r}: {e}")
+            backend_password = urlparse(cfg.searxng_url).password or ""
+            detail = redact_secrets(e, backend_password)
+            raise ToolError(f"SearXNG query failed for {query!r}: {detail}")
 
         applied = {
             "time_range": resolved_time_range or "all",

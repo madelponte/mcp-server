@@ -1,5 +1,7 @@
 """Tests for the pure helpers in tools/fetch_page.py."""
 
+import pytest
+
 import tools.fetch_page as fp
 import tools.serialize as serialize
 from tools.fetch_page import (
@@ -8,6 +10,7 @@ from tools.fetch_page import (
     _compile_query,
     _segment_text,
     _extract_matches,
+    QueryMatchTimeoutError,
     _format_match_windows,
     _normalize_reddit_url,
     _compact_reddit_json,
@@ -177,6 +180,19 @@ def test_extract_matches_no_match():
 
 def test_extract_matches_empty_text():
     assert _extract_matches("", "x", context=1, max_windows=5) == ([], 0, 0)
+
+
+def test_extract_matches_interrupts_catastrophic_backtracking(monkeypatch):
+    # This ambiguous alternation evades the nested-quantifier heuristic but is
+    # still exponential in a traditional backtracking engine on a failed match.
+    monkeypatch.setattr(fp, "_QUERY_MATCH_BUDGET_SECONDS", 0.01)
+    with pytest.raises(QueryMatchTimeoutError):
+        _extract_matches(
+            "a" * 10_000 + "!",
+            r"(a|aa)+$",
+            context=0,
+            max_windows=1,
+        )
 
 
 # --------------------------- _format_match_windows ---------------------------

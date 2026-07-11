@@ -508,11 +508,35 @@ def test_http_get_json_caches(monkeypatch):
         calls["n"] += 1
         return FakeResp()
 
-    monkeypatch.setattr(stock._session, "get", fake_get)
+    class FakeSession:
+        get = staticmethod(fake_get)
+
+    monkeypatch.setattr(stock, "_session_for_thread", lambda: FakeSession())
     a = stock._http_get_json("https://x.com/api", {"q": 1})
     b = stock._http_get_json("https://x.com/api", {"q": 1})
     assert a == b == {"ok": True}
     assert calls["n"] == 1  # second call served from cache
+
+
+def test_http_get_json_cache_key_does_not_retain_credentials(monkeypatch):
+    cache = TTLCache(60)
+    monkeypatch.setattr(stock, "_cache", cache)
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True}
+
+    class FakeSession:
+        @staticmethod
+        def get(*args, **kwargs):
+            return FakeResp()
+
+    monkeypatch.setattr(stock, "_session_for_thread", lambda: FakeSession())
+    stock._http_get_json("https://x.com/api", {"symbol": "AAPL", "token": "SECRET"})
+    assert all("SECRET" not in key for key in cache._data)
 
 
 # --------------------------- _yfinance_dividends / _yfinance_ownership ---------------------------

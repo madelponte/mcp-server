@@ -17,6 +17,13 @@ from conftest import run
 @pytest.fixture(autouse=True)
 def configured(monkeypatch):
     """Give the tool valid-looking credentials by default."""
+    async def run_sync(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    # These tests patch the SMTP boundary and exercise validation/formatting.
+    # Run worker targets inline because this Python 3.13 environment can hang
+    # while cleaning up AnyIO worker threads during asyncio.run().
+    monkeypatch.setattr(email_mod.anyio.to_thread, "run_sync", run_sync)
     monkeypatch.setattr(email_mod.cfg, "username", "bot@gmail.com")
     monkeypatch.setattr(email_mod.cfg, "password", "app-password")
     monkeypatch.setattr(email_mod.cfg, "from_address", "")
@@ -247,6 +254,35 @@ def test_missing_attachment_raises(tool_fns):
             )
         )
     assert "attachment path" in str(exc.value).lower()
+
+
+def test_attachment_growth_after_stat_is_bounded(monkeypatch, tmp_path):
+    path = tmp_path / "growing.bin"
+    path.write_bytes(b"small")
+    monkeypatch.setattr(email_mod.cfg, "max_attachment_bytes", 5)
+
+    original_open = email_mod.Path.open
+
+    def growing_open(self, *args, **kwargs):
+        with original_open(path, "wb") as stream:
+            stream.write(b"too-large")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(email_mod.Path, "open", growing_open)
+    with pytest.raises(ToolError) as exc:
+        email_mod._prepare_attachments([str(path)])
+    assert "per-file limit" in str(exc.value)
+
+
+def test_subject_header_injection_raises_toolerror(monkeypatch, tool_fns):
+    _capture_send(monkeypatch)
+    with pytest.raises(ToolError) as exc:
+        run(
+            tool_fns["send_email"](
+                recipients=["a@b.com"], subject="hello\nBcc: victim@example.com", body="yo"
+            )
+        )
+    assert "newline" in str(exc.value).lower()
 
 
 def test_auth_error_raises_toolerror(monkeypatch, tool_fns):
