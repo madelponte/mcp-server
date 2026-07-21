@@ -545,6 +545,50 @@ class DownloadTooLargeError(RuntimeError):
     """A response body exceeded the configured download-size cap."""
 
 
+class BrowserRenderError(RuntimeError):
+    """FlareSolverr returned Chromium's own navigation-error document."""
+
+
+# A failed Chromium navigation is sometimes reported by FlareSolverr as an
+# otherwise successful response: its API says ``status: ok`` and the solution
+# status is 200, but ``solution.response`` is Chrome's internal error page.  If
+# that HTML reaches the extraction layer, fetch_page presents text such as
+# "This site can't be reached / ERR_HTTP2_PROTOCOL_ERROR" as page content.
+# Keep this separate from bot-wall detection: it is a browser/network failure,
+# not a response produced by the target site.
+_CHROMIUM_NET_ERROR_CODE_RE = re.compile(r"\bERR_[A-Z0-9_]+\b")
+_CHROMIUM_NET_ERROR_MARKERS = (
+    "chrome-error://chromewebdata/",
+    'id="main-frame-error"',
+    'class="error-code"',
+    'id="error-information-button"',
+)
+
+
+def _chromium_network_error_code(html: str) -> str | None:
+    """Return an error code when ``html`` is Chromium's navigation-error page.
+
+    Requiring both an ``ERR_*`` token and either Chromium-specific markup or
+    its standard visible heading avoids rejecting an ordinary page that merely
+    discusses a browser error code.
+    """
+    if not html:
+        return None
+    match = _CHROMIUM_NET_ERROR_CODE_RE.search(html)
+    if not match:
+        return None
+    lowered = html.lower()
+    standard_heading = (
+        "this site can't be reached" in lowered
+        or "this site can\u2019t be reached" in lowered
+        or "this page isn't working" in lowered
+        or "this page isn\u2019t working" in lowered
+    )
+    if standard_heading or any(marker in lowered for marker in _CHROMIUM_NET_ERROR_MARKERS):
+        return match.group(0)
+    return None
+
+
 async def _httpx_fetch(
     url: str, timeout: float, user_agent: str, verify_ssl: bool, max_bytes: int = 0
 ) -> tuple[int, dict, bytes, str]:
@@ -635,6 +679,12 @@ async def _flaresolverr_fetch(
         raise DownloadTooLargeError(
             f"Rendered response from {url!r} exceeds the configured "
             f"{max_bytes}-byte download cap."
+        )
+    browser_error = _chromium_network_error_code(body)
+    if browser_error:
+        raise BrowserRenderError(
+            "FlareSolverr's browser could not load "
+            f"{url!r} ({browser_error})."
         )
     return status, hdrs, body
 

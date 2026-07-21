@@ -11,6 +11,7 @@ import tools.web_fetch as web_fetch
 from tools.cache import TTLCache
 from tools.web_fetch import (
     _is_blocked_response,
+    _chromium_network_error_code,
     _is_tika_document,
     _sniff_document_bytes,
     _decode_body,
@@ -19,6 +20,7 @@ from tools.web_fetch import (
     _addr_is_blocked,
     _assert_url_allowed,
     _cached_resilient_fetch,
+    BrowserRenderError,
     DownloadTooLargeError,
     SSRFError,
 )
@@ -86,6 +88,29 @@ def test_200_with_one_marker_is_not_blocked():
 
 def test_clean_200_is_not_blocked():
     assert _is_blocked_response(200, "<html><body>Real content</body></html>", {}) is False
+
+
+# --------------------------- browser navigation errors ---------------------------
+
+def test_chromium_navigation_error_is_detected():
+    html = """
+    <html><body>
+      <div id="main-frame-error" class="interstitial-wrapper">
+        <h1>This site can\u2019t be reached</h1>
+        <div class="error-code">ERR_HTTP2_PROTOCOL_ERROR</div>
+      </div>
+    </body></html>
+    """
+    assert _chromium_network_error_code(html) == "ERR_HTTP2_PROTOCOL_ERROR"
+
+
+def test_page_discussing_chromium_error_is_not_misclassified():
+    html = (
+        "<html><article><h1>How to fix ERR_HTTP2_PROTOCOL_ERROR</h1>"
+        "<p>This troubleshooting article explains several possible causes.</p>"
+        "</article></html>"
+    )
+    assert _chromium_network_error_code(html) is None
 
 
 # --------------------------- Tika document detection ---------------------------
@@ -348,6 +373,35 @@ def test_flaresolverr_rendered_body_obeys_download_cap(patch_httpx):
                 max_timeout_ms=1000,
                 http_timeout=5,
                 max_bytes=10,
+            )
+        )
+
+
+def test_flaresolverr_rejects_chromium_navigation_error(patch_httpx):
+    """A FlareSolverr API success must not turn Chrome's error page into data."""
+    browser_error_html = (
+        '<html><body><div id="main-frame-error">'
+        '<h1>This site can\u2019t be reached</h1>'
+        '<div class="error-code">ERR_HTTP2_PROTOCOL_ERROR</div>'
+        '</div></body></html>'
+    )
+    payload = {
+        "status": "ok",
+        "solution": {
+            "status": 200,
+            "headers": {"content-type": "text/html"},
+            "response": browser_error_html,
+        },
+    }
+    patch_httpx(lambda request: httpx.Response(200, content=json.dumps(payload).encode()))
+
+    with pytest.raises(BrowserRenderError, match="ERR_HTTP2_PROTOCOL_ERROR"):
+        run(
+            web_fetch._flaresolverr_fetch(
+                "https://example.com",
+                "http://flaresolverr:8191",
+                max_timeout_ms=1000,
+                http_timeout=5,
             )
         )
 
