@@ -62,3 +62,7 @@ services:
       - CAPTCHA_SOLVER=${CAPTCHA_SOLVER:-none}
       - TZ=America/New_York
     restart: unless-stopped
+
+volumes:
+  valkey-data:
+  searxng-data:
