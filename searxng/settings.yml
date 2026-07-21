@@ -9,6 +9,9 @@ server:
   limiter: false
   image_proxy: true
 
+valkey:
+  url: valkey://redis:6379/0
+
 search:
   formats:
     - html
