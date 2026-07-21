@@ -157,7 +157,7 @@ which helps smaller models avoid tool-selection paralysis.
 
 ### Place Search
 
-`find_nearby_places(category="", near=None, latitude=None, longitude=None, radius_m=None, limit=None, include_nearby_towns=False, nearby_towns_limit=None, place_details=False)`
+`find_nearby_places(category="", near=None, latitude=None, longitude=None, radius_m=None, limit=None, nearby_towns_limit=None, place_details=False)`
 — Find points of interest near a location via OpenStreetMap
 [Overpass](https://overpass-api.de/). Specify the location either as `near` (a
 place name, geocoded for you via [Nominatim](https://nominatim.org/) — so "vegan
@@ -172,8 +172,9 @@ unrecognized category falls back to matching place names, so brands like
 `"Starbucks"` work too. Results are sorted nearest-first and include distance
 plus useful tags (cuisine, address, phone, website, opening hours) when
 available. An empty `results` list means nothing matched in range (not an error).
-Set `include_nearby_towns=true` to include nearby city/town/village centers that
-can seed follow-up searches in neighboring municipalities.
+Every POI search automatically includes nearby city/town/village centers that can
+seed follow-up searches in neighboring municipalities; `nearby_towns_limit` can
+reduce the number returned.
 
 Set `place_details=true` to look up rich information about the place named in
 `near` or at the supplied coordinates instead of searching for POIs around it.

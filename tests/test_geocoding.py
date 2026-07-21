@@ -509,6 +509,10 @@ def test_rate_limiter_disabled_when_interval_zero(monkeypatch):
 
 # --------------------------- find_nearby_places tool (validation) ---------------------------
 
+async def _empty_nearby_towns(lat, lon, n, exclude):
+    return []
+
+
 def test_find_nearby_places_empty_category_raises(tool_fns):
     fn = tool_fns["find_nearby_places"]
     with pytest.raises(ToolError):
@@ -543,8 +547,16 @@ def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
              "tags": {"name": "Far Cafe", "amenity": "cafe"}},
         ]
 
+    nearby_call = {}
+
+    async def fake_nearby_towns(lat, lon, n, exclude):
+        nearby_call.update(lat=lat, lon=lon, n=n, exclude=exclude)
+        return [{"name": "Beaverton", "latitude": 45.49, "longitude": -122.80,
+                 "distance_m": 12000, "place_type": "city"}]
+
     monkeypatch.setattr(geo, "_geocode", fake_geocode)
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", fake_nearby_towns)
 
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(category="cafe", near="Portland", radius_m=2000, limit=5)))
@@ -554,6 +566,14 @@ def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
     # Results are sorted nearest-first.
     assert out["results"][0]["name"] == "Near Cafe"
     assert out["results"][0]["distance_m"] <= out["results"][1]["distance_m"]
+    assert out["nearby_towns"][0]["name"] == "Beaverton"
+    assert out["nearby_towns_radius_m"] == geo.cfg.nearby_towns_radius_m
+    assert nearby_call == {
+        "lat": 45.52,
+        "lon": -122.68,
+        "n": geo.cfg.max_nearby_towns,
+        "exclude": "Portland, OR",
+    }
 
 
 def test_find_nearby_places_accepts_coordinates_in_near(monkeypatch, tool_fns):
@@ -569,6 +589,7 @@ def test_find_nearby_places_accepts_coordinates_in_near(monkeypatch, tool_fns):
         ]
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="coffee",
@@ -596,6 +617,7 @@ def test_find_nearby_places_accepts_osm_url_as_center(monkeypatch, tool_fns):
 
     monkeypatch.setattr(geo, "_lookup_osm_object", fake_lookup_osm_object)
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="coffee",
@@ -617,6 +639,7 @@ def test_find_nearby_places_clamps_radius(monkeypatch, tool_fns):
         return []
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="cafe", latitude=45.0, longitude=-122.0,
@@ -643,6 +666,7 @@ def test_find_nearby_places_name_search_query_is_key_constrained(monkeypatch, to
         return []
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     run(fn(category="Starbucks", latitude=45.0, longitude=-122.0))
     ql = captured["ql"]

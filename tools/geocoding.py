@@ -889,8 +889,8 @@ async def _nearby_towns(
 _RETURN_SCHEMA = (
     "Search returns {center:{latitude,longitude,name?},count,results:[{name,"
     "latitude,longitude,distance_m,category,cuisine?,address?,opening_hours?,"
-    "phone?,website?}],nearby_towns?:[{name,latitude,longitude,distance_m,"
-    "place_type?,population?}]}"
+    "phone?,website?}],nearby_towns_radius_m,nearby_towns:[{name,latitude,"
+    "longitude,distance_m,place_type?,population?}]}"
 )
 
 _PLACE_RETURN_SCHEMA = (
@@ -909,7 +909,7 @@ def register(mcp: FastMCP) -> None:
         "pharmacy, atm, "
         "hotel, park, gym, …); prefix food with a diet (vegan/vegetarian/halal/"
         'kosher/gluten-free); unknown words match names ("Starbucks"). '
-        f"include_nearby_towns=true also lists towns within {cfg.nearby_towns_radius_m} m "
+        f"Every POI search also lists nearby towns within {cfg.nearby_towns_radius_m} m "
         "to recenter a follow-up search.\n"
         "place_details=true: ignore category/radius/limit and return rich info "
         "ABOUT the place in `near` or at latitude+longitude (coords, bounding "
@@ -939,13 +939,11 @@ def register(mcp: FastMCP) -> None:
                 "(larger is clamped)."
             ),
         ] = None,
-        include_nearby_towns: bool = False,
         nearby_towns_limit: Annotated[
             int | None,
             Field(
-                description="Max nearby towns, nearest-first. Default & max "
-                f"{cfg.max_nearby_towns} (larger is clamped). Needs "
-                "include_nearby_towns=true."
+                description="Max automatically included nearby towns, nearest-first. "
+                f"Default & max {cfg.max_nearby_towns} (larger is clamped)."
             ),
         ] = None,
         place_details: bool = False,
@@ -957,7 +955,6 @@ def register(mcp: FastMCP) -> None:
         :param near: Place/address (geocoded), "lat,lon", or map URL with coords.
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
-        :param include_nearby_towns: Also return surrounding towns to recenter on.
         :param place_details: Look up rich info about the place in `near` instead
             of searching for nearby POIs.
         """
@@ -970,7 +967,6 @@ def register(mcp: FastMCP) -> None:
             longitude=longitude,
             radius_m=radius_m,
             limit=limit,
-            include_nearby_towns=include_nearby_towns,
             nearby_towns_limit=nearby_towns_limit,
             place_details=place_details,
         )
@@ -1125,16 +1121,12 @@ def register(mcp: FastMCP) -> None:
             "results": results,
         }
 
-        # Optional companion list of surrounding towns to seed follow-up searches.
-        # Only added when asked, so the common case stays lean. max_nearby_towns
-        # doubles as the default (omitting the count returns up to the cap).
-        if include_nearby_towns:
-            towns_n = _clamp(
-                nearby_towns_limit, cfg.max_nearby_towns, cfg.max_nearby_towns
-            )
-            payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
-            payload["nearby_towns"] = await _nearby_towns(
-                lat, lon, towns_n, center_name
-            )
+        # Always include surrounding towns so models can seed follow-up searches
+        # without first discovering and opting into a companion lookup.
+        towns_n = _clamp(
+            nearby_towns_limit, cfg.max_nearby_towns, cfg.max_nearby_towns
+        )
+        payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
+        payload["nearby_towns"] = await _nearby_towns(lat, lon, towns_n, center_name)
 
         return log_result(log, "find_nearby_places", to_json(payload))
