@@ -382,7 +382,15 @@ class GeocodingSettings(BaseSettings):
     # pointed at a self-hosted Overpass instance.
     overpass_url: str = Field(
         "https://overpass-api.de/api/interpreter",
-        description="Full URL of an Overpass API interpreter endpoint.",
+        description="Full URL of the primary Overpass API interpreter endpoint.",
+    )
+    overpass_fallback_urls: str = Field(
+        "https://overpass.openstreetmap.fr/api/interpreter",
+        description=(
+            "Comma-separated fallback Overpass interpreter URLs tried when the "
+            "primary times out, rate-limits, or returns 502/503/504. Set blank to "
+            "disable, especially when a self-hosted query must remain private."
+        ),
     )
 
     # Nominatim's usage policy REQUIRES a descriptive User-Agent that identifies

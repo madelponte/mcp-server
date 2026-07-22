@@ -771,6 +771,17 @@ async def _place_lookup_osm_object(osm_type: str, osm_id: str) -> dict:
 
 # -------------------------------- Overpass -------------------------------
 
+def _overpass_endpoints() -> list[str]:
+    """Return the primary and de-duplicated configured fallback endpoints."""
+    urls = [cfg.overpass_url, *cfg.overpass_fallback_urls.split(",")]
+    endpoints = []
+    for value in urls:
+        url = value.strip()
+        if url and url not in endpoints:
+            endpoints.append(url)
+    return endpoints
+
+
 async def _overpass(query_ql: str) -> list[dict]:
     """Run an Overpass QL query and return its `elements`. Raises ToolError on
     failure; an empty element list is returned as-is (valid-but-empty)."""
@@ -779,43 +790,48 @@ async def _overpass(query_ql: str) -> list[dict]:
     if cached is not None:
         return cached
 
-    # Space requests so a burst of concurrent tool calls is queued rather than
-    # stampeding Overpass (which answers a flood with 429/504). Shares the single
-    # OpenStreetMap limiter with Nominatim. Done after the cache check so a cache
-    # hit doesn't needlessly consume the rate budget.
+    # Queue requests so concurrent tool calls cannot stampede Overpass. If one
+    # public instance is transiently unavailable, try the configured fallbacks;
+    # public Overpass mirrors frequently overload independently of one another.
+    # The same queue slot covers all attempts so failover cannot create a burst.
     headers = {"User-Agent": cfg.user_agent}
-    try:
-        client = _http_client()
-        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
-            resp = await client.post(
-                cfg.overpass_url,
-                data={"data": query_ql},
-                headers=headers,
-                timeout=cfg.overpass_timeout_seconds,
-            )
-    except httpx.TimeoutException:
-        raise ToolError(
-            f"Overpass request timed out after {cfg.overpass_timeout_seconds}s. "
-            "Try a smaller radius or a more specific category."
-        )
-    except httpx.HTTPError as exc:
-        raise ToolError(
-            "Network error contacting Overpass: "
-            f"{_backend_error(exc, cfg.overpass_url)}"
-        )
+    endpoints = _overpass_endpoints()
+    if not endpoints:
+        raise ToolError("No Overpass endpoint is configured.")
 
-    if resp.status_code == 429:
-        raise ToolError(
-            "Overpass rate-limited the request (HTTP 429). Wait a moment and "
-            "retry, or point GEO_OVERPASS_URL at your own instance."
-        )
-    if resp.status_code in (504, 502, 503):
-        raise ToolError(
-            f"Overpass is overloaded (HTTP {resp.status_code}). Retry shortly or "
-            "narrow the query (smaller radius / more specific category)."
-        )
-    if resp.status_code >= 400:
-        raise ToolError(f"Overpass error (HTTP {resp.status_code}): {resp.text[:200]}")
+    failures = []
+    client = _http_client()
+    async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+        for endpoint in endpoints:
+            endpoint_name = urlparse(endpoint).hostname or "Overpass endpoint"
+            try:
+                resp = await client.post(
+                    endpoint,
+                    data={"data": query_ql},
+                    headers=headers,
+                    timeout=cfg.overpass_timeout_seconds,
+                )
+            except httpx.TimeoutException:
+                failures.append(f"{endpoint_name}: timeout")
+                continue
+            except httpx.HTTPError as exc:
+                failures.append(f"{endpoint_name}: {_backend_error(exc, endpoint)}")
+                continue
+
+            if resp.status_code in (429, 502, 503, 504):
+                failures.append(f"{endpoint_name}: HTTP {resp.status_code}")
+                continue
+            if resp.status_code >= 400:
+                raise ToolError(
+                    f"Overpass error (HTTP {resp.status_code}): {resp.text[:200]}"
+                )
+            break
+        else:
+            summary = "; ".join(failures)
+            raise ToolError(
+                "All configured Overpass endpoints were unavailable or rate-limited"
+                + (f": {summary}" if summary else ".")
+            )
 
     try:
         data = resp.json()

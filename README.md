@@ -192,7 +192,8 @@ It uses the public OpenStreetMap APIs by default and honors Nominatim's
 [usage policy](https://operations.osmfoundation.org/policies/nominatim/): a
 descriptive `GEO_USER_AGENT` (set this!) and a ~1 req/sec throttle on the public
 API. To self-host, point `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` at your own
-instances and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`. Results are cached
+instances, clear `GEO_OVERPASS_FALLBACK_URLS` if queries must stay private, and
+set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`. Results are cached
 (place data changes slowly), which also eases the rate limits.
 
 ## Configuration
@@ -212,7 +213,7 @@ for the full list with defaults. Key things to set:
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
 - `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
-- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` and `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
+- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL`, clear `GEO_OVERPASS_FALLBACK_URLS` when queries must stay private, and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 - `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
   `EMAIL_PASSWORD` must be a 16-character App Password, not the normal account
   password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,

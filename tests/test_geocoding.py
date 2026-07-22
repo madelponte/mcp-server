@@ -459,6 +459,26 @@ def test_overpass_rate_limited_raises(monkeypatch, patch_httpx):
         run(_overpass("[out:json];node;out;"))
 
 
+def test_overpass_uses_fallback_after_primary_504(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+    monkeypatch.setattr(geo.cfg, "overpass_url", "https://primary.test/interpreter")
+    monkeypatch.setattr(
+        geo.cfg, "overpass_fallback_urls", "https://fallback.test/interpreter"
+    )
+    hosts = []
+
+    def handler(req):
+        hosts.append(req.url.host)
+        if req.url.host == "primary.test":
+            return httpx.Response(504, text="overloaded")
+        return httpx.Response(200, json={"elements": [{"type": "node"}]})
+
+    patch_httpx(handler)
+    assert run(_overpass("[out:json];node;out;")) == [{"type": "node"}]
+    assert hosts == ["primary.test", "fallback.test"]
+
+
 def test_overpass_non_json_raises(monkeypatch, patch_httpx):
     _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
