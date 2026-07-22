@@ -24,6 +24,7 @@ import math
 import re
 import time
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Annotated
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -74,29 +75,38 @@ _cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 # Both OpenStreetMap backends (Nominatim and Overpass) rate-limit aggressive
 # callers (Nominatim caps at ~1 req/sec; Overpass returns 429/504 when its few
 # query slots are saturated). A model can fire several find_nearby_places calls at
-# once, so a single shared limiter serializes every request to either backend
-# through a lock and spaces them by the configured interval. anyio.Lock is
-# FIFO-fair, so concurrent callers are effectively queued and dispatched in
-# arrival order — a burst waits its turn instead of stampeding the APIs. anyio
-# primitives keep this on the event loop without blocking it. The limiter is
-# module-global so the spacing holds across every concurrent tool invocation.
+# once, so a single shared limiter queues every request to either backend, holds
+# the queue slot until the HTTP response arrives, and enforces the configured
+# interval between request starts. Holding the slot is important: spacing only the
+# request starts still lets slow Overpass queries overlap and exhaust its slots.
+# anyio.Lock is FIFO-fair, so a burst waits its turn without blocking the event
+# loop. The limiter is module-global so this holds across every tool invocation.
 class _RateLimiter:
-    """Serializes calls and spaces consecutive ones by `interval` seconds."""
+    """Serializes full requests and spaces consecutive starts by `interval`."""
 
     def __init__(self) -> None:
         self._lock = anyio.Lock()
         self._last_call = 0.0
 
-    async def acquire(self, interval: float) -> None:
-        """Block until at least `interval` seconds have passed since the previous
-        acquire (no-op when interval <= 0, e.g. when self-hosting)."""
+    async def _wait(self, interval: float) -> None:
+        wait = self._last_call + interval - time.monotonic()
+        if wait > 0:
+            await anyio.sleep(wait)
+        self._last_call = time.monotonic()
+
+    @asynccontextmanager
+    async def request_slot(self, interval: float):
+        """Queue a full HTTP request, preventing concurrent backend calls.
+
+        Queueing is disabled with the throttle when ``interval <= 0`` so a
+        self-hosted deployment can retain full concurrency.
+        """
         if interval <= 0:
+            yield
             return
         async with self._lock:
-            wait = self._last_call + interval - time.monotonic()
-            if wait > 0:
-                await anyio.sleep(wait)
-            self._last_call = time.monotonic()
+            await self._wait(interval)
+            yield
 
 
 _osm_limiter = _RateLimiter()
@@ -486,15 +496,15 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
     url = cfg.nominatim_url.rstrip("/") + "/search"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(f"Geocoding request timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
@@ -579,15 +589,15 @@ async def _reverse_geocode(lat: float, lon: float, detailed: bool = False) -> di
     url = cfg.nominatim_url.rstrip("/") + "/reverse"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(
             f"Reverse geocoding request timed out after {cfg.http_timeout_seconds}s."
@@ -661,15 +671,15 @@ async def _lookup_osm_object(osm_type: str, osm_id: str, detailed: bool = False)
     url = cfg.nominatim_url.rstrip("/") + "/lookup"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(f"OSM object lookup timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
@@ -773,17 +783,16 @@ async def _overpass(query_ql: str) -> list[dict]:
     # stampeding Overpass (which answers a flood with 429/504). Shares the single
     # OpenStreetMap limiter with Nominatim. Done after the cache check so a cache
     # hit doesn't needlessly consume the rate budget.
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
-
     headers = {"User-Agent": cfg.user_agent}
     try:
         client = _http_client()
-        resp = await client.post(
-            cfg.overpass_url,
-            data={"data": query_ql},
-            headers=headers,
-            timeout=cfg.overpass_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.post(
+                cfg.overpass_url,
+                data={"data": query_ql},
+                headers=headers,
+                timeout=cfg.overpass_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(
             f"Overpass request timed out after {cfg.overpass_timeout_seconds}s. "

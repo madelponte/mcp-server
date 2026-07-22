@@ -468,16 +468,15 @@ def test_overpass_non_json_raises(monkeypatch, patch_httpx):
 
 
 def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
-    """Concurrent acquires are queued and dispatched one per interval, in order,
-    rather than all firing at once (the burst that overloads Overpass)."""
+    """Concurrent request slots are queued one per interval rather than all
+    firing at once (the burst that overloads Overpass)."""
     import anyio as _anyio
 
     sleeps: list[float] = []
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
-        # Advance the limiter's clock so the next waiter computes its own delay
-        # off the time this one "finished" — mimics real elapsed time.
+        # Advance the limiter's clock so the next waiter computes its own delay.
         clock[0] += seconds
 
     clock = [1000.0]
@@ -486,11 +485,14 @@ def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
 
     limiter = geo._RateLimiter()
 
+    async def worker():
+        async with limiter.request_slot(1.0):
+            pass
+
     async def main():
-        # Five callers arrive together; the lock serializes them.
         async with _anyio.create_task_group() as tg:
             for _ in range(5):
-                tg.start_soon(limiter.acquire, 1.0)
+                tg.start_soon(worker)
 
     run(main())
 
@@ -499,11 +501,41 @@ def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
     assert all(abs(s - 1.0) < 1e-9 for s in sleeps)
 
 
+def test_rate_limiter_holds_slot_until_request_finishes():
+    """Slow backend calls cannot overlap even when launched concurrently."""
+    import anyio as _anyio
+
+    limiter = geo._RateLimiter()
+    active = 0
+    max_active = 0
+
+    async def worker():
+        nonlocal active, max_active
+        async with limiter.request_slot(0.001):
+            active += 1
+            max_active = max(max_active, active)
+            await _anyio.sleep(0.005)
+            active -= 1
+
+    async def main():
+        async with _anyio.create_task_group() as tg:
+            for _ in range(3):
+                tg.start_soon(worker)
+
+    run(main())
+    assert max_active == 1
+
+
 def test_rate_limiter_disabled_when_interval_zero(monkeypatch):
     slept = []
     monkeypatch.setattr(geo.anyio, "sleep", lambda s: slept.append(s))
     limiter = geo._RateLimiter()
-    run(limiter.acquire(0))
+
+    async def main():
+        async with limiter.request_slot(0):
+            pass
+
+    run(main())
     assert slept == []
 
 
