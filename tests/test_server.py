@@ -71,6 +71,10 @@ def test_find_nearby_places_description_interpolates_caps(server):
     tool = next(t for t in _list_tools(server) if t.name == "find_nearby_places")
     # The configured nearby-towns radius is rendered as a concrete number.
     assert str(geo.cfg.nearby_towns_radius_m) in tool.description
+    assert "Every POI search also lists nearby towns" in tool.description
+    props = (tool.to_mcp_tool().inputSchema or {}).get("properties", {})
+    assert "include_nearby_towns" not in props
+    assert "nearby_towns_limit" in props
 
 
 def test_get_company_data_schema_has_section_params(server):

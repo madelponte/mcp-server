@@ -459,6 +459,26 @@ def test_overpass_rate_limited_raises(monkeypatch, patch_httpx):
         run(_overpass("[out:json];node;out;"))
 
 
+def test_overpass_uses_fallback_after_primary_504(monkeypatch, patch_httpx):
+    _no_throttle(monkeypatch)
+    _fresh_cache(monkeypatch)
+    monkeypatch.setattr(geo.cfg, "overpass_url", "https://primary.test/interpreter")
+    monkeypatch.setattr(
+        geo.cfg, "overpass_fallback_urls", "https://fallback.test/interpreter"
+    )
+    hosts = []
+
+    def handler(req):
+        hosts.append(req.url.host)
+        if req.url.host == "primary.test":
+            return httpx.Response(504, text="overloaded")
+        return httpx.Response(200, json={"elements": [{"type": "node"}]})
+
+    patch_httpx(handler)
+    assert run(_overpass("[out:json];node;out;")) == [{"type": "node"}]
+    assert hosts == ["primary.test", "fallback.test"]
+
+
 def test_overpass_non_json_raises(monkeypatch, patch_httpx):
     _no_throttle(monkeypatch)
     _fresh_cache(monkeypatch)
@@ -468,16 +488,15 @@ def test_overpass_non_json_raises(monkeypatch, patch_httpx):
 
 
 def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
-    """Concurrent acquires are queued and dispatched one per interval, in order,
-    rather than all firing at once (the burst that overloads Overpass)."""
+    """Concurrent request slots are queued one per interval rather than all
+    firing at once (the burst that overloads Overpass)."""
     import anyio as _anyio
 
     sleeps: list[float] = []
 
     async def fake_sleep(seconds):
         sleeps.append(seconds)
-        # Advance the limiter's clock so the next waiter computes its own delay
-        # off the time this one "finished" — mimics real elapsed time.
+        # Advance the limiter's clock so the next waiter computes its own delay.
         clock[0] += seconds
 
     clock = [1000.0]
@@ -486,11 +505,14 @@ def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
 
     limiter = geo._RateLimiter()
 
+    async def worker():
+        async with limiter.request_slot(1.0):
+            pass
+
     async def main():
-        # Five callers arrive together; the lock serializes them.
         async with _anyio.create_task_group() as tg:
             for _ in range(5):
-                tg.start_soon(limiter.acquire, 1.0)
+                tg.start_soon(worker)
 
     run(main())
 
@@ -499,15 +521,49 @@ def test_rate_limiter_serializes_and_spaces_concurrent_calls(monkeypatch):
     assert all(abs(s - 1.0) < 1e-9 for s in sleeps)
 
 
+def test_rate_limiter_holds_slot_until_request_finishes():
+    """Slow backend calls cannot overlap even when launched concurrently."""
+    import anyio as _anyio
+
+    limiter = geo._RateLimiter()
+    active = 0
+    max_active = 0
+
+    async def worker():
+        nonlocal active, max_active
+        async with limiter.request_slot(0.001):
+            active += 1
+            max_active = max(max_active, active)
+            await _anyio.sleep(0.005)
+            active -= 1
+
+    async def main():
+        async with _anyio.create_task_group() as tg:
+            for _ in range(3):
+                tg.start_soon(worker)
+
+    run(main())
+    assert max_active == 1
+
+
 def test_rate_limiter_disabled_when_interval_zero(monkeypatch):
     slept = []
     monkeypatch.setattr(geo.anyio, "sleep", lambda s: slept.append(s))
     limiter = geo._RateLimiter()
-    run(limiter.acquire(0))
+
+    async def main():
+        async with limiter.request_slot(0):
+            pass
+
+    run(main())
     assert slept == []
 
 
 # --------------------------- find_nearby_places tool (validation) ---------------------------
+
+async def _empty_nearby_towns(lat, lon, n, exclude):
+    return []
+
 
 def test_find_nearby_places_empty_category_raises(tool_fns):
     fn = tool_fns["find_nearby_places"]
@@ -543,8 +599,16 @@ def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
              "tags": {"name": "Far Cafe", "amenity": "cafe"}},
         ]
 
+    nearby_call = {}
+
+    async def fake_nearby_towns(lat, lon, n, exclude):
+        nearby_call.update(lat=lat, lon=lon, n=n, exclude=exclude)
+        return [{"name": "Beaverton", "latitude": 45.49, "longitude": -122.80,
+                 "distance_m": 12000, "place_type": "city"}]
+
     monkeypatch.setattr(geo, "_geocode", fake_geocode)
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", fake_nearby_towns)
 
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(category="cafe", near="Portland", radius_m=2000, limit=5)))
@@ -554,6 +618,14 @@ def test_find_nearby_places_happy_path(monkeypatch, tool_fns):
     # Results are sorted nearest-first.
     assert out["results"][0]["name"] == "Near Cafe"
     assert out["results"][0]["distance_m"] <= out["results"][1]["distance_m"]
+    assert out["nearby_towns"][0]["name"] == "Beaverton"
+    assert out["nearby_towns_radius_m"] == geo.cfg.nearby_towns_radius_m
+    assert nearby_call == {
+        "lat": 45.52,
+        "lon": -122.68,
+        "n": geo.cfg.max_nearby_towns,
+        "exclude": "Portland, OR",
+    }
 
 
 def test_find_nearby_places_accepts_coordinates_in_near(monkeypatch, tool_fns):
@@ -569,6 +641,7 @@ def test_find_nearby_places_accepts_coordinates_in_near(monkeypatch, tool_fns):
         ]
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="coffee",
@@ -596,6 +669,7 @@ def test_find_nearby_places_accepts_osm_url_as_center(monkeypatch, tool_fns):
 
     monkeypatch.setattr(geo, "_lookup_osm_object", fake_lookup_osm_object)
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="coffee",
@@ -617,6 +691,7 @@ def test_find_nearby_places_clamps_radius(monkeypatch, tool_fns):
         return []
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     out = _json.loads(run(fn(
         category="cafe", latitude=45.0, longitude=-122.0,
@@ -643,6 +718,7 @@ def test_find_nearby_places_name_search_query_is_key_constrained(monkeypatch, to
         return []
 
     monkeypatch.setattr(geo, "_overpass", fake_overpass)
+    monkeypatch.setattr(geo, "_nearby_towns", _empty_nearby_towns)
     fn = tool_fns["find_nearby_places"]
     run(fn(category="Starbucks", latitude=45.0, longitude=-122.0))
     ql = captured["ql"]
