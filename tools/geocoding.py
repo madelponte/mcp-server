@@ -24,6 +24,7 @@ import math
 import re
 import time
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Annotated
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -74,29 +75,38 @@ _cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 # Both OpenStreetMap backends (Nominatim and Overpass) rate-limit aggressive
 # callers (Nominatim caps at ~1 req/sec; Overpass returns 429/504 when its few
 # query slots are saturated). A model can fire several find_nearby_places calls at
-# once, so a single shared limiter serializes every request to either backend
-# through a lock and spaces them by the configured interval. anyio.Lock is
-# FIFO-fair, so concurrent callers are effectively queued and dispatched in
-# arrival order — a burst waits its turn instead of stampeding the APIs. anyio
-# primitives keep this on the event loop without blocking it. The limiter is
-# module-global so the spacing holds across every concurrent tool invocation.
+# once, so a single shared limiter queues every request to either backend, holds
+# the queue slot until the HTTP response arrives, and enforces the configured
+# interval between request starts. Holding the slot is important: spacing only the
+# request starts still lets slow Overpass queries overlap and exhaust its slots.
+# anyio.Lock is FIFO-fair, so a burst waits its turn without blocking the event
+# loop. The limiter is module-global so this holds across every tool invocation.
 class _RateLimiter:
-    """Serializes calls and spaces consecutive ones by `interval` seconds."""
+    """Serializes full requests and spaces consecutive starts by `interval`."""
 
     def __init__(self) -> None:
         self._lock = anyio.Lock()
         self._last_call = 0.0
 
-    async def acquire(self, interval: float) -> None:
-        """Block until at least `interval` seconds have passed since the previous
-        acquire (no-op when interval <= 0, e.g. when self-hosting)."""
+    async def _wait(self, interval: float) -> None:
+        wait = self._last_call + interval - time.monotonic()
+        if wait > 0:
+            await anyio.sleep(wait)
+        self._last_call = time.monotonic()
+
+    @asynccontextmanager
+    async def request_slot(self, interval: float):
+        """Queue a full HTTP request, preventing concurrent backend calls.
+
+        Queueing is disabled with the throttle when ``interval <= 0`` so a
+        self-hosted deployment can retain full concurrency.
+        """
         if interval <= 0:
+            yield
             return
         async with self._lock:
-            wait = self._last_call + interval - time.monotonic()
-            if wait > 0:
-                await anyio.sleep(wait)
-            self._last_call = time.monotonic()
+            await self._wait(interval)
+            yield
 
 
 _osm_limiter = _RateLimiter()
@@ -486,15 +496,15 @@ async def _geocode(query: str, limit: int, detailed: bool = False) -> list[dict]
     url = cfg.nominatim_url.rstrip("/") + "/search"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(f"Geocoding request timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
@@ -579,15 +589,15 @@ async def _reverse_geocode(lat: float, lon: float, detailed: bool = False) -> di
     url = cfg.nominatim_url.rstrip("/") + "/reverse"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(
             f"Reverse geocoding request timed out after {cfg.http_timeout_seconds}s."
@@ -661,15 +671,15 @@ async def _lookup_osm_object(osm_type: str, osm_id: str, detailed: bool = False)
     url = cfg.nominatim_url.rstrip("/") + "/lookup"
     headers = {"User-Agent": cfg.user_agent, "Accept-Language": cfg.language}
 
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
     try:
         client = _http_client()
-        resp = await client.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=cfg.http_timeout_seconds,
-        )
+        async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+            resp = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cfg.http_timeout_seconds,
+            )
     except httpx.TimeoutException:
         raise ToolError(f"OSM object lookup timed out after {cfg.http_timeout_seconds}s.")
     except httpx.HTTPError as exc:
@@ -761,6 +771,17 @@ async def _place_lookup_osm_object(osm_type: str, osm_id: str) -> dict:
 
 # -------------------------------- Overpass -------------------------------
 
+def _overpass_endpoints() -> list[str]:
+    """Return the primary and de-duplicated configured fallback endpoints."""
+    urls = [cfg.overpass_url, *cfg.overpass_fallback_urls.split(",")]
+    endpoints = []
+    for value in urls:
+        url = value.strip()
+        if url and url not in endpoints:
+            endpoints.append(url)
+    return endpoints
+
+
 async def _overpass(query_ql: str) -> list[dict]:
     """Run an Overpass QL query and return its `elements`. Raises ToolError on
     failure; an empty element list is returned as-is (valid-but-empty)."""
@@ -769,44 +790,48 @@ async def _overpass(query_ql: str) -> list[dict]:
     if cached is not None:
         return cached
 
-    # Space requests so a burst of concurrent tool calls is queued rather than
-    # stampeding Overpass (which answers a flood with 429/504). Shares the single
-    # OpenStreetMap limiter with Nominatim. Done after the cache check so a cache
-    # hit doesn't needlessly consume the rate budget.
-    await _osm_limiter.acquire(cfg.min_request_interval_seconds)
-
+    # Queue requests so concurrent tool calls cannot stampede Overpass. If one
+    # public instance is transiently unavailable, try the configured fallbacks;
+    # public Overpass mirrors frequently overload independently of one another.
+    # The same queue slot covers all attempts so failover cannot create a burst.
     headers = {"User-Agent": cfg.user_agent}
-    try:
-        client = _http_client()
-        resp = await client.post(
-            cfg.overpass_url,
-            data={"data": query_ql},
-            headers=headers,
-            timeout=cfg.overpass_timeout_seconds,
-        )
-    except httpx.TimeoutException:
-        raise ToolError(
-            f"Overpass request timed out after {cfg.overpass_timeout_seconds}s. "
-            "Try a smaller radius or a more specific category."
-        )
-    except httpx.HTTPError as exc:
-        raise ToolError(
-            "Network error contacting Overpass: "
-            f"{_backend_error(exc, cfg.overpass_url)}"
-        )
+    endpoints = _overpass_endpoints()
+    if not endpoints:
+        raise ToolError("No Overpass endpoint is configured.")
 
-    if resp.status_code == 429:
-        raise ToolError(
-            "Overpass rate-limited the request (HTTP 429). Wait a moment and "
-            "retry, or point GEO_OVERPASS_URL at your own instance."
-        )
-    if resp.status_code in (504, 502, 503):
-        raise ToolError(
-            f"Overpass is overloaded (HTTP {resp.status_code}). Retry shortly or "
-            "narrow the query (smaller radius / more specific category)."
-        )
-    if resp.status_code >= 400:
-        raise ToolError(f"Overpass error (HTTP {resp.status_code}): {resp.text[:200]}")
+    failures = []
+    client = _http_client()
+    async with _osm_limiter.request_slot(cfg.min_request_interval_seconds):
+        for endpoint in endpoints:
+            endpoint_name = urlparse(endpoint).hostname or "Overpass endpoint"
+            try:
+                resp = await client.post(
+                    endpoint,
+                    data={"data": query_ql},
+                    headers=headers,
+                    timeout=cfg.overpass_timeout_seconds,
+                )
+            except httpx.TimeoutException:
+                failures.append(f"{endpoint_name}: timeout")
+                continue
+            except httpx.HTTPError as exc:
+                failures.append(f"{endpoint_name}: {_backend_error(exc, endpoint)}")
+                continue
+
+            if resp.status_code in (429, 502, 503, 504):
+                failures.append(f"{endpoint_name}: HTTP {resp.status_code}")
+                continue
+            if resp.status_code >= 400:
+                raise ToolError(
+                    f"Overpass error (HTTP {resp.status_code}): {resp.text[:200]}"
+                )
+            break
+        else:
+            summary = "; ".join(failures)
+            raise ToolError(
+                "All configured Overpass endpoints were unavailable or rate-limited"
+                + (f": {summary}" if summary else ".")
+            )
 
     try:
         data = resp.json()
@@ -889,8 +914,8 @@ async def _nearby_towns(
 _RETURN_SCHEMA = (
     "Search returns {center:{latitude,longitude,name?},count,results:[{name,"
     "latitude,longitude,distance_m,category,cuisine?,address?,opening_hours?,"
-    "phone?,website?}],nearby_towns?:[{name,latitude,longitude,distance_m,"
-    "place_type?,population?}]}"
+    "phone?,website?}],nearby_towns_radius_m,nearby_towns:[{name,latitude,"
+    "longitude,distance_m,place_type?,population?}]}"
 )
 
 _PLACE_RETURN_SCHEMA = (
@@ -909,7 +934,7 @@ def register(mcp: FastMCP) -> None:
         "pharmacy, atm, "
         "hotel, park, gym, …); prefix food with a diet (vegan/vegetarian/halal/"
         'kosher/gluten-free); unknown words match names ("Starbucks"). '
-        f"include_nearby_towns=true also lists towns within {cfg.nearby_towns_radius_m} m "
+        f"Every POI search also lists nearby towns within {cfg.nearby_towns_radius_m} m "
         "to recenter a follow-up search.\n"
         "place_details=true: ignore category/radius/limit and return rich info "
         "ABOUT the place in `near` or at latitude+longitude (coords, bounding "
@@ -939,13 +964,11 @@ def register(mcp: FastMCP) -> None:
                 "(larger is clamped)."
             ),
         ] = None,
-        include_nearby_towns: bool = False,
         nearby_towns_limit: Annotated[
             int | None,
             Field(
-                description="Max nearby towns, nearest-first. Default & max "
-                f"{cfg.max_nearby_towns} (larger is clamped). Needs "
-                "include_nearby_towns=true."
+                description="Max automatically included nearby towns, nearest-first. "
+                f"Default & max {cfg.max_nearby_towns} (larger is clamped)."
             ),
         ] = None,
         place_details: bool = False,
@@ -957,7 +980,6 @@ def register(mcp: FastMCP) -> None:
         :param near: Place/address (geocoded), "lat,lon", or map URL with coords.
         :param latitude: Coords (with longitude).
         :param longitude: Coords (with latitude).
-        :param include_nearby_towns: Also return surrounding towns to recenter on.
         :param place_details: Look up rich info about the place in `near` instead
             of searching for nearby POIs.
         """
@@ -970,7 +992,6 @@ def register(mcp: FastMCP) -> None:
             longitude=longitude,
             radius_m=radius_m,
             limit=limit,
-            include_nearby_towns=include_nearby_towns,
             nearby_towns_limit=nearby_towns_limit,
             place_details=place_details,
         )
@@ -1125,16 +1146,12 @@ def register(mcp: FastMCP) -> None:
             "results": results,
         }
 
-        # Optional companion list of surrounding towns to seed follow-up searches.
-        # Only added when asked, so the common case stays lean. max_nearby_towns
-        # doubles as the default (omitting the count returns up to the cap).
-        if include_nearby_towns:
-            towns_n = _clamp(
-                nearby_towns_limit, cfg.max_nearby_towns, cfg.max_nearby_towns
-            )
-            payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
-            payload["nearby_towns"] = await _nearby_towns(
-                lat, lon, towns_n, center_name
-            )
+        # Always include surrounding towns so models can seed follow-up searches
+        # without first discovering and opting into a companion lookup.
+        towns_n = _clamp(
+            nearby_towns_limit, cfg.max_nearby_towns, cfg.max_nearby_towns
+        )
+        payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
+        payload["nearby_towns"] = await _nearby_towns(lat, lon, towns_n, center_name)
 
         return log_result(log, "find_nearby_places", to_json(payload))
