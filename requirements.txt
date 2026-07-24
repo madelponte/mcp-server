@@ -16,7 +16,7 @@ anyio>=4.14.2
 # Accept-Encoding) the compression schemes it can import: with these installed it
 # adds Brotli ("br") and Zstandard ("zstd"). Many CDNs return those, and
 # advertising the full set real browsers send makes a direct fetch look less like
-# a bot, so fewer pages fall through to the FlareSolverr/Wayback fallbacks.
+# a bot, so fewer pages fall through to the FlareSolverr/Firecrawl fallbacks.
 brotli>=1.2.0
 zstandard>=0.25.0
 

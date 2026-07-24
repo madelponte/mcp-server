@@ -34,19 +34,19 @@ from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
+    DownloadTooLargeError,
+    SSRFError,
     _cached_resilient_fetch,
-    _fetch_from_wayback,
     _is_tika_document,
+    _render_with_firecrawl,
     _render_with_flaresolverr,
     _sniff_document_bytes,
     _tika_extract,
 )
 from .web_extract import (
     _find_section,
-    _markdown_from_html,
     _markdown_from_soup,
     _page_title,
-    _plain_text_from_html,
     _plain_text_from_soup,
     _structured_from_html,
     _structured_section_from_html,
@@ -106,11 +106,8 @@ def _fetch_page_desc(prefix: str) -> str:
 # straight to what it needs instead of paging.
 # ---------------------------------------------------------------------------
 
-# Statuses that mean the URL itself is gone/unavailable rather than bot-walled:
-# 404 (not found), 410 (gone), 451 (unavailable for legal reasons). On these,
-# fetch_page tries the Wayback Machine before raising the live HTTP error, since
-# archive.org may still hold the original content. (Block/throttle statuses are
-# handled separately by `_is_blocked_response`, not here.)
+# Statuses where a remote renderer may still recover content even though the
+# direct origin/CDN says the URL is unavailable.
 _GONE_STATUSES = {404, 410, 451}
 
 _OFFSET_HINT = (
@@ -476,19 +473,6 @@ def _provenance(
 # Single-URL fetch
 # ---------------------------------------------------------------------------
 
-def _render_text_body(html: str, base_url: str) -> tuple[str, str]:
-    """Render page HTML to ``(body, format)`` for text mode.
-
-    `format` is "markdown" or "text" per the WEB_SEARCH_MARKDOWN valve. Used by
-    the Wayback-archive paths, which need only the body (the title is taken
-    separately there). The live path uses `_render_text_mode`, which parses once
-    and returns the title too.
-    """
-    if cfg.markdown:
-        return _markdown_from_html(html, base_url), "markdown"
-    return _plain_text_from_html(html), "text"
-
-
 # `_render_text_mode` and `_parse_section` parse the page HTML and run
 # markdownify — both CPU-bound — so callers offload them to a worker thread
 # (`anyio.to_thread.run_sync`), per the sync-in-async convention: on the
@@ -544,133 +528,23 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
-def _format_wayback_date(ts: str) -> str:
-    """Format a 14-digit Wayback timestamp (YYYYMMDDhhmmss) as 'YYYY-MM-DD'."""
-    if len(ts) >= 8 and ts[:8].isdigit():
-        return f"{ts[0:4]}-{ts[4:6]}-{ts[6:8]}"
-    return ts or "an unknown date"
-
-
-def _strip_wayback_chrome(html: str) -> str:
-    """Remove the Wayback Machine's injected toolbar/banner from a replay DOM.
-
-    Rendering a Wayback *replay* URL yields the page plus archive.org's own
-    navigation chrome (``#wm-ipp-base`` etc.). The extractor prefers an
-    ``<article>``/``<main>`` and usually ignores the chrome anyway, but strip it
-    so it can't pollute content on pages whose body falls back to ``<body>``.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    for el_id in ("wm-ipp-base", "wm-ipp", "donato"):
-        el = soup.find(id=el_id)
-        if el:
-            el.decompose()
-    return str(soup)
-
-
-async def _wayback_content(fetch_url: str) -> dict | None:
-    """Recover readable text for `fetch_url` from the Wayback Machine, or None.
-
-    Tries the archived page's static HTML first (cheap; works when the snapshot
-    captured server-rendered text). If that snapshot is *itself* a JavaScript
-    shell — as a client-side-rendered SPA's archived main document is — and
-    FlareSolverr is configured, it renders the Wayback *replay* URL in a real
-    browser: Wayback serves the page's archived sub-resources/XHRs to that
-    browser, so the JS-built body can materialize from the archive (and without
-    the live site's API latency that defeated the live render). Returns
-    ``{text, plain, format, status, content_type, meta}`` on success, else None.
-    """
-    archived = await _fetch_from_wayback(fetch_url)
-    if not archived or not archived.get("text"):
-        return None
-
-    text = archived["text"]
-    status = archived.get("status")
-    ctype = (archived.get("content_type") or "text/html").lower()
+async def _try_firecrawl(fetch_url: str) -> tuple[dict | None, str | None]:
+    """Best-effort Firecrawl fallback, returning a usable fetch or an error note."""
+    if not cfg.firecrawl_api_key.strip():
+        return None, None
     try:
-        plain, fmt = _render_text_body(text, fetch_url)
-    except Exception:
-        plain, fmt = "", "markdown"
-
-    # Archived main document is a JS shell — render the replay in a real browser.
-    if _is_contentless(plain) and cfg.flaresolverr_url and archived.get("wayback_url"):
-        try:
-            rr = await _render_with_flaresolverr(archived["wayback_url"])
-        except Exception:
-            rr = None
-        if rr and rr.get("text"):
-            stripped = _strip_wayback_chrome(rr["text"])
-            try:
-                p2, f2 = _render_text_body(stripped, fetch_url)
-            except Exception:
-                p2, f2 = "", fmt
-            if not _is_contentless(p2):
-                text, plain, fmt = stripped, p2, f2
-                status = rr.get("status", status)
-                ctype = (rr.get("content_type") or ctype).lower()
-
-    if _is_contentless(plain):
-        return None
-    ts = archived.get("wayback_timestamp", "")
-    return {
-        "text": text,
-        "plain": plain,
-        "format": fmt,
-        "status": status,
-        "content_type": ctype,
-        "meta": {"timestamp": ts, "date": _format_wayback_date(ts), "url": archived.get("wayback_url")},
-    }
-
-
-async def _archived_text_payload(
-    url: str, fetch_url: str, wb: dict, *, query: str | None, offset: int, reason: str
-) -> dict:
-    """Build a fetch_page text payload from a `_wayback_content` result.
-
-    Shared by both fallbacks that substitute an archived copy for an unreadable
-    live page (a blocked/throttled page, or a JS empty shell). Honors `query` and
-    `offset` like the live text path, and tags the result as archived
-    (``via="archive.org"`` + an ``archived_snapshot`` field + a staleness note
-    prefixed by `reason`, e.g. "The live page is rate-limited (HTTP 429)") so the
-    model treats it as possibly out of date rather than live.
-    """
-    text, plain, text_format = wb["text"], wb["plain"], wb["format"]
-    meta = wb["meta"]
-    soup_title = _page_title(BeautifulSoup(text, "lxml"))
-    payload = {
-        "url": fetch_url,
-        **_provenance(url, fetch_url, wb["status"], wb["content_type"], "archive.org"),
-        "format": text_format,
-        "title": soup_title,
-    }
-    if query:
-        qres = await _query_payload(plain, query, fetch_url, kind="content")
-        content = qres.pop("content")
-        if soup_title:
-            content = f"{soup_title}\n\n{content}"
-        payload.update(qres)
-        _set_content(payload, content, offset=offset)
-    else:
-        if soup_title:
-            plain = f"{soup_title}\n\n{plain}"
-        _set_content(payload, plain, offset=offset)
-    # Tag after content is set, so it survives the query path's `update()` and
-    # merges onto (not under) any truncation note from `_set_content`.
-    _tag_archived_payload(payload, meta, reason)
-    return payload
-
-
-def _archive_note(reason: str, meta: dict) -> str:
-    """Human note attached to payloads recovered from archive.org."""
-    return (
-        f"{reason}; this is an archived snapshot from {meta['date']} via the "
-        "Wayback Machine and may be out of date."
-    )
-
-
-def _tag_archived_payload(payload: dict, meta: dict, reason: str) -> None:
-    """Add archive provenance fields to a payload built from Wayback HTML."""
-    payload["archived_snapshot"] = meta
-    payload["note"] = _join_note(payload.get("note"), _archive_note(reason, meta))
+        fetched = await _render_with_firecrawl(fetch_url)
+    except Exception as exc:
+        api_password = urlparse(cfg.firecrawl_api_url).password or ""
+        return None, redact_secrets(exc, cfg.firecrawl_api_key, api_password)
+    status = fetched.get("status")
+    if status is not None and status >= 400:
+        return None, f"Firecrawl received HTTP {status} from the target page"
+    if fetched.get("blocked_detected"):
+        return None, "Firecrawl also received a bot/CAPTCHA challenge"
+    if not fetched.get("text"):
+        return None, "Firecrawl returned no rendered HTML"
+    return fetched, None
 
 
 def _unsupported_media_error(
@@ -757,14 +631,33 @@ async def _fetch_one(
 
     try:
         fetched = await _cached_resilient_fetch(fetch_url)
-    except Exception as e:
+    except (SSRFError, DownloadTooLargeError) as e:
         backend_passwords = tuple(
             urlparse(endpoint).password or ""
-            for endpoint in (cfg.flaresolverr_url, cfg.tika_url)
+            for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
             if endpoint
         )
         detail = redact_secrets(e, *backend_passwords)
         raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
+    except Exception as e:
+        # A network-level direct failure has already gone through FlareSolverr
+        # inside `_cached_resilient_fetch`; Firecrawl is the final tier.
+        fetched, firecrawl_error = await _try_firecrawl(fetch_url)
+        if fetched is None:
+            backend_passwords = tuple(
+                urlparse(endpoint).password or ""
+                for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
+                if endpoint
+            )
+            detail = redact_secrets(e, *backend_passwords)
+            fallback_detail = (
+                f" Firecrawl also failed: {firecrawl_error}."
+                if firecrawl_error
+                else ""
+            )
+            raise ToolError(
+                f"Fetch failed for {fetch_url}: {detail}.{fallback_detail}"
+            )
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
@@ -779,69 +672,102 @@ async def _fetch_one(
     # convention guards against), so raise instead — telling the model the
     # page is protected, and the operator what (if anything) is left to try.
     if fetched.get("blocked_detected"):
-        # FlareSolverr (already attempted inside _resilient_fetch on a block/429)
-        # couldn't clear the wall. The page itself exists, so try the Wayback
-        # Machine — the same archived-snapshot rescue used for empty shells —
-        # before giving up. Returned content is clearly flagged as archived.
-        if cfg.wayback_fallback:
-            wb = await _wayback_content(fetch_url)
-            if wb:
-                reason = (
-                    f"The live page is rate-limited (HTTP {status})"
-                    if status == 429
-                    else f"The live page is blocked (HTTP {status})"
-                )
-                return await _archived_text_payload(
-                    url, fetch_url, wb, query=query, offset=offset, reason=reason
-                )
-        if via == "flaresolverr":
-            detail = (
-                "the FlareSolverr fallback rendered it in a real browser but "
-                "the page is still an interactive challenge (e.g. a "
-                "'Press & Hold' / CAPTCHA) it cannot solve"
-            )
-        elif fetched.get("flaresolverr_error"):
-            detail = (
-                "the FlareSolverr fallback could not fetch it "
-                f"({fetched['flaresolverr_error']})"
-            )
-        elif cfg.flaresolverr_url:
-            detail = "the FlareSolverr fallback did not resolve it"
+        # FlareSolverr was already attempted inside `_resilient_fetch` for a
+        # detected wall/429. Firecrawl is the final tier before this becomes a
+        # real tool error.
+        recovered, firecrawl_error = await _try_firecrawl(fetch_url)
+        if recovered is not None:
+            fetched = recovered
+            status = fetched["status"]
+            ctype = (fetched.get("content_type") or "").lower()
+            via = fetched.get("via")
         else:
-            detail = (
-                "no FlareSolverr fallback is configured "
-                "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
+            if via == "flaresolverr":
+                detail = (
+                    "the FlareSolverr fallback rendered it in a real browser but "
+                    "the page is still an interactive challenge (e.g. a "
+                    "'Press & Hold' / CAPTCHA) it cannot solve"
+                )
+            elif fetched.get("flaresolverr_error"):
+                detail = (
+                    "the FlareSolverr fallback could not fetch it "
+                    f"({fetched['flaresolverr_error']})"
+                )
+            elif cfg.flaresolverr_url:
+                detail = "the FlareSolverr fallback did not resolve it"
+            else:
+                detail = (
+                    "no FlareSolverr fallback is configured "
+                    "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
+                )
+            firecrawl_detail = (
+                f" Firecrawl also failed: {firecrawl_error}."
+                if firecrawl_error
+                else (
+                    " No Firecrawl fallback is configured "
+                    "(set WEB_SEARCH_FIRECRAWL_API_KEY to enable it)."
+                )
             )
-        wall = "rate limit" if status == 429 else "bot/CAPTCHA wall"
-        raise ToolError(
-            f"{fetch_url} is behind a {wall} (HTTP {status}) and "
-            f"{detail}. The page content could not be retrieved."
-        )
+            wall = "rate limit" if status == 429 else "bot/CAPTCHA wall"
+            raise ToolError(
+                f"{fetch_url} is behind a {wall} (HTTP {status}) and "
+                f"{detail}.{firecrawl_detail} The page content could not be retrieved."
+            )
 
-    # A dead/removed/legally-unavailable URL (404 Gone-style, 410, 451): the live
-    # page is no longer there, but archive.org may still hold the original.
-    # Try that recovery before applying the consistent HTTP-error rule below.
-    if status in _GONE_STATUSES and cfg.wayback_fallback:
-        wb = await _wayback_content(fetch_url)
-        if wb:
-            return await _archived_text_payload(
-                url, fetch_url, wb, query=query, offset=offset,
-                reason=f"The live page is unavailable (HTTP {status})",
-            )
+    # Gone/unavailable URLs used to get the archive fallback. Preserve that
+    # recovery scope while replacing its implementation: finish the ordered
+    # FlareSolverr -> Firecrawl chain, then apply the normal HTTP-error rule.
+    http_fallback_details = []
+    if status in _GONE_STATUSES:
+        flaresolverr_error = None
+        if via != "flaresolverr" and cfg.flaresolverr_url:
+            try:
+                rendered = await _render_with_flaresolverr(fetch_url)
+            except Exception as exc:
+                flaresolverr_error = str(exc)
+                rendered = None
+            if (
+                rendered
+                and rendered.get("text")
+                and not rendered.get("blocked_detected")
+                and (rendered.get("status") is None or rendered["status"] < 400)
+            ):
+                fetched = rendered
+                status = fetched["status"]
+                ctype = (fetched.get("content_type") or "").lower()
+                via = fetched.get("via")
+
+        if status is not None and status >= 400:
+            recovered, firecrawl_error = await _try_firecrawl(fetch_url)
+            if recovered is not None:
+                fetched = recovered
+                status = fetched["status"]
+                ctype = (fetched.get("content_type") or "").lower()
+                via = fetched.get("via")
+            else:
+                if flaresolverr_error:
+                    http_fallback_details.append(
+                        f"FlareSolverr failed: {flaresolverr_error}"
+                    )
+                if firecrawl_error:
+                    http_fallback_details.append(
+                        f"Firecrawl failed: {firecrawl_error}"
+                    )
+                elif not cfg.firecrawl_api_key.strip():
+                    http_fallback_details.append("Firecrawl is not configured")
 
     # Never return an HTTP error document as page content. Besides violating the
     # tool's error contract, doing so lets a CDN/proxy error page masquerade as
-    # the requested article, JSON payload, or document. Gone statuses get the
-    # archive recovery attempt above; all unrecovered 4xx/5xx responses fail here.
+    # the requested article, JSON payload, or document.
     if status is not None and status >= 400:
-        archive_detail = (
-            " No usable archived snapshot was found."
-            if status in _GONE_STATUSES and cfg.wayback_fallback
+        fallback_detail = (
+            f" {'; '.join(http_fallback_details)}."
+            if http_fallback_details
             else ""
         )
         raise ToolError(
             f"{fetch_url} returned HTTP {status}; page content was not returned."
-            f"{archive_detail}"
+            f"{fallback_detail}"
         )
 
     # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
@@ -908,8 +834,6 @@ async def _fetch_one(
     # HTML / text
     # `query` is a content search, so it overrides "structured" (which would
     # return only metadata); structured mode applies only without a query.
-    archive_meta = None
-    archive_reason = None
     try:
         soup_title, plain, text_format = await anyio.to_thread.run_sync(
             _render_text_mode, text, fetch_url
@@ -919,9 +843,13 @@ async def _fetch_one(
 
     # Empty-shell handling. Check this before section/structured parsing, since
     # a static JS shell can otherwise look like "section not found" or sparse
-    # metadata even though a browser/archive fallback can recover the page body.
+    # metadata even though a browser fallback can recover the page body.
     tried_render = False
-    if _is_contentless(plain) and via != "flaresolverr" and cfg.flaresolverr_url:
+    if (
+        _is_contentless(plain)
+        and via not in ("flaresolverr", "firecrawl")
+        and cfg.flaresolverr_url
+    ):
         tried_render = True
         try:
             rendered = await _render_with_flaresolverr(fetch_url)
@@ -939,41 +867,50 @@ async def _fetch_one(
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-    tried_wayback = False
-    if _is_contentless(plain) and cfg.wayback_fallback:
-        tried_wayback = True
-        wb = await _wayback_content(fetch_url)
-        if wb:
-            text = wb["text"]
-            plain = wb["plain"]
-            text_format = wb["format"]
-            status = wb["status"]
-            ctype = (wb.get("content_type") or ctype).lower()
-            via = "archive.org"
-            archive_meta = wb["meta"]
-            archive_reason = "The live page had no readable content"
-            soup_title = _page_title(BeautifulSoup(text, "lxml"))
+    tried_firecrawl = via == "firecrawl"
+    firecrawl_error = None
+    if (
+        _is_contentless(plain)
+        and via != "firecrawl"
+        and cfg.firecrawl_api_key.strip()
+    ):
+        tried_firecrawl = True
+        rendered, firecrawl_error = await _try_firecrawl(fetch_url)
+        if rendered is not None:
+            text = rendered["text"]
+            status = rendered["status"]
+            ctype = (rendered.get("content_type") or ctype).lower()
+            via = rendered.get("via")
+            try:
+                soup_title, plain, text_format = await anyio.to_thread.run_sync(
+                    _render_text_mode, text, fetch_url
+                )
+            except Exception as e:
+                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
     if _is_contentless(plain) and not (mode == "structured" and not query):
         tried = [
             name
             for name, used in (
                 ("the FlareSolverr browser fallback", tried_render),
-                ("the Wayback Machine archive", tried_wayback),
+                ("the Firecrawl fallback", tried_firecrawl),
             )
             if used
         ]
         if tried:
+            firecrawl_detail = (
+                f" Firecrawl failed: {firecrawl_error}." if firecrawl_error else ""
+            )
             hint = (
                 f"Even {' and '.join(tried)} produced no readable text, so the "
-                "content is loaded by a script that wasn't captured or no usable "
-                "archive exists. Try another source."
+                "content could not be recovered."
+                f"{firecrawl_detail} Try another source."
             )
         else:
             hint = (
-                "Enable the FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) or Wayback "
-                "(WEB_SEARCH_WAYBACK_FALLBACK) fallbacks to recover JavaScript-"
-                "rendered or archived pages, or fetch the article from another source."
+                "Enable FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) and configure "
+                "Firecrawl (WEB_SEARCH_FIRECRAWL_API_KEY) to recover JavaScript-"
+                "rendered pages, or fetch the article from another source."
             )
         titled = f" (page title: {soup_title!r})" if soup_title else ""
         raise ToolError(
@@ -1018,8 +955,6 @@ async def _fetch_one(
             "format": "structured",
             "content": structured,
         }
-        if archive_meta:
-            _tag_archived_payload(payload, archive_meta, archive_reason or "")
         return payload
 
     # mode == "text"
@@ -1058,8 +993,6 @@ async def _fetch_one(
         else:
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
         _set_content(section_payload, section_body, offset=offset)
-        if archive_meta:
-            _tag_archived_payload(section_payload, archive_meta, archive_reason or "")
         return section_payload
 
     # An undetected/bypassed block can't reach here: a detected wall on the
@@ -1083,9 +1016,6 @@ async def _fetch_one(
         if soup_title:
             plain = f"{soup_title}\n\n{plain}"
         _set_content(text_payload, plain, offset=offset)
-
-    if archive_meta:
-        _tag_archived_payload(text_payload, archive_meta, archive_reason or "")
 
     return text_payload
 

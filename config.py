@@ -111,14 +111,23 @@ class WebSearchSettings(BaseSettings):
         60000, description="maxTimeout passed to FlareSolverr, in milliseconds."
     )
 
-    wayback_fallback: bool = Field(
-        True,
+    firecrawl_api_url: str = Field(
+        "https://api.firecrawl.dev/v2/scrape",
+        description="Firecrawl v2 scrape endpoint used as the last-resort page fallback.",
+    )
+    firecrawl_api_key: str = Field(
+        "",
         description=(
-            "As a last resort, when fetch_page's live fetch (even after a "
-            "FlareSolverr render) yields no readable text, try the Internet "
-            "Archive's Wayback Machine for an archived snapshot of the page. The "
-            "snapshot may be out of date — it is clearly flagged as archived in "
-            "the result. Set false to disable the archive.org fallback."
+            "Firecrawl API key. When set, fetch_page uses Firecrawl only after "
+            "the direct and FlareSolverr paths fail to recover usable content. "
+            "Blank disables the Firecrawl fallback."
+        ),
+    )
+    firecrawl_timeout_seconds: float = Field(
+        60.0,
+        description=(
+            "Timeout for a Firecrawl scrape, in seconds (clamped to Firecrawl's "
+            "supported 1-300 second range)."
         ),
     )
 
@@ -158,7 +167,7 @@ class WebSearchSettings(BaseSettings):
             "document head, so this is far smaller than max_download_bytes: a result "
             "whose page exceeds it is left un-enriched rather than pulled in full, "
             "and — unlike a fetch_page read — enrichment skips the FlareSolverr/"
-            "Wayback fallbacks, so a single bot-walled hit can't slow the whole "
+            "Firecrawl fallbacks, so a single bot-walled hit can't slow the whole "
             "search. 0 = unbounded."
         ),
     )

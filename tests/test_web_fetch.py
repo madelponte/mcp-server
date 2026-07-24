@@ -406,6 +406,83 @@ def test_flaresolverr_rejects_chromium_navigation_error(patch_httpx):
         )
 
 
+def test_firecrawl_fetch_uses_v2_scrape_contract(patch_httpx):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers["authorization"]
+        seen["payload"] = json.loads(request.content)
+        payload = {
+            "success": True,
+            "data": {
+                "html": "<html><body><article>Rendered content.</article></body></html>",
+                "metadata": {
+                    "statusCode": 200,
+                    "contentType": "text/html; charset=utf-8",
+                },
+            },
+        }
+        return httpx.Response(200, json=payload)
+
+    patch_httpx(handler)
+    status, ctype, html = run(
+        web_fetch._firecrawl_fetch(
+            "https://example.com/page",
+            api_url="https://api.firecrawl.dev/v2/scrape",
+            api_key="fc-test",
+            timeout_seconds=60,
+            max_bytes=10000,
+        )
+    )
+    assert seen["url"] == "https://api.firecrawl.dev/v2/scrape"
+    assert seen["authorization"] == "Bearer fc-test"
+    assert seen["payload"] == {
+        "url": "https://example.com/page",
+        "formats": ["html"],
+        "onlyMainContent": False,
+        "timeout": 60000,
+    }
+    assert status == 200
+    assert ctype == "text/html; charset=utf-8"
+    assert "Rendered content." in html
+
+
+def test_firecrawl_fetch_surfaces_api_error(patch_httpx):
+    patch_httpx(
+        lambda request: httpx.Response(
+            429, json={"success": False, "error": "Request rate limit exceeded."}
+        )
+    )
+    with pytest.raises(RuntimeError, match="HTTP 429"):
+        run(
+            web_fetch._firecrawl_fetch(
+                "https://example.com/page",
+                api_url="https://api.firecrawl.dev/v2/scrape",
+                api_key="fc-test",
+                timeout_seconds=60,
+            )
+        )
+
+
+def test_firecrawl_rendered_body_obeys_download_cap(patch_httpx):
+    payload = {
+        "success": True,
+        "data": {"html": "x" * 100, "metadata": {"statusCode": 200}},
+    }
+    patch_httpx(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(DownloadTooLargeError):
+        run(
+            web_fetch._firecrawl_fetch(
+                "https://example.com/page",
+                api_url="https://api.firecrawl.dev/v2/scrape",
+                api_key="fc-test",
+                timeout_seconds=60,
+                max_bytes=10,
+            )
+        )
+
+
 def test_tika_output_obeys_download_cap(monkeypatch):
     class Response:
         encoding = "utf-8"

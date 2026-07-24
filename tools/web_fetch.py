@@ -17,7 +17,6 @@ import json
 import logging
 import re
 import socket
-from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
@@ -43,7 +42,7 @@ _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
 _page_inflight: dict[str, asyncio.Task] = {}
 
 # Lean search-result enrichment has its own in-flight map. It deliberately does
-# not use the full fetch path because enrichment skips browser/Wayback fallbacks,
+# not use the full fetch path because enrichment skips browser/Firecrawl fallbacks,
 # but concurrent enrichment of the same URL should still share the one direct,
 # byte-capped download.
 _enrich_inflight: dict[str, asyncio.Task] = {}
@@ -916,7 +915,7 @@ async def _enrich_fetch(url: str) -> dict | None:
       ``fetch_page`` read and this share a download), but
     * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
       fetch through the same SSRF-guarded redirect path — and **skips** the
-      FlareSolverr and Wayback fallbacks, so one bot-walled result among the top
+      FlareSolverr and Firecrawl fallbacks, so one bot-walled result among the top
       hits can't stall the whole ``search_web`` call.
 
     A page larger than the cap returns ``None`` (left un-enriched) rather than
@@ -990,64 +989,120 @@ async def _render_with_flaresolverr(url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Wayback Machine (archive.org) fallback
+# Firecrawl fallback
 # ---------------------------------------------------------------------------
 
-WAYBACK_AVAILABILITY_API = "https://archive.org/wayback/available"
+async def _firecrawl_fetch(
+    url: str,
+    *,
+    api_url: str,
+    api_key: str,
+    timeout_seconds: float,
+    max_bytes: int = 0,
+) -> tuple[int, str, str]:
+    """Render one URL through Firecrawl's synchronous v2 scrape endpoint.
 
-
-async def _fetch_from_wayback(url: str) -> dict | None:
-    """Fetch `url` from the Internet Archive's Wayback Machine as a last resort.
-
-    Used when the live page (even after a real-browser render) yields no readable
-    content, or has since changed/disappeared: a prior snapshot may have captured
-    text the live SPA hides behind JavaScript. Returns a raw-fetch dict in the
-    `_resilient_fetch` shape — with ``via="archive.org"`` and the snapshot's
-    ``wayback_timestamp`` / ``wayback_url`` — or ``None`` when no usable snapshot
-    exists. Best-effort: any error returns ``None`` rather than raising, since
-    this only ever runs after the live attempts already failed.
-
-    The snapshot is requested in ``id_`` (identity) mode, which returns the
-    original archived HTML with its original links and without the Wayback
-    toolbar/URL-rewriting, so the existing extractors handle it like a live page.
-    The snapshot fetch goes through `_cached_resilient_fetch`, so it is SSRF-
-    guarded and cached like any other; the availability API is a fixed host.
+    The response is requested as rendered HTML so fetch_page can keep using its
+    existing BeautifulSoup extraction for text, structured metadata, sections,
+    and query filtering. The JSON envelope and returned HTML both obey the same
+    download cap as the direct and FlareSolverr paths.
     """
-    now = datetime.now(tz=timezone.utc).strftime("%Y%m%d%H%M%S")
-    try:
-        async with httpx.AsyncClient(timeout=cfg.http_timeout_seconds) as client:
-            resp = await client.get(
-                WAYBACK_AVAILABILITY_API, params={"url": url, "timestamp": now}
-            )
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception:
-        return None
+    timeout_ms = max(1000, min(300000, int(timeout_seconds * 1000)))
+    payload = {
+        "url": url,
+        "formats": ["html"],
+        "onlyMainContent": False,
+        "timeout": timeout_ms,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    http_timeout = timeout_ms / 1000 + 10
 
+    async with httpx.AsyncClient(timeout=http_timeout) as client:
+        async with client.stream("POST", api_url, json=payload, headers=headers) as resp:
+            chunks: list[bytes] = []
+            total = 0
+            # Firecrawl wraps the rendered page in JSON. Match the modest
+            # protocol-overhead allowance used for FlareSolverr.
+            response_limit = max_bytes + 1048576 if max_bytes else 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if response_limit and total > response_limit:
+                    raise DownloadTooLargeError(
+                        f"Firecrawl response for {url!r} exceeds the configured "
+                        f"{max_bytes}-byte download cap."
+                    )
+                chunks.append(chunk)
+            response_status = resp.status_code
+
+    try:
+        response_data = json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("Firecrawl returned invalid JSON.") from exc
+    if not isinstance(response_data, dict):
+        raise RuntimeError("Firecrawl returned a JSON value that is not an object.")
+
+    if response_status < 200 or response_status >= 300:
+        message = str(response_data.get("error") or "unknown Firecrawl error")[:500]
+        raise RuntimeError(f"Firecrawl returned HTTP {response_status}: {message}")
+    if response_data.get("success") is not True:
+        message = str(response_data.get("error") or "scrape was unsuccessful")[:500]
+        raise RuntimeError(f"Firecrawl failed: {message}")
+
+    data = response_data.get("data")
     if not isinstance(data, dict):
-        return None
-    snapshots = data.get("archived_snapshots") or {}
-    if not isinstance(snapshots, dict):
-        return None
-    snap = snapshots.get("closest") or {}
-    if not isinstance(snap, dict):
-        return None
-    timestamp = snap.get("timestamp") or ""
-    # Accept a snapshot only when it is available and (per the API) was a 200
-    # capture; some snapshots omit `status`, which we tolerate.
-    if not snap.get("available") or not timestamp:
-        return None
-    if str(snap.get("status") or "200") != "200":
-        return None
+        raise RuntimeError("Firecrawl response did not contain a data object.")
+    html = data.get("html")
+    if not isinstance(html, str) or not html:
+        raise RuntimeError("Firecrawl returned no rendered HTML.")
+    if max_bytes and len(html.encode("utf-8")) > max_bytes:
+        raise DownloadTooLargeError(
+            f"Rendered response from {url!r} exceeds the configured "
+            f"{max_bytes}-byte download cap."
+        )
 
-    snapshot_url = f"https://web.archive.org/web/{timestamp}id_/{url}"
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
     try:
-        fetched = await _cached_resilient_fetch(snapshot_url)
-    except Exception:
-        return None
+        status = int(metadata.get("statusCode") or 200)
+    except (TypeError, ValueError):
+        status = 200
+    content_type = str(metadata.get("contentType") or "text/html")
+    browser_error = _chromium_network_error_code(html)
+    if browser_error:
+        raise BrowserRenderError(
+            f"Firecrawl's browser could not load {url!r} ({browser_error})."
+        )
+    return status, content_type, html
 
-    result = dict(fetched)
-    result["via"] = "archive.org"
-    result["wayback_timestamp"] = timestamp
-    result["wayback_url"] = f"https://web.archive.org/web/{timestamp}/{url}"
+
+async def _render_with_firecrawl(url: str) -> dict:
+    """Fetch rendered HTML through Firecrawl after local fallbacks are exhausted."""
+    api_url = cfg.firecrawl_api_url.strip()
+    api_key = cfg.firecrawl_api_key.strip()
+    if not api_url or not api_key:
+        raise RuntimeError(
+            "Firecrawl is not configured (set WEB_SEARCH_FIRECRAWL_API_KEY)."
+        )
+
+    await _assert_url_allowed(url)
+    status, content_type, html = await _firecrawl_fetch(
+        url,
+        api_url=api_url,
+        api_key=api_key,
+        timeout_seconds=cfg.firecrawl_timeout_seconds,
+        max_bytes=cfg.max_download_bytes,
+    )
+    result = {
+        "url": url,
+        "status": status,
+        "content_type": content_type,
+        "text": html,
+        "bytes": None,
+        "via": "firecrawl",
+        "blocked_detected": _is_blocked_response(status, html, {}),
+    }
+    if html and status < 400 and not result["blocked_detected"]:
+        _cache_page(url, result)
     return result
