@@ -93,6 +93,26 @@ def test_text_mode_markdown(monkeypatch, tool_fns):
     assert "Body text here." in out["content"]
 
 
+def test_firecrawl_metadata_title_overrides_body_widget_title(monkeypatch, tool_fns):
+    fetched = _fetched(
+        text=(
+            "<html><body><div><title>reCAPTCHA</title></div>"
+            "<main><h1>ASUS Zenbook A14</h1><p>Recovered product details.</p></main>"
+            "</body></html>"
+        ),
+        via="firecrawl",
+    )
+    fetched["title"] = "ASUS Zenbook A14 - Best Buy"
+    _patch_fetch(monkeypatch, fetched)
+
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/product")))
+
+    assert out["via"] == "firecrawl"
+    assert out["title"] == "ASUS Zenbook A14 - Best Buy"
+    assert out["content"].startswith("ASUS Zenbook A14 - Best Buy")
+    assert "Recovered product details." in out["content"]
+
+
 # --------------------------- structured mode ---------------------------
 
 def test_structured_mode(monkeypatch, tool_fns):
@@ -102,6 +122,24 @@ def test_structured_mode(monkeypatch, tool_fns):
     assert out["format"] == "structured"
     assert out["content"]["title"] == "T"
     assert out["content"]["description"] == "D"
+
+
+def test_structured_mode_prefers_firecrawl_metadata_title(monkeypatch, tool_fns):
+    fetched = _fetched(
+        text=(
+            "<html><body><div><title>reCAPTCHA</title></div>"
+            "<main><h1>ASUS Zenbook A14</h1></main></body></html>"
+        ),
+        via="firecrawl",
+    )
+    fetched["title"] = "ASUS Zenbook A14 - Best Buy"
+    _patch_fetch(monkeypatch, fetched)
+
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com/product", mode="structured"))
+    )
+
+    assert out["content"]["title"] == "ASUS Zenbook A14 - Best Buy"
 
 
 def test_structured_mode_with_section_scopes_headings(monkeypatch, tool_fns):

@@ -420,13 +420,14 @@ def test_firecrawl_fetch_uses_v2_scrape_contract(patch_httpx):
                 "metadata": {
                     "statusCode": 200,
                     "contentType": "text/html; charset=utf-8",
+                    "title": "Canonical page title",
                 },
             },
         }
         return httpx.Response(200, json=payload)
 
     patch_httpx(handler)
-    status, ctype, html = run(
+    status, ctype, html, title = run(
         web_fetch._firecrawl_fetch(
             "https://example.com/page",
             api_url="https://api.firecrawl.dev/v2/scrape",
@@ -446,6 +447,7 @@ def test_firecrawl_fetch_uses_v2_scrape_contract(patch_httpx):
     assert status == 200
     assert ctype == "text/html; charset=utf-8"
     assert "Rendered content." in html
+    assert title == "Canonical page title"
 
 
 def test_firecrawl_fetch_surfaces_api_error(patch_httpx):

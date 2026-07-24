@@ -770,6 +770,20 @@ async def _fetch_one(
             f"{fallback_detail}"
         )
 
+    # Firecrawl's `html` format is cleaned page HTML and may omit the document
+    # head. A body-level widget can then contain the first remaining <title>
+    # element (Best Buy's embedded reCAPTCHA does this), which BeautifulSoup's
+    # broad `soup.title` lookup would mistake for the page title. Firecrawl
+    # provides the canonical page title separately in response metadata, so
+    # retain it as the authoritative title for this fetch source.
+    firecrawl_title = (
+        fetched.get("title").strip()
+        if via == "firecrawl"
+        and isinstance(fetched.get("title"), str)
+        and fetched["title"].strip()
+        else None
+    )
+
     # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
     # routed to Apache Tika and returned as plain text, regardless of the
     # requested mode. Detected by content-type/extension or — for a document
@@ -838,6 +852,7 @@ async def _fetch_one(
         soup_title, plain, text_format = await anyio.to_thread.run_sync(
             _render_text_mode, text, fetch_url
         )
+        soup_title = firecrawl_title or soup_title
     except Exception as e:
         raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
@@ -881,10 +896,17 @@ async def _fetch_one(
             status = rendered["status"]
             ctype = (rendered.get("content_type") or ctype).lower()
             via = rendered.get("via")
+            firecrawl_title = (
+                rendered.get("title").strip()
+                if isinstance(rendered.get("title"), str)
+                and rendered["title"].strip()
+                else None
+            )
             try:
                 soup_title, plain, text_format = await anyio.to_thread.run_sync(
                     _render_text_mode, text, fetch_url
                 )
+                soup_title = firecrawl_title or soup_title
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
@@ -944,6 +966,8 @@ async def _fetch_one(
                 )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
+        if firecrawl_title:
+            structured["title"] = firecrawl_title
         # Cap headings and the (heading-derived) toc together so they stay aligned.
         if structured.get("headings"):
             structured["headings"] = structured["headings"][: cfg.max_enrich_headings]
@@ -963,6 +987,7 @@ async def _fetch_one(
             soup_title, section_data, available = await anyio.to_thread.run_sync(
                 _parse_section, text, section, fetch_url
             )
+            soup_title = firecrawl_title or soup_title
         except Exception as e:
             raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
         if section_data is None:

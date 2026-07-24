@@ -999,7 +999,7 @@ async def _firecrawl_fetch(
     api_key: str,
     timeout_seconds: float,
     max_bytes: int = 0,
-) -> tuple[int, str, str]:
+) -> tuple[int, str, str, str | None]:
     """Render one URL through Firecrawl's synchronous v2 scrape endpoint.
 
     The response is requested as rendered HTML so fetch_page can keep using its
@@ -1069,12 +1069,14 @@ async def _firecrawl_fetch(
     except (TypeError, ValueError):
         status = 200
     content_type = str(metadata.get("contentType") or "text/html")
+    title = metadata.get("title")
+    title = title.strip() if isinstance(title, str) and title.strip() else None
     browser_error = _chromium_network_error_code(html)
     if browser_error:
         raise BrowserRenderError(
             f"Firecrawl's browser could not load {url!r} ({browser_error})."
         )
-    return status, content_type, html
+    return status, content_type, html, title
 
 
 async def _render_with_firecrawl(url: str) -> dict:
@@ -1087,7 +1089,7 @@ async def _render_with_firecrawl(url: str) -> dict:
         )
 
     await _assert_url_allowed(url)
-    status, content_type, html = await _firecrawl_fetch(
+    status, content_type, html, title = await _firecrawl_fetch(
         url,
         api_url=api_url,
         api_key=api_key,
@@ -1101,6 +1103,7 @@ async def _render_with_firecrawl(url: str) -> dict:
         "text": html,
         "bytes": None,
         "via": "firecrawl",
+        "title": title,
         "blocked_detected": _is_blocked_response(status, html, {}),
     }
     if html and status < 400 and not result["blocked_detected"]:
