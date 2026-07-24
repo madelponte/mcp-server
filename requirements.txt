@@ -25,11 +25,11 @@ beautifulsoup4>=4.15.0
 lxml>=6.1.1
 markdownify>=1.2.3
 # Timeout-capable regex engine for model-supplied fetch_page query patterns.
-regex>=2026.7.10
+regex>=2026.7.19
 
 # Stock Data
 requests>=2.34.2
-yfinance>=1.5.1
+yfinance>=1.5.2
 
 # YouTube Transcript
 youtube-transcript-api>=1.2.4
