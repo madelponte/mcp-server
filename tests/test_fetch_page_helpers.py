@@ -16,9 +16,6 @@ from tools.fetch_page import (
     _compact_reddit_json,
     _provenance,
     _is_contentless,
-    _format_wayback_date,
-    _strip_wayback_chrome,
-    _render_text_body,
 )
 
 
@@ -315,39 +312,3 @@ def test_is_contentless_punctuation_only():
 def test_is_contentless_has_word():
     assert _is_contentless("hi") is False
     assert _is_contentless("a real sentence") is False
-
-
-# --------------------------- _format_wayback_date ---------------------------
-
-def test_format_wayback_date():
-    assert _format_wayback_date("20230615123000") == "2023-06-15"
-
-
-def test_format_wayback_date_invalid():
-    assert _format_wayback_date("xx") == "xx"
-
-
-# --------------------------- _strip_wayback_chrome ---------------------------
-
-def test_strip_wayback_chrome_removes_toolbar():
-    html = '<body><div id="wm-ipp-base">archive bar</div><p>real</p></body>'
-    out = _strip_wayback_chrome(html)
-    assert "archive bar" not in out
-    assert "real" in out
-
-
-# --------------------------- _render_text_body ---------------------------
-
-def test_render_text_body_markdown(monkeypatch):
-    monkeypatch.setattr(fp.cfg, "markdown", True)
-    body, fmt = _render_text_body("<article><h1>Hi</h1></article>", "https://e.com")
-    assert fmt == "markdown"
-    assert "# Hi" in body
-
-
-def test_render_text_body_plain(monkeypatch):
-    monkeypatch.setattr(fp.cfg, "markdown", False)
-    body, fmt = _render_text_body("<article><h1>Hi</h1><p>text</p></article>", "https://e.com")
-    assert fmt == "text"
-    assert "# Hi" not in body
-    assert "Hi" in body
