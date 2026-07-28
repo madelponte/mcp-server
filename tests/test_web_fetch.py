@@ -49,6 +49,14 @@ def test_clean_403_without_markers_is_not_blocked():
     assert _is_blocked_response(403, "<p>Plain forbidden page</p>", {}) is False
 
 
+def test_sec_automated_tool_403_is_blocked():
+    body = (
+        "<title>SEC.gov | Your Request Originates from an Undeclared Automated Tool</title>"
+        "<h1>Your Request Originates from an Undeclared Automated Tool</h1>"
+    )
+    assert _is_blocked_response(403, body, {}) is True
+
+
 def test_datadome_401_challenge_is_blocked():
     # DataDome (e.g. Reuters) serves its interstitial as HTTP 401 with a
     # captcha-delivery marker in the body and a datadome= cookie — both signals,
