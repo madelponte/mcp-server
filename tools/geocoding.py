@@ -257,7 +257,10 @@ def _build_filters(category: str) -> list[str]:
         else:
             # Unknown category: search POI names instead. Strip characters that
             # could break out of the Overpass quoted string (prevents injection).
-            term = re.sub(r'["\\]', "", category or "").strip()
+            # Then escape regex metacharacters so a search like "Starbucks" is a
+            # literal match — without this, a term like ".*" would match every
+            # POI in the radius (a minor DoS / noise vector).
+            term = re.escape(re.sub(r'["\\]', "", category or "").strip())
             if not term:
                 return []
             # Constrain the name regex to elements carrying an indexed POI key so
