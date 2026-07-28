@@ -22,7 +22,7 @@ import logging
 import math
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 import anyio
@@ -144,21 +144,34 @@ def _clamp_amount(requested: int | None, maximum: int) -> int:
     return min(requested, maximum)
 
 
+def _decode_json_array_string(value: str) -> list | None:
+    """Decode a JSON-encoded array passed as a string, e.g. '["AAPL","MSFT"]'.
+
+    Returns the parsed list, or None if the string is not a JSON array (or is not
+    valid JSON). This guards against models passing an array *as a string* where
+    a real list is expected — a common slip that would otherwise be treated as
+    a single bogus value.
+    """
+    stripped = value.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return None
+    try:
+        decoded = json.loads(stripped)
+    except (ValueError, TypeError):
+        return None
+    return decoded if isinstance(decoded, list) else None
+
+
 def _coerce_string_list(value: list[str] | str | None) -> list[str]:
     """Accept a real list, comma-separated string, or JSON string array."""
     if value is None:
         return []
     if isinstance(value, str):
-        stripped = value.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            try:
-                decoded = json.loads(stripped)
-            except (ValueError, TypeError):
-                decoded = None
-            if isinstance(decoded, list):
-                value = decoded
-            else:
-                value = stripped
+        decoded = _decode_json_array_string(value)
+        if decoded is not None:
+            value = decoded
+        else:
+            value = value.strip()
         if isinstance(value, str):
             parts = value.split(",")
         else:
@@ -483,7 +496,6 @@ def _finnhub_earnings(symbol: str, limit: int) -> dict | None:
 
 def _finnhub_news(symbol: str, limit: int, days: int = 7) -> dict | None:
     token = _finnhub_require_key()
-    from datetime import date, timedelta
     today = date.today()
     from_date = (today - timedelta(days=days)).isoformat()
     to_date = today.isoformat()
@@ -531,7 +543,6 @@ _INSIDER_TX_CODES = {
 
 def _finnhub_insider_transactions(symbol: str, weeks: int) -> dict | None:
     token = _finnhub_require_key()
-    from datetime import date, timedelta
     today = date.today()
     from_date = (today - timedelta(weeks=weeks)).isoformat()
     to_date = today.isoformat()
@@ -920,7 +931,6 @@ def _yfinance_insider_transactions(symbol: str, weeks: int) -> dict | None:
     if df is None or df.empty:
         return None
 
-    from datetime import date, timedelta
     today = date.today()
     cutoff = today - timedelta(weeks=weeks)
     from_date = cutoff.isoformat()
@@ -1003,8 +1013,6 @@ def _yfinance_history(symbol: str, bars: int, interval: str = "1d") -> dict | No
     calendar window wide enough to hold ``bars`` of the chosen interval (plus
     slack for closures) and keep the most recent ``bars`` rows.
     """
-    from datetime import date, timedelta
-
     if interval not in _HISTORY_INTERVAL_DAYS:
         interval = "1d"
     span_days = int(bars * _HISTORY_INTERVAL_DAYS[interval]) + 10
@@ -1057,8 +1065,6 @@ def _yfinance_dividends(symbol: str, max_events: int) -> dict | None:
     ``max_events`` of each, newest first, plus the trailing-12-month dividend
     total so the model can sanity-check the profile's dividend yield.
     """
-    from datetime import date, timedelta
-
     ticker = _yfinance_ticker(symbol)
     try:
         div = ticker.dividends
@@ -1825,14 +1831,9 @@ def register(mcp: FastMCP) -> None:
         # would otherwise be resolved as one bogus ticker. Detect that shape and
         # decode it back into a list so the call succeeds.
         if isinstance(symbol, str):
-            stripped = symbol.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                try:
-                    decoded = json.loads(stripped)
-                except (ValueError, TypeError):
-                    decoded = None
-                if isinstance(decoded, list):
-                    symbol = decoded
+            decoded = _decode_json_array_string(symbol)
+            if decoded is not None:
+                symbol = decoded
 
         single_input = isinstance(symbol, str)
         raw_symbols = [symbol] if single_input else symbol if isinstance(symbol, list) else None
@@ -1864,14 +1865,9 @@ def register(mcp: FastMCP) -> None:
             requested = list(DEFAULT_SECTIONS)
         else:
             if isinstance(sections, str):
-                stripped = sections.strip()
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    try:
-                        decoded = json.loads(stripped)
-                    except (ValueError, TypeError):
-                        decoded = None
-                    if isinstance(decoded, list):
-                        sections = decoded
+                decoded = _decode_json_array_string(sections)
+                if decoded is not None:
+                    sections = decoded
             if isinstance(sections, str):
                 requested = sections.split(",")
             else:
