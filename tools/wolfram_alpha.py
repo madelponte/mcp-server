@@ -259,7 +259,7 @@ def register(mcp: FastMCP) -> None:
         if status == 501:
             raise ToolError(
                 f"Wolfram Alpha could not interpret the query: '{clean_query}'.\n"
-                f"Suggestions from the API:\n{body.strip()}\n\n"
+                f"Suggestions from the API:\n{redact_secrets(body.strip(), app_id)}\n\n"
                 "Try rephrasing as a simpler keyword-style query, or pick one of "
                 "the suggested inputs above."
             )
@@ -270,7 +270,7 @@ def register(mcp: FastMCP) -> None:
                 "Check that WOLFRAM_APP_ID is set correctly."
             )
 
-        body_snippet = body[:200]
+        body_snippet = redact_secrets(body[:200], app_id)
         if status == 400:
             raise ToolError(f"Wolfram Alpha rejected the request (HTTP 400): {body_snippet}")
 

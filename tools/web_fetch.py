@@ -135,6 +135,7 @@ CHALLENGE_MARKERS = (
     "access to this page has been denied",
     "confirm you are a human",
     "and not a bot",
+    "your request originates from an undeclared automated tool",
 )
 ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
 

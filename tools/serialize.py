@@ -41,11 +41,21 @@ def _replace_nonfinite(value: Any) -> Any:
 
 
 def redact_secrets(text: Any, *secrets: str) -> str:
-    """Redact configured credential values before an exception reaches a tool."""
+    """Redact configured credential values before an exception reaches a tool.
+
+    Handles both the raw secret and its URL-encoded form (httpx may include
+    the AppID percent-encoded in exception strings that embed the request URL).
+    """
+    import urllib.parse
+
     rendered = str(text)
     for secret in secrets:
-        if secret:
-            rendered = rendered.replace(secret, "REDACTED")
+        if not secret:
+            continue
+        rendered = rendered.replace(secret, "REDACTED")
+        encoded = urllib.parse.quote(secret, safe="")
+        if encoded != secret:
+            rendered = rendered.replace(encoded, "REDACTED")
     return rendered
 
 

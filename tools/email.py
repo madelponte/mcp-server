@@ -165,7 +165,8 @@ def _build_message(
 ) -> EmailMessage:
     msg = EmailMessage()
     from_addr = (cfg.from_address or cfg.username).strip()
-    msg["From"] = formataddr((cfg.from_name.strip(), from_addr)) if cfg.from_name.strip() else from_addr
+    from_name = (cfg.from_name or "").strip()
+    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -309,6 +310,13 @@ def register(mcp: FastMCP) -> None:
             raise ToolError("`subject` must not be empty.")
         if "\r" in subject or "\n" in subject:
             raise ToolError("`subject` must not contain newline characters.")
+        # from_name becomes a MIME header value; newlines would allow header
+        # injection (a misconfigured EMAIL_FROM_NAME could smuggle extra headers).
+        from_name = (cfg.from_name or "").strip()
+        if "\r" in from_name or "\n" in from_name:
+            raise ToolError(
+                "EMAIL_FROM_NAME must not contain newline characters."
+            )
         if not (body or "").strip():
             raise ToolError("`body` must not be empty.")
 
