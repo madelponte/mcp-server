@@ -415,6 +415,39 @@ def test_firecrawl_fetch_uses_v2_scrape_contract(patch_httpx):
     assert title == "Canonical page title"
 
 
+def test_firecrawl_fetch_can_request_markdown_for_document(patch_httpx):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "Extracted protected PDF text.",
+                    "metadata": {"statusCode": 200, "title": "Report"},
+                },
+            },
+        )
+
+    patch_httpx(handler)
+    status, ctype, text, title = run(
+        web_fetch._firecrawl_fetch(
+            "https://example.com/report.pdf",
+            api_url="https://api.firecrawl.dev/v2/scrape",
+            api_key="fc-test",
+            timeout_seconds=60,
+            output_format="markdown",
+        )
+    )
+    assert seen["payload"]["formats"] == ["markdown"]
+    assert status == 200
+    assert ctype == "text/markdown"
+    assert text == "Extracted protected PDF text."
+    assert title == "Report"
+
+
 def test_firecrawl_fetch_surfaces_api_error(patch_httpx):
     patch_httpx(
         lambda request: httpx.Response(

@@ -3,8 +3,9 @@ Page-fetching MCP tool.
 
 Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
 structured metadata summary) or, when handed a YouTube video URL, that video's
-transcript. PDF/Office/OpenDocument/RTF/EPUB documents are routed to Apache Tika
-and returned as text; Reddit links are read through the JSON API. An optional
+transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
+Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
+links use the full JSON API with official oEmbed metadata as a fallback. An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
 content too long to return at once.
@@ -22,7 +23,7 @@ import re
 import time
 from functools import partial
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import anyio
 import regex as safe_regex
@@ -372,6 +373,11 @@ def _normalize_reddit_url(url: str) -> str:
     return urlunparse((p.scheme or "https", "www.reddit.com", path, "", p.query, ""))
 
 
+def _reddit_oembed_url(url: str) -> str:
+    """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
+    return "https://www.reddit.com/oembed?" + urlencode({"url": url})
+
+
 def _compact_reddit_json(data: Any) -> Any:
     """Compact Reddit's verbose post+comments JSON to just what the model needs."""
     try:
@@ -602,25 +608,45 @@ async def _fetch_one(
     fetch_url = _normalize_reddit_url(url)
     reddit_rewritten = fetch_url != url
 
+    reddit_oembed = False
     try:
         # The acquisition module owns the complete browser-first policy: direct
         # resource probe, FlareSolverr, quality assessment, optional classifier,
         # circuit breaker, hedge, and Firecrawl fallback.
         fetched = await _acquire_page(fetch_url)
-    except Exception as exc:
-        backend_passwords = tuple(
-            urlparse(endpoint).password or ""
-            for endpoint in (
-                cfg.flaresolverr_url,
-                cfg.firecrawl_api_url,
-                cfg.tika_url,
-                cfg.classifier_api_url,
+    except Exception as primary_exc:
+        # Reddit frequently blocks its post/comments .json endpoint from server
+        # IPs, while its official oEmbed JSON remains available. Return that
+        # useful post metadata rather than sending a .json URL through browsers
+        # (or Firecrawl, which explicitly does not support Reddit).
+        if reddit_rewritten:
+            fetch_url = _reddit_oembed_url(url)
+            try:
+                fetched = await _acquire_page(fetch_url)
+                reddit_oembed = True
+            except Exception as oembed_exc:
+                primary_exc = RuntimeError(
+                    f"Reddit JSON failed ({primary_exc}); oEmbed failed ({oembed_exc})"
+                )
+        if not reddit_oembed:
+            backend_passwords = tuple(
+                urlparse(endpoint).password or ""
+                for endpoint in (
+                    cfg.flaresolverr_url,
+                    cfg.firecrawl_api_url,
+                    cfg.tika_url,
+                    cfg.classifier_api_url,
+                )
+                if endpoint
             )
-            if endpoint
-        )
-        detail = redact_secrets(exc, cfg.firecrawl_api_key, cfg.classifier_api_key, *backend_passwords)
-        detail = detail.strip() or type(exc).__name__
-        raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
+            detail = redact_secrets(
+                primary_exc,
+                cfg.firecrawl_api_key,
+                cfg.classifier_api_key,
+                *backend_passwords,
+            )
+            detail = detail.strip() or type(primary_exc).__name__
+            raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
@@ -653,28 +679,35 @@ async def _fetch_one(
     # served with a generic/wrong content-type and no telling extension — by a
     # magic-byte sniff of the raw bytes.
     if (
-        fetched.get("resource_kind") == "document"
+        fetched.get("resource_kind") in ("document", "document_text")
         or _is_tika_document(ctype, fetch_url)
         or _sniff_document_bytes(fetched.get("bytes"))
     ):
-        body = fetched.get("bytes")
-        if not body and fetched.get("text"):
-            body = fetched["text"].encode("utf-8", errors="replace")
-        if not body:
-            raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
-        try:
-            extracted = await asyncio.to_thread(
-                _tika_extract,
-                body,
-                cfg.tika_url,
-                timeout=cfg.tika_timeout_seconds,
-                ocr_strategy=cfg.tika_ocr_strategy,
-                max_output_bytes=cfg.max_download_bytes,
-            )
-        except Exception as exc:
-            tika_password = urlparse(cfg.tika_url).password or ""
-            detail = redact_secrets(exc, tika_password)
-            raise ToolError(f"Document extraction failed for {fetch_url}: {detail}")
+        if fetched.get("resource_kind") == "document_text":
+            extracted = fetched.get("text") or ""
+            if not extracted:
+                raise ToolError(
+                    f"Document recovery returned no text (url={fetch_url}, status={status})."
+                )
+        else:
+            body = fetched.get("bytes")
+            if not body and fetched.get("text"):
+                body = fetched["text"].encode("utf-8", errors="replace")
+            if not body:
+                raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
+            try:
+                extracted = await asyncio.to_thread(
+                    _tika_extract,
+                    body,
+                    cfg.tika_url,
+                    timeout=cfg.tika_timeout_seconds,
+                    ocr_strategy=cfg.tika_ocr_strategy,
+                    max_output_bytes=cfg.max_download_bytes,
+                )
+            except Exception as exc:
+                tika_password = urlparse(cfg.tika_url).password or ""
+                detail = redact_secrets(exc, tika_password)
+                raise ToolError(f"Document extraction failed for {fetch_url}: {detail}")
         doc_payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),
@@ -708,6 +741,12 @@ async def _fetch_one(
             # query=/section= can't narrow JSON, so flag truncation without
             # the retry hint that points at them — but offset= still pages it.
             _set_content(json_payload, to_json(compact), hint=False, offset=offset)
+            if reddit_oembed:
+                json_payload["note"] = _join_note(
+                    json_payload.get("note"),
+                    "Reddit blocked its full post/comments JSON; returning official "
+                    "oEmbed post metadata without comments.",
+                )
             return json_payload
         except Exception:
             pass

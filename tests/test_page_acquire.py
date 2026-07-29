@@ -55,6 +55,23 @@ def test_json_stays_on_direct_path(monkeypatch):
     assert out["text"] == '{"ok":true}'
 
 
+def test_blocked_document_can_use_firecrawl_document_parser(monkeypatch):
+    async def direct(*args, **kwargs):
+        return 403, {}, b"<html><body>Challenge</body></html>", "text/html", False
+
+    async def document_firecrawl(url):
+        result = _artifact("Recovered PDF text", via="firecrawl", ctype="text/markdown")
+        result["resource_kind"] = "document_text"
+        return result
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_document_with_firecrawl", document_firecrawl)
+    out = run(pa.acquire_page("https://example.com/report.pdf"))
+    assert out["resource_kind"] == "document_text"
+    assert out["text"] == "Recovered PDF text"
+
+
 def test_document_url_returning_html_is_not_sent_to_browser_or_tika(monkeypatch):
     async def direct(*args, **kwargs):
         return 200, {}, b"<html><body>Download denied</body></html>", "text/html", False
@@ -155,6 +172,31 @@ def test_sparse_page_is_accepted_when_classifier_is_not_configured(monkeypatch):
     out = run(pa.acquire_page("https://example.com/status"))
     assert out["via"] == "flaresolverr"
     assert out["assessment"]["verdict"] == "uncertain"
+
+
+def test_slow_browser_is_bounded_before_sequential_firecrawl(monkeypatch):
+    calls = []
+
+    async def direct(*args, **kwargs):
+        return 200, {}, b"", "text/html", True
+
+    async def browser(url):
+        calls.append("fs-start")
+        await asyncio.sleep(1)
+        return _artifact("late")
+
+    async def firecrawl(url):
+        calls.append("firecrawl")
+        return _artifact("<main><p>Recovered after browser timeout.</p></main>", via="firecrawl")
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa.cfg, "flaresolverr_attempt_timeout_seconds", 0.01)
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "_render_with_firecrawl", firecrawl)
+    out = run(pa.acquire_page("https://example.com/product"))
+    assert calls == ["fs-start", "firecrawl"]
+    assert out["via"] == "firecrawl"
 
 
 def test_hedged_firecrawl_starts_before_slow_failed_browser_finishes(monkeypatch):

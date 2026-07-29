@@ -110,6 +110,14 @@ class WebSearchSettings(BaseSettings):
     flaresolverr_timeout_ms: int = Field(
         60000, description="maxTimeout passed to FlareSolverr, in milliseconds."
     )
+    flaresolverr_attempt_timeout_seconds: float = Field(
+        20.0,
+        description=(
+            "When Firecrawl is configured, stop waiting for one FlareSolverr "
+            "attempt after this many seconds so the sequential fallback can fit "
+            "within an MCP request timeout."
+        ),
+    )
 
     firecrawl_api_url: str = Field(
         "https://api.firecrawl.dev/v2/scrape",
@@ -119,7 +127,8 @@ class WebSearchSettings(BaseSettings):
         "",
         description=(
             "Firecrawl API key. When set, fetch_page uses Firecrawl after the "
-            "FlareSolverr render is blocked, unusable, or unresolved. "
+            "FlareSolverr render is blocked, unusable, or unresolved, and to "
+            "recover text from a known document blocked by an HTML challenge. "
             "Blank disables the Firecrawl fallback."
         ),
     )

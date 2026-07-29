@@ -213,7 +213,7 @@ for the full list with defaults. Key things to set:
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked or unusable.
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
 - `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
 - `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
 - `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.

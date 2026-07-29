@@ -236,6 +236,20 @@ def test_document_routed_to_tika(monkeypatch, tool_fns):
     assert out["content"] == "Extracted PDF text."
 
 
+def test_firecrawl_recovered_document_text_skips_tika(monkeypatch, tool_fns):
+    fetched = _fetched(text="Recovered protected PDF content.", via="firecrawl")
+    fetched["resource_kind"] = "document_text"
+    fetched["content_type"] = "text/markdown"
+    _patch_fetch(monkeypatch, fetched)
+    monkeypatch.setattr(
+        fp, "_tika_extract", lambda *a, **k: pytest.fail("Tika should not run")
+    )
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report.pdf")))
+    assert out["format"] == "document_text"
+    assert out["via"] == "firecrawl"
+    assert out["content"] == "Recovered protected PDF content."
+
+
 def test_document_no_content_raises(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(content_type="application/pdf", body=None, text=None))
     with pytest.raises(ToolError):
@@ -312,6 +326,28 @@ def test_reddit_url_compacted(monkeypatch, tool_fns):
     content = json.loads(out["content"])
     assert content["post"]["title"] == "Post Title"
     assert content["comments"][0]["body"] == "a comment"
+
+
+def test_reddit_json_failure_uses_oembed(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        if url.endswith(".json"):
+            raise RuntimeError("Reddit JSON returned HTML")
+        return _fetched(
+            text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
+            content_type="application/json",
+        )
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith(".json")
+    assert "/oembed?" in calls[1]
+    assert json.loads(out["content"])["title"] == "Fallback title"
+    assert "without comments" in out["note"]
 
 
 def test_json_content_returned_as_json(monkeypatch, tool_fns):

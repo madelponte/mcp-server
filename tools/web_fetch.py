@@ -874,18 +874,18 @@ async def _firecrawl_fetch(
     api_key: str,
     timeout_seconds: float,
     max_bytes: int = 0,
+    output_format: str = "html",
 ) -> tuple[int, str, str, str | None]:
-    """Render one URL through Firecrawl's synchronous v2 scrape endpoint.
+    """Scrape one URL through Firecrawl's synchronous v2 endpoint.
 
-    The response is requested as rendered HTML so fetch_page can keep using its
-    existing BeautifulSoup extraction for text, structured metadata, sections,
-    and query filtering. The JSON envelope and returned HTML both obey the same
-    download cap as the direct and FlareSolverr paths.
+    HTML is the normal browser-page format. ``markdown`` is used only to recover
+    a known document whose direct download returned an HTML challenge. The JSON
+    envelope and extracted content both obey the configured download cap.
     """
     timeout_ms = max(1000, min(300000, int(timeout_seconds * 1000)))
     payload = {
         "url": url,
-        "formats": ["html"],
+        "formats": [output_format],
         "onlyMainContent": False,
         "timeout": timeout_ms,
     }
@@ -929,10 +929,10 @@ async def _firecrawl_fetch(
     data = response_data.get("data")
     if not isinstance(data, dict):
         raise RuntimeError("Firecrawl response did not contain a data object.")
-    html = data.get("html")
-    if not isinstance(html, str) or not html:
-        raise RuntimeError("Firecrawl returned no rendered HTML.")
-    if max_bytes and len(html.encode("utf-8")) > max_bytes:
+    content = data.get(output_format)
+    if not isinstance(content, str) or not content:
+        raise RuntimeError(f"Firecrawl returned no {output_format} content.")
+    if max_bytes and len(content.encode("utf-8")) > max_bytes:
         raise DownloadTooLargeError(
             f"Rendered response from {url!r} exceeds the configured "
             f"{max_bytes}-byte download cap."
@@ -943,15 +943,18 @@ async def _firecrawl_fetch(
         status = int(metadata.get("statusCode") or 200)
     except (TypeError, ValueError):
         status = 200
-    content_type = str(metadata.get("contentType") or "text/html")
+    content_type = str(
+        metadata.get("contentType")
+        or ("text/markdown" if output_format == "markdown" else "text/html")
+    )
     title = metadata.get("title")
     title = title.strip() if isinstance(title, str) and title.strip() else None
-    browser_error = _chromium_network_error_code(html)
+    browser_error = _chromium_network_error_code(content) if output_format == "html" else None
     if browser_error:
         raise BrowserRenderError(
             f"Firecrawl's browser could not load {url!r} ({browser_error})."
         )
-    return status, content_type, html, title
+    return status, content_type, content, title
 
 
 async def _render_with_firecrawl(url: str) -> dict:
@@ -983,3 +986,35 @@ async def _render_with_firecrawl(url: str) -> dict:
     }
     # page_acquire applies the shared quality gate before caching this result.
     return result
+
+
+async def _render_document_with_firecrawl(url: str) -> dict:
+    """Recover text for a directly blocked document through Firecrawl's parser."""
+    api_url = cfg.firecrawl_api_url.strip()
+    api_key = cfg.firecrawl_api_key.strip()
+    if not api_url or not api_key:
+        raise RuntimeError(
+            "Firecrawl is not configured (set WEB_SEARCH_FIRECRAWL_API_KEY)."
+        )
+    await _assert_url_allowed(url)
+    status, _content_type, text, title = await _firecrawl_fetch(
+        url,
+        api_url=api_url,
+        api_key=api_key,
+        timeout_seconds=cfg.firecrawl_timeout_seconds,
+        max_bytes=cfg.max_download_bytes,
+        output_format="markdown",
+    )
+    if status >= 400:
+        raise RuntimeError(f"Firecrawl received HTTP {status} for the document.")
+    return {
+        "url": url,
+        "status": status,
+        "content_type": "text/markdown",
+        "text": text,
+        "bytes": None,
+        "via": "firecrawl",
+        "title": title,
+        "blocked_detected": False,
+        "resource_kind": "document_text",
+    }

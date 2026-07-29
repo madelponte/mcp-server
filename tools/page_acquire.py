@@ -25,6 +25,7 @@ from .web_fetch import (
     _direct_resource_fetch,
     _is_tika_document,
     _page_cache,
+    _render_document_with_firecrawl,
     _render_with_firecrawl,
     _render_with_flaresolverr,
     _sniff_document_bytes,
@@ -154,6 +155,17 @@ async def _firecrawl(url: str) -> tuple[dict | None, str | None]:
         return None, _error_detail(exc)
 
 
+async def _firecrawl_document(url: str) -> tuple[dict | None, str | None]:
+    if not cfg.firecrawl_api_key.strip():
+        return None, "Firecrawl is not configured"
+    try:
+        fetched = await _render_document_with_firecrawl(url)
+        _cache_page(url, fetched)
+        return fetched, None
+    except Exception as exc:
+        return None, _error_detail(exc)
+
+
 async def _delayed_firecrawl(url: str) -> tuple[dict | None, str | None]:
     await asyncio.sleep(max(0.0, cfg.firecrawl_hedge_delay_seconds))
     return await _firecrawl(url)
@@ -162,7 +174,13 @@ async def _delayed_firecrawl(url: str) -> tuple[dict | None, str | None]:
 async def _browser(url: str) -> tuple[dict | None, str | None]:
     """Render and assess FlareSolverr output, updating the host circuit."""
     try:
-        rendered = await _render_with_flaresolverr(url)
+        if cfg.firecrawl_api_key.strip():
+            rendered = await asyncio.wait_for(
+                _render_with_flaresolverr(url),
+                timeout=max(0.1, cfg.flaresolverr_attempt_timeout_seconds),
+            )
+        else:
+            rendered = await _render_with_flaresolverr(url)
         assessment = await _assess(rendered, url)
         if _accepted(assessment):
             _record_browser_success(url)
@@ -172,6 +190,12 @@ async def _browser(url: str) -> tuple[dict | None, str | None]:
         return None, f"FlareSolverr page was {assessment.verdict.value} ({assessment.reason})"
     except (SSRFError, DownloadTooLargeError):
         raise
+    except TimeoutError:
+        _record_browser_failure(url)
+        return None, (
+            "FlareSolverr timed out after "
+            f"{max(0.1, cfg.flaresolverr_attempt_timeout_seconds):g} seconds"
+        )
     except Exception as exc:
         _record_browser_failure(url)
         return None, f"FlareSolverr failed: {_error_detail(exc)}"
@@ -291,12 +315,28 @@ async def _acquire_page(url: str) -> dict:
         is_html = True
         status, body, ctype = 0, b"", "text/html"
         log.debug("Direct resource probe failed for %s: %s", url, probe_error)
+    if is_html and direct_only:
+        if _is_tika_document("", url):
+            recovered, document_error = await _firecrawl_document(url)
+            if recovered is not None:
+                return recovered
+            raise PageAcquisitionError(
+                "Document URL returned HTML instead of a document; "
+                f"Firecrawl document recovery failed: {document_error}"
+            )
+        raise PageAcquisitionError(
+            "Known direct-resource URL returned HTML instead of its expected format."
+        )
+
     if not is_html:
         fetched = _direct_result(url, status, body, ctype)
         if fetched["resource_kind"] == "html_at_document_url":
+            recovered, document_error = await _firecrawl_document(url)
+            if recovered is not None:
+                return recovered
             raise PageAcquisitionError(
-                "Document URL returned HTML instead of a document; refusing to "
-                "send an error or challenge page to Tika."
+                "Document URL returned HTML instead of a document; "
+                f"Firecrawl document recovery failed: {document_error}"
             )
         if status < 400:
             _cache_page(url, fetched)
