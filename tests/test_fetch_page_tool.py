@@ -1,6 +1,6 @@
 """Integration tests for the fetch_page tool's _fetch_one logic.
 
-The network layer (`_cached_resilient_fetch`), the YouTube transcript helper, and
+The acquisition layer (`_acquire_page`), the YouTube transcript helper, and
 Tika extraction are monkeypatched so the routing/formatting logic is exercised
 offline. FlareSolverr and Firecrawl fallbacks are disabled unless a test needs them.
 """
@@ -60,7 +60,7 @@ def _patch_fetch(monkeypatch, result):
     async def fake_fetch(url):
         return result if not callable(result) else result(url)
 
-    monkeypatch.setattr(fp, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(fp, "_acquire_page", fake_fetch)
 
 
 # --------------------------- input validation ---------------------------
@@ -287,74 +287,16 @@ def test_mislabeled_pdf_sniffed_to_tika(monkeypatch, tool_fns):
     assert out["content"] == "Sniffed PDF text."
 
 
-# --------------------------- HTTP-error fallback chain ---------------------------
+# --------------------------- direct-resource HTTP errors ---------------------------
 
-def test_http_error_tries_flaresolverr_then_firecrawl(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
+def test_direct_resource_http_error_raises(monkeypatch, tool_fns):
     _patch_fetch(
         monkeypatch,
-        _fetched(text="<html><body>Not Found</body></html>", status=404),
+        _fetched(text='{"error":"not found"}', content_type="application/json", status=404),
     )
-    calls = []
-
-    async def fake_flaresolverr(url):
-        calls.append("flaresolverr")
-        return _fetched(text="<p>Still not found</p>", status=404, via="flaresolverr")
-
-    async def fake_firecrawl(url):
-        calls.append("firecrawl")
-        return _fetched(
-            text="<html><body><article>Recovered article body.</article></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_flaresolverr)
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/dead")))
-    assert calls == ["flaresolverr", "firecrawl"]
-    assert out["via"] == "firecrawl"
-    assert "Recovered article body." in out["content"]
-    assert "archived_snapshot" not in out
-
-
-def test_http_error_without_firecrawl_hit_raises(monkeypatch, tool_fns):
-    """An unrecovered error response is never returned as page content."""
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-secret")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(text="<html><body><p>Page not found here.</p></body></html>", status=404),
-    )
-
-    async def failed_firecrawl(url):
-        raise RuntimeError("scrape failed")
-
-    monkeypatch.setattr(fp, "_render_with_firecrawl", failed_firecrawl)
     with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/dead"))
+        run(tool_fns["fetch_page"](url="https://example.com/api"))
     assert "HTTP 404" in str(exc.value)
-    assert "Firecrawl failed" in str(exc.value)
-    assert "fc-secret" not in str(exc.value)
-
-
-def test_server_error_raises_instead_of_returning_error_page(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(
-            text="<html><body><p>Upstream service unavailable.</p></body></html>",
-            status=502,
-        ),
-    )
-    monkeypatch.setattr(
-        fp,
-        "_render_with_firecrawl",
-        lambda url: pytest.fail("Firecrawl should not be spent on a plain HTTP 502"),
-    )
-    with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/article"))
-    assert "HTTP 502" in str(exc.value)
-    assert "Upstream service unavailable" not in str(exc.value)
 
 
 # --------------------------- Reddit / JSON ---------------------------
@@ -381,108 +323,11 @@ def test_json_content_returned_as_json(monkeypatch, tool_fns):
 
 # --------------------------- blocked / contentless ---------------------------
 
-def test_blocked_without_fallback_raises(monkeypatch, tool_fns):
-    _patch_fetch(monkeypatch, _fetched(text="challenge", status=403, blocked=True))
-    with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com"))
-    assert "wall" in str(exc.value).lower() or "could not be retrieved" in str(exc.value)
-
-
-def test_contentless_without_fallback_raises(monkeypatch, tool_fns):
+def test_contentless_accepted_artifact_still_raises(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(text="<html><body>; ;</body></html>"))
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://example.com"))
-    assert "client-side" in str(exc.value) or "no extractable text" in str(exc.value)
-
-
-def test_contentless_section_tries_browser_render_first(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-
-    async def fake_render(url):
-        return _fetched(
-            text=(
-                "<html><body><article><h2>Details</h2>"
-                "<p>Rendered section body.</p></article></body></html>"
-            ),
-            via="flaresolverr",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com", section="Details")))
-    assert out["format"] == "section"
-    assert out["via"] == "flaresolverr"
-    assert "Rendered section body." in out["content"]
-
-
-def test_contentless_structured_tries_browser_render_first(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-
-    async def fake_render(url):
-        return _fetched(
-            text=(
-                "<html><head><title>Rendered</title></head>"
-                "<body><main><h1>Loaded Heading</h1></main></body></html>"
-            ),
-            via="flaresolverr",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
-    out = json.loads(
-        run(tool_fns["fetch_page"](url="https://example.com", mode="structured"))
-    )
-    assert out["format"] == "structured"
-    assert out["via"] == "flaresolverr"
-    assert out["content"]["title"] == "Rendered"
-    assert out["content"]["headings"][0]["text"] == "Loaded Heading"
-
-
-def test_contentless_tries_firecrawl_after_browser(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-    calls = []
-
-    async def fake_flaresolverr(url):
-        calls.append("flaresolverr")
-        return _fetched(
-            text="<html><body><div id='root'></div></body></html>",
-            via="flaresolverr",
-        )
-
-    async def fake_firecrawl(url):
-        calls.append("firecrawl")
-        return _fetched(
-            text="<html><body><main><h1>Loaded</h1><p>Final content.</p></main></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_flaresolverr)
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
-    assert calls == ["flaresolverr", "firecrawl"]
-    assert out["via"] == "firecrawl"
-    assert "Final content." in out["content"]
-
-
-def test_blocked_after_flaresolverr_uses_firecrawl(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(text="interactive challenge", status=403, via="flaresolverr", blocked=True),
-    )
-
-    async def fake_firecrawl(url):
-        return _fetched(
-            text="<html><body><article>Recovered through Firecrawl.</article></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
-    assert out["via"] == "firecrawl"
-    assert "Recovered through Firecrawl." in out["content"]
+    assert "no extractable text" in str(exc.value)
 
 
 def test_unsupported_binary_media_raises_actionable_error(monkeypatch, tool_fns):

@@ -34,15 +34,11 @@ from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
-    DownloadTooLargeError,
-    SSRFError,
-    _cached_resilient_fetch,
     _is_tika_document,
-    _render_with_firecrawl,
-    _render_with_flaresolverr,
     _sniff_document_bytes,
     _tika_extract,
 )
+from .page_acquire import acquire_page as _acquire_page
 from .web_extract import (
     _find_section,
     _markdown_from_soup,
@@ -105,10 +101,6 @@ def _fetch_page_desc(prefix: str) -> str:
 # is added only for formats those two params can target, so the model can jump
 # straight to what it needs instead of paging.
 # ---------------------------------------------------------------------------
-
-# Statuses where a remote renderer may still recover content even though the
-# direct origin/CDN says the URL is unavailable.
-_GONE_STATUSES = {404, 410, 451}
 
 _OFFSET_HINT = (
     "Content was truncated to fit the size limit; the rest was dropped. To read "
@@ -528,25 +520,6 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
-async def _try_firecrawl(fetch_url: str) -> tuple[dict | None, str | None]:
-    """Best-effort Firecrawl fallback, returning a usable fetch or an error note."""
-    if not cfg.firecrawl_api_key.strip():
-        return None, None
-    try:
-        fetched = await _render_with_firecrawl(fetch_url)
-    except Exception as exc:
-        api_password = urlparse(cfg.firecrawl_api_url).password or ""
-        return None, redact_secrets(exc, cfg.firecrawl_api_key, api_password)
-    status = fetched.get("status")
-    if status is not None and status >= 400:
-        return None, f"Firecrawl received HTTP {status} from the target page"
-    if fetched.get("blocked_detected"):
-        return None, "Firecrawl also received a bot/CAPTCHA challenge"
-    if not fetched.get("text"):
-        return None, "Firecrawl returned no rendered HTML"
-    return fetched, None
-
-
 def _unsupported_media_error(
     fetch_url: str, status: int | None, ctype: str, size: int | None
 ) -> ToolError:
@@ -630,144 +603,33 @@ async def _fetch_one(
     reddit_rewritten = fetch_url != url
 
     try:
-        fetched = await _cached_resilient_fetch(fetch_url)
-    except (SSRFError, DownloadTooLargeError) as e:
+        # The acquisition module owns the complete browser-first policy: direct
+        # resource probe, FlareSolverr, quality assessment, optional classifier,
+        # circuit breaker, hedge, and Firecrawl fallback.
+        fetched = await _acquire_page(fetch_url)
+    except Exception as exc:
         backend_passwords = tuple(
             urlparse(endpoint).password or ""
-            for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
+            for endpoint in (
+                cfg.flaresolverr_url,
+                cfg.firecrawl_api_url,
+                cfg.tika_url,
+                cfg.classifier_api_url,
+            )
             if endpoint
         )
-        detail = redact_secrets(e, *backend_passwords)
+        detail = redact_secrets(exc, cfg.firecrawl_api_key, cfg.classifier_api_key, *backend_passwords)
         raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
-    except Exception as e:
-        # A network-level direct failure has already gone through FlareSolverr
-        # inside `_cached_resilient_fetch`; Firecrawl is the final tier.
-        fetched, firecrawl_error = await _try_firecrawl(fetch_url)
-        if fetched is None:
-            backend_passwords = tuple(
-                urlparse(endpoint).password or ""
-                for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
-                if endpoint
-            )
-            detail = redact_secrets(e, *backend_passwords)
-            fallback_detail = (
-                f" Firecrawl also failed: {firecrawl_error}."
-                if firecrawl_error
-                else ""
-            )
-            raise ToolError(
-                f"Fetch failed for {fetch_url}: {detail}.{fallback_detail}"
-            )
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
     via = fetched.get("via")
 
-    # Bot wall we couldn't get past: a challenge was detected in the response
-    # we're holding. `blocked_detected` is set whether that response came
-    # direct or back from FlareSolverr — FlareSolverr returning a page is not
-    # the same as a bypass, since an interactive wall (PerimeterX "Press &
-    # Hold", a CAPTCHA) renders as an ordinary page it can't solve. Returning
-    # the challenge would dress a failure up as data (the very thing the error
-    # convention guards against), so raise instead — telling the model the
-    # page is protected, and the operator what (if anything) is left to try.
-    if fetched.get("blocked_detected"):
-        # FlareSolverr was already attempted inside `_resilient_fetch` for a
-        # detected wall/429. Firecrawl is the final tier before this becomes a
-        # real tool error.
-        recovered, firecrawl_error = await _try_firecrawl(fetch_url)
-        if recovered is not None:
-            fetched = recovered
-            status = fetched["status"]
-            ctype = (fetched.get("content_type") or "").lower()
-            via = fetched.get("via")
-        else:
-            if via == "flaresolverr":
-                detail = (
-                    "the FlareSolverr fallback rendered it in a real browser but "
-                    "the page is still an interactive challenge (e.g. a "
-                    "'Press & Hold' / CAPTCHA) it cannot solve"
-                )
-            elif fetched.get("flaresolverr_error"):
-                detail = (
-                    "the FlareSolverr fallback could not fetch it "
-                    f"({fetched['flaresolverr_error']})"
-                )
-            elif cfg.flaresolverr_url:
-                detail = "the FlareSolverr fallback did not resolve it"
-            else:
-                detail = (
-                    "no FlareSolverr fallback is configured "
-                    "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
-                )
-            firecrawl_detail = (
-                f" Firecrawl also failed: {firecrawl_error}."
-                if firecrawl_error
-                else (
-                    " No Firecrawl fallback is configured "
-                    "(set WEB_SEARCH_FIRECRAWL_API_KEY to enable it)."
-                )
-            )
-            wall = "rate limit" if status == 429 else "bot/CAPTCHA wall"
-            raise ToolError(
-                f"{fetch_url} is behind a {wall} (HTTP {status}) and "
-                f"{detail}.{firecrawl_detail} The page content could not be retrieved."
-            )
-
-    # Gone/unavailable URLs used to get the archive fallback. Preserve that
-    # recovery scope while replacing its implementation: finish the ordered
-    # FlareSolverr -> Firecrawl chain, then apply the normal HTTP-error rule.
-    http_fallback_details = []
-    if status in _GONE_STATUSES:
-        flaresolverr_error = None
-        if via != "flaresolverr" and cfg.flaresolverr_url:
-            try:
-                rendered = await _render_with_flaresolverr(fetch_url)
-            except Exception as exc:
-                flaresolverr_error = str(exc)
-                rendered = None
-            if (
-                rendered
-                and rendered.get("text")
-                and not rendered.get("blocked_detected")
-                and (rendered.get("status") is None or rendered["status"] < 400)
-            ):
-                fetched = rendered
-                status = fetched["status"]
-                ctype = (fetched.get("content_type") or "").lower()
-                via = fetched.get("via")
-
-        if status is not None and status >= 400:
-            recovered, firecrawl_error = await _try_firecrawl(fetch_url)
-            if recovered is not None:
-                fetched = recovered
-                status = fetched["status"]
-                ctype = (fetched.get("content_type") or "").lower()
-                via = fetched.get("via")
-            else:
-                if flaresolverr_error:
-                    http_fallback_details.append(
-                        f"FlareSolverr failed: {flaresolverr_error}"
-                    )
-                if firecrawl_error:
-                    http_fallback_details.append(
-                        f"Firecrawl failed: {firecrawl_error}"
-                    )
-                elif not cfg.firecrawl_api_key.strip():
-                    http_fallback_details.append("Firecrawl is not configured")
-
-    # Never return an HTTP error document as page content. Besides violating the
-    # tool's error contract, doing so lets a CDN/proxy error page masquerade as
-    # the requested article, JSON payload, or document.
+    # Direct non-HTML resources do not go through browser recovery. Never return
+    # an HTTP error payload as if it were the requested JSON/document/text file.
     if status is not None and status >= 400:
-        fallback_detail = (
-            f" {'; '.join(http_fallback_details)}."
-            if http_fallback_details
-            else ""
-        )
         raise ToolError(
             f"{fetch_url} returned HTTP {status}; page content was not returned."
-            f"{fallback_detail}"
         )
 
     # Firecrawl's `html` format is cleaned page HTML and may omit the document
@@ -789,7 +651,11 @@ async def _fetch_one(
     # requested mode. Detected by content-type/extension or — for a document
     # served with a generic/wrong content-type and no telling extension — by a
     # magic-byte sniff of the raw bytes.
-    if _is_tika_document(ctype, fetch_url) or _sniff_document_bytes(fetched.get("bytes")):
+    if (
+        fetched.get("resource_kind") == "document"
+        or _is_tika_document(ctype, fetch_url)
+        or _sniff_document_bytes(fetched.get("bytes"))
+    ):
         body = fetched.get("bytes")
         if not body and fetched.get("text"):
             body = fetched["text"].encode("utf-8", errors="replace")
@@ -856,88 +722,12 @@ async def _fetch_one(
     except Exception as e:
         raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-    # Empty-shell handling. Check this before section/structured parsing, since
-    # a static JS shell can otherwise look like "section not found" or sparse
-    # metadata even though a browser fallback can recover the page body.
-    tried_render = False
-    if (
-        _is_contentless(plain)
-        and via not in ("flaresolverr", "firecrawl")
-        and cfg.flaresolverr_url
-    ):
-        tried_render = True
-        try:
-            rendered = await _render_with_flaresolverr(fetch_url)
-        except Exception:
-            rendered = None
-        if rendered and rendered.get("text") and not rendered.get("blocked_detected"):
-            text = rendered["text"]
-            status = rendered["status"]
-            ctype = (rendered.get("content_type") or ctype).lower()
-            via = rendered.get("via")
-            try:
-                soup_title, plain, text_format = await anyio.to_thread.run_sync(
-                    _render_text_mode, text, fetch_url
-                )
-            except Exception as e:
-                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
-    tried_firecrawl = via == "firecrawl"
-    firecrawl_error = None
-    if (
-        _is_contentless(plain)
-        and via != "firecrawl"
-        and cfg.firecrawl_api_key.strip()
-    ):
-        tried_firecrawl = True
-        rendered, firecrawl_error = await _try_firecrawl(fetch_url)
-        if rendered is not None:
-            text = rendered["text"]
-            status = rendered["status"]
-            ctype = (rendered.get("content_type") or ctype).lower()
-            via = rendered.get("via")
-            firecrawl_title = (
-                rendered.get("title").strip()
-                if isinstance(rendered.get("title"), str)
-                and rendered["title"].strip()
-                else None
-            )
-            try:
-                soup_title, plain, text_format = await anyio.to_thread.run_sync(
-                    _render_text_mode, text, fetch_url
-                )
-                soup_title = firecrawl_title or soup_title
-            except Exception as e:
-                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
+    # Acquisition already rejected empty/block/error renders. Keep a final
+    # extraction-level invariant in case a parser removes all nominally visible
+    # content. Structured mode may legitimately consist only of metadata.
     if _is_contentless(plain) and not (mode == "structured" and not query):
-        tried = [
-            name
-            for name, used in (
-                ("the FlareSolverr browser fallback", tried_render),
-                ("the Firecrawl fallback", tried_firecrawl),
-            )
-            if used
-        ]
-        if tried:
-            firecrawl_detail = (
-                f" Firecrawl failed: {firecrawl_error}." if firecrawl_error else ""
-            )
-            hint = (
-                f"Even {' and '.join(tried)} produced no readable text, so the "
-                "content could not be recovered."
-                f"{firecrawl_detail} Try another source."
-            )
-        else:
-            hint = (
-                "Enable FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) and configure "
-                "Firecrawl (WEB_SEARCH_FIRECRAWL_API_KEY) to recover JavaScript-"
-                "rendered pages, or fetch the article from another source."
-            )
-        titled = f" (page title: {soup_title!r})" if soup_title else ""
         raise ToolError(
-            f"{fetch_url} returned HTTP {status} but no extractable text content — "
-            f"the page renders its content client-side with JavaScript.{titled} {hint}"
+            f"{fetch_url} produced no extractable text after page acquisition."
         )
 
     if mode == "structured" and not query:

@@ -213,7 +213,10 @@ for the full list with defaults. Key things to set:
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl as the final `fetch_page` fallback after direct fetching and FlareSolverr.
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked or unusable.
+- `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
+- `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
+- `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
 - `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 - `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL`, clear `GEO_OVERPASS_FALLBACK_URLS` when queries must stay private, and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 - `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,

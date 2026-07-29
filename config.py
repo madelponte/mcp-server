@@ -105,7 +105,7 @@ class WebSearchSettings(BaseSettings):
 
     flaresolverr_url: str = Field(
         "http://flaresolverr:8191",
-        description="Base URL of FlareSolverr (no trailing /v1). Blank disables fallback.",
+        description="Base URL of the first-line HTML renderer. Blank uses direct HTML fetching.",
     )
     flaresolverr_timeout_ms: int = Field(
         60000, description="maxTimeout passed to FlareSolverr, in milliseconds."
@@ -118,8 +118,8 @@ class WebSearchSettings(BaseSettings):
     firecrawl_api_key: str = Field(
         "",
         description=(
-            "Firecrawl API key. When set, fetch_page uses Firecrawl only after "
-            "the direct and FlareSolverr paths fail to recover usable content. "
+            "Firecrawl API key. When set, fetch_page uses Firecrawl after the "
+            "FlareSolverr render is blocked, unusable, or unresolved. "
             "Blank disables the Firecrawl fallback."
         ),
     )
@@ -129,6 +129,58 @@ class WebSearchSettings(BaseSettings):
             "Timeout for a Firecrawl scrape, in seconds (clamped to Firecrawl's "
             "supported 1-300 second range)."
         ),
+    )
+    firecrawl_hedge_enabled: bool = Field(
+        False,
+        description=(
+            "Start Firecrawl speculatively when FlareSolverr exceeds the hedge "
+            "delay. Disabled by default because a cancelled hedge may still consume credits."
+        ),
+    )
+    firecrawl_hedge_delay_seconds: float = Field(
+        8.0,
+        description="Seconds to wait for FlareSolverr before starting a hedged Firecrawl scrape.",
+    )
+
+    classifier_api_url: str = Field(
+        "",
+        description=(
+            "OpenAI-compatible API base URL or /chat/completions endpoint used only "
+            "to classify ambiguous rendered pages. Blank disables LLM classification."
+        ),
+    )
+    classifier_api_key: str = Field(
+        "", description="Optional bearer token for the page-classifier API."
+    )
+    classifier_model: str = Field(
+        "",
+        description="Model name for ambiguous-page classification. Blank disables it.",
+    )
+    classifier_timeout_seconds: float = Field(
+        5.0, description="Timeout for one page-classifier request."
+    )
+    classifier_max_input_chars: int = Field(
+        8000, description="Maximum visible page characters sent to the classifier."
+    )
+    classifier_min_confidence: float = Field(
+        0.7, description="Minimum classifier confidence required to use its verdict."
+    )
+
+    circuit_breaker_enabled: bool = Field(
+        True,
+        description=(
+            "Temporarily skip FlareSolverr for hosts with repeated failed renders "
+            "when Firecrawl is configured."
+        ),
+    )
+    circuit_breaker_failure_threshold: int = Field(
+        3, description="Distinct failed URLs on one host required to open the circuit."
+    )
+    circuit_breaker_window_seconds: int = Field(
+        300, description="Window in which host-level FlareSolverr failures are counted."
+    )
+    circuit_breaker_ttl_seconds: int = Field(
+        300, description="How long an opened host circuit bypasses FlareSolverr."
     )
 
     tika_url: str = Field(
