@@ -65,6 +65,40 @@ def test_document_url_returning_html_is_not_sent_to_browser_or_tika(monkeypatch)
         run(pa.acquire_page("https://example.com/report.pdf"))
 
 
+def test_probe_timeout_continues_to_browser_and_firecrawl(monkeypatch):
+    calls = []
+
+    async def direct(*args, **kwargs):
+        calls.append("probe")
+        raise TimeoutError()
+
+    async def browser(url):
+        calls.append("flaresolverr")
+        return _artifact("<form id='human-verification'>Verify that you are human</form>")
+
+    async def firecrawl(url):
+        calls.append("firecrawl")
+        return _artifact("<main><p>Recovered product price is available.</p></main>", via="firecrawl")
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "_render_with_firecrawl", firecrawl)
+    out = run(pa.acquire_page("https://example.com/product/123"))
+    assert calls == ["probe", "flaresolverr", "firecrawl"]
+    assert out["via"] == "firecrawl"
+
+
+def test_known_direct_resource_timeout_does_not_launch_browser(monkeypatch):
+    async def direct(*args, **kwargs):
+        raise TimeoutError()
+
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", lambda url: pytest.fail("browser used"))
+    with pytest.raises(pa.PageAcquisitionError, match="TimeoutError"):
+        run(pa.acquire_page("https://example.com/data.json"))
+
+
 def test_html_probe_routes_to_flaresolverr_first(monkeypatch):
     calls = []
 

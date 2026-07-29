@@ -619,6 +619,7 @@ async def _fetch_one(
             if endpoint
         )
         detail = redact_secrets(exc, cfg.firecrawl_api_key, cfg.classifier_api_key, *backend_passwords)
+        detail = detail.strip() or type(exc).__name__
         raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
 
     status = fetched["status"]

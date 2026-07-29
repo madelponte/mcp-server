@@ -94,6 +94,19 @@ def _record_browser_success(url: str) -> None:
     _open_circuits.pop(host, None)
 
 
+def _error_detail(exc: BaseException) -> str:
+    """Useful provider error text even for exceptions such as bare timeouts."""
+    return str(exc).strip() or type(exc).__name__
+
+
+def _known_direct_url(url: str) -> bool:
+    """Whether the URL itself identifies a resource that should skip browsers."""
+    if _is_tika_document("", url):
+        return True
+    path = (urlparse(url).path or "").lower()
+    return path.endswith((".json", ".xml", ".rss", ".atom", ".txt", ".csv"))
+
+
 def _classifier_enabled() -> bool:
     return bool(cfg.classifier_api_url.strip() and cfg.classifier_model.strip())
 
@@ -138,7 +151,7 @@ async def _firecrawl(url: str) -> tuple[dict | None, str | None]:
             return fetched, None
         return None, f"Firecrawl page was {assessment.verdict.value} ({assessment.reason})"
     except Exception as exc:
-        return None, str(exc)
+        return None, _error_detail(exc)
 
 
 async def _delayed_firecrawl(url: str) -> tuple[dict | None, str | None]:
@@ -161,7 +174,7 @@ async def _browser(url: str) -> tuple[dict | None, str | None]:
         raise
     except Exception as exc:
         _record_browser_failure(url)
-        return None, f"FlareSolverr failed: {exc}"
+        return None, f"FlareSolverr failed: {_error_detail(exc)}"
 
 
 async def _cancel(task: asyncio.Task | None) -> None:
@@ -250,13 +263,34 @@ async def _acquire_page(url: str) -> dict:
             return cached
 
     await _assert_url_allowed(url)
-    status, _headers, body, ctype, is_html = await _direct_resource_fetch(
-        url,
-        timeout=cfg.http_timeout_seconds,
-        user_agent=cfg.user_agent,
-        verify_ssl=cfg.verify_ssl,
-        max_bytes=cfg.max_download_bytes,
-    )
+    direct_only = _known_direct_url(url)
+    probe_error: str | None = None
+    try:
+        status, _headers, body, ctype, is_html = await _direct_resource_fetch(
+            url,
+            timeout=(
+                cfg.http_timeout_seconds
+                if direct_only
+                else cfg.direct_probe_timeout_seconds
+            ),
+            user_agent=cfg.user_agent,
+            verify_ssl=cfg.verify_ssl,
+            max_bytes=cfg.max_download_bytes,
+        )
+    except (SSRFError, DownloadTooLargeError):
+        raise
+    except Exception as exc:
+        probe_error = _error_detail(exc)
+        if direct_only:
+            raise PageAcquisitionError(
+                f"Direct resource fetch failed: {probe_error}"
+            ) from exc
+        # A type probe is an optimization, not a prerequisite. Sites commonly
+        # stall or drop non-browser clients; assume an ordinary web page and
+        # continue directly to the browser providers.
+        is_html = True
+        status, body, ctype = 0, b"", "text/html"
+        log.debug("Direct resource probe failed for %s: %s", url, probe_error)
     if not is_html:
         fetched = _direct_result(url, status, body, ctype)
         if fetched["resource_kind"] == "html_at_document_url":
@@ -273,10 +307,21 @@ async def _acquire_page(url: str) -> dict:
     if not cfg.flaresolverr_url:
         from .web_fetch import _httpx_fetch
 
-        status, _headers, body, ctype = await _httpx_fetch(
-            url, cfg.http_timeout_seconds, cfg.user_agent, cfg.verify_ssl,
-            cfg.max_download_bytes,
-        )
+        try:
+            status, _headers, body, ctype = await _httpx_fetch(
+                url, cfg.http_timeout_seconds, cfg.user_agent, cfg.verify_ssl,
+                cfg.max_download_bytes,
+            )
+        except (SSRFError, DownloadTooLargeError):
+            raise
+        except Exception as exc:
+            direct_error = _error_detail(exc)
+            recovered, firecrawl_error = await _firecrawl(url)
+            if recovered is not None:
+                return recovered
+            raise PageAcquisitionError(
+                f"Direct HTML fetch failed: {direct_error}; {firecrawl_error}"
+            ) from exc
         fetched = _direct_result(url, status, body, ctype)
         assessment = await _assess(fetched, url)
         if _accepted(assessment):
@@ -293,10 +338,18 @@ async def _acquire_page(url: str) -> dict:
         recovered, error = await _firecrawl(url)
         if recovered is not None:
             return recovered
-        raise PageAcquisitionError(f"Host browser circuit is open; {error}")
+        prefix = f"Direct probe failed: {probe_error}; " if probe_error else ""
+        raise PageAcquisitionError(f"{prefix}host browser circuit is open; {error}")
 
     if cfg.firecrawl_hedge_enabled and cfg.firecrawl_api_key.strip():
-        return await _hedged_browser_fetch(url)
+        try:
+            return await _hedged_browser_fetch(url)
+        except PageAcquisitionError as exc:
+            if probe_error:
+                raise PageAcquisitionError(
+                    f"Direct probe failed: {probe_error}; {exc}"
+                ) from exc
+            raise
 
     rendered, browser_error = await _browser(url)
     if rendered is not None:
@@ -304,7 +357,8 @@ async def _acquire_page(url: str) -> dict:
     recovered, firecrawl_error = await _firecrawl(url)
     if recovered is not None:
         return recovered
-    raise PageAcquisitionError(f"{browser_error}; {firecrawl_error}")
+    prefix = f"Direct probe failed: {probe_error}; " if probe_error else ""
+    raise PageAcquisitionError(f"{prefix}{browser_error}; {firecrawl_error}")
 
 
 async def acquire_page(url: str) -> dict:

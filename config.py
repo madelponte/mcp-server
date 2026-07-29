@@ -200,6 +200,13 @@ class WebSearchSettings(BaseSettings):
     )
 
     http_timeout_seconds: float = Field(25.0, description="HTTP timeout for fetches, in seconds.")
+    direct_probe_timeout_seconds: float = Field(
+        5.0,
+        description=(
+            "Timeout for fetch_page's lightweight direct resource-type probe. "
+            "On timeout, HTML acquisition continues through FlareSolverr."
+        ),
+    )
     max_download_bytes: int = Field(
         104857600,  # 100 MiB
         description=(
