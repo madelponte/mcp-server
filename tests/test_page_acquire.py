@@ -72,6 +72,35 @@ def test_blocked_document_can_use_firecrawl_document_parser(monkeypatch):
     assert out["text"] == "Recovered PDF text"
 
 
+def test_blocked_document_rejects_firecrawl_challenge_text(monkeypatch):
+    async def direct(*args, **kwargs):
+        return 403, {}, b"<html><body>Challenge</body></html>", "text/html", False
+
+    async def document_firecrawl(url):
+        result = _artifact(
+            "Access denied. Verify that you are human.",
+            via="firecrawl",
+            ctype="text/markdown",
+        )
+        result["resource_kind"] = "document_text"
+        return result
+
+    async def blocked_assessment(url, status, html):
+        return pa.PageAssessment(
+            pa.PageVerdict.BLOCKED,
+            0.96,
+            "challenge_page",
+            {"challenge_language": True},
+        )
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_document_with_firecrawl", document_firecrawl)
+    monkeypatch.setattr(pa, "assess_page", blocked_assessment)
+    with pytest.raises(pa.PageAcquisitionError, match="document recovery was blocked"):
+        run(pa.acquire_page("https://example.com/report.pdf"))
+
+
 def test_document_url_returning_html_is_not_sent_to_browser_or_tika(monkeypatch):
     async def direct(*args, **kwargs):
         return 200, {}, b"<html><body>Download denied</body></html>", "text/html", False
@@ -174,6 +203,32 @@ def test_sparse_page_is_accepted_when_classifier_is_not_configured(monkeypatch):
     assert out["assessment"]["verdict"] == "uncertain"
 
 
+def test_sparse_page_is_accepted_when_classifier_fails(monkeypatch):
+    async def direct(*args, **kwargs):
+        return 200, {}, b"", "text/html", True
+
+    async def browser(url):
+        return _artifact("<body>Service operational</body>")
+
+    async def classifier_failed(url, status, html):
+        return pa.PageAssessment(
+            pa.PageVerdict.UNCERTAIN,
+            0.5,
+            "sparse_content",
+            {"word_count": 2},
+            source="deterministic",
+        )
+
+    monkeypatch.setattr(pa.cfg, "classifier_api_url", "http://classifier/v1")
+    monkeypatch.setattr(pa.cfg, "classifier_model", "small-4b")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "assess_page", classifier_failed)
+    out = run(pa.acquire_page("https://example.com/status"))
+    assert out["via"] == "flaresolverr"
+    assert out["assessment"]["source"] == "deterministic"
+
+
 def test_slow_browser_is_bounded_before_sequential_firecrawl(monkeypatch):
     calls = []
 
@@ -273,3 +328,55 @@ def test_host_circuit_skips_browser_after_distinct_url_failures(monkeypatch):
     run(pa.acquire_page("https://example.com/b"))
     run(pa.acquire_page("https://example.com/c"))
     assert browser_calls == ["https://www.example.com/a", "https://example.com/b"]
+
+
+def test_http_errors_do_not_open_host_browser_circuit(monkeypatch):
+    browser_calls = []
+
+    async def direct(*args, **kwargs):
+        return 200, {}, b"", "text/html", True
+
+    async def browser(url):
+        browser_calls.append(url)
+        if url.endswith(("/a", "/b")):
+            return _artifact("<h1>Not Found</h1>", status=404)
+        return _artifact("<main><p>The valid page is available.</p></main>")
+
+    async def firecrawl(url):
+        return _artifact(
+            "<main><p>Fallback result for the unavailable URL.</p></main>",
+            via="firecrawl",
+        )
+
+    async def assess(url, status, html):
+        if status == 404:
+            return pa.PageAssessment(
+                pa.PageVerdict.UNUSABLE,
+                0.98,
+                "http_404",
+                {"status": 404},
+            )
+        return pa.PageAssessment(
+            pa.PageVerdict.ACCEPT,
+            0.96,
+            "substantive_content",
+            {"main_content": True},
+        )
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa.cfg, "circuit_breaker_failure_threshold", 2)
+    monkeypatch.setattr(pa.cfg, "circuit_breaker_window_seconds", 60)
+    monkeypatch.setattr(pa.cfg, "circuit_breaker_ttl_seconds", 60)
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "_render_with_firecrawl", firecrawl)
+    monkeypatch.setattr(pa, "assess_page", assess)
+
+    run(pa.acquire_page("https://example.com/a"))
+    run(pa.acquire_page("https://example.com/b"))
+    run(pa.acquire_page("https://example.com/c"))
+    assert browser_calls == [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ]

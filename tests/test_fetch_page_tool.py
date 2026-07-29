@@ -350,6 +350,32 @@ def test_reddit_json_failure_uses_oembed(monkeypatch, tool_fns):
     assert "without comments" in out["note"]
 
 
+def test_reddit_json_http_error_uses_oembed(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        if url.endswith(".json"):
+            return _fetched(
+                text='{"message":"Forbidden"}',
+                content_type="application/json",
+                status=403,
+            )
+        return _fetched(
+            text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
+            content_type="application/json",
+        )
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith(".json")
+    assert "/oembed?" in calls[1]
+    assert json.loads(out["content"])["title"] == "Fallback title"
+    assert "without comments" in out["note"]
+
+
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(text='{"key": "value"}', content_type="application/json"))
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/api")))

@@ -352,19 +352,25 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
 # post + comment fields the model needs.
 # ---------------------------------------------------------------------------
 
-def _normalize_reddit_url(url: str) -> str:
-    """Reddit blocks HTML scraping; force the .json endpoint for reddit links."""
+def _is_reddit_url(url: str) -> bool:
+    """Whether a URL targets reddit.com or one of its real subdomains."""
     try:
         p = urlparse(url)
     except Exception:
-        return url
+        return False
     # Match reddit.com and its subdomains (www./old./np. …) only. A bare
     # `endswith("reddit.com")` on the netloc would also catch look-alike domains
     # like `notreddit.com` (and miss `reddit.com:443`, since the port is part of
     # the netloc), so test the parsed hostname for an exact or dotted-suffix match.
     host = (p.hostname or "").lower()
-    if host != "reddit.com" and not host.endswith(".reddit.com"):
+    return host == "reddit.com" or host.endswith(".reddit.com")
+
+
+def _normalize_reddit_url(url: str) -> str:
+    """Reddit blocks HTML scraping; force the .json endpoint for reddit links."""
+    if not _is_reddit_url(url):
         return url
+    p = urlparse(url)
     path = p.path or "/"
     if path.endswith("/"):
         path = path[:-1]
@@ -375,7 +381,12 @@ def _normalize_reddit_url(url: str) -> str:
 
 def _reddit_oembed_url(url: str) -> str:
     """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
-    return "https://www.reddit.com/oembed?" + urlencode({"url": url})
+    p = urlparse(url)
+    path = p.path[:-5] if p.path.endswith(".json") else p.path
+    post_url = urlunparse(
+        (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
+    )
+    return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
 
 
 def _compact_reddit_json(data: Any) -> Any:
@@ -605,48 +616,66 @@ async def _fetch_one(
 
     section = (section or "").strip() or None
 
+    reddit_request = _is_reddit_url(url)
     fetch_url = _normalize_reddit_url(url)
-    reddit_rewritten = fetch_url != url
 
     reddit_oembed = False
+    fetched: dict | None = None
+    primary_exc: Exception | None = None
     try:
         # The acquisition module owns the complete browser-first policy: direct
         # resource probe, FlareSolverr, quality assessment, optional classifier,
         # circuit breaker, hedge, and Firecrawl fallback.
         fetched = await _acquire_page(fetch_url)
-    except Exception as primary_exc:
-        # Reddit frequently blocks its post/comments .json endpoint from server
-        # IPs, while its official oEmbed JSON remains available. Return that
-        # useful post metadata rather than sending a .json URL through browsers
-        # (or Firecrawl, which explicitly does not support Reddit).
-        if reddit_rewritten:
-            fetch_url = _reddit_oembed_url(url)
-            try:
-                fetched = await _acquire_page(fetch_url)
-                reddit_oembed = True
-            except Exception as oembed_exc:
-                primary_exc = RuntimeError(
-                    f"Reddit JSON failed ({primary_exc}); oEmbed failed ({oembed_exc})"
-                )
-        if not reddit_oembed:
-            backend_passwords = tuple(
-                urlparse(endpoint).password or ""
-                for endpoint in (
-                    cfg.flaresolverr_url,
-                    cfg.firecrawl_api_url,
-                    cfg.tika_url,
-                    cfg.classifier_api_url,
-                )
-                if endpoint
+    except Exception as exc:
+        primary_exc = exc
+
+    # Reddit frequently blocks its post/comments .json endpoint from server
+    # IPs. Direct-resource HTTP errors are returned as artifacts rather than
+    # acquisition exceptions, so treat either form as a reason to try oEmbed.
+    primary_status = fetched.get("status") if fetched is not None else None
+    if reddit_request and (
+        primary_exc is not None
+        or (primary_status is not None and primary_status >= 400)
+    ):
+        if primary_exc is None:
+            primary_exc = RuntimeError(f"Reddit JSON returned HTTP {primary_status}")
+        fetch_url = _reddit_oembed_url(url)
+        try:
+            oembed = await _acquire_page(fetch_url)
+            oembed_status = oembed.get("status")
+            if oembed_status is not None and oembed_status >= 400:
+                raise RuntimeError(f"Reddit oEmbed returned HTTP {oembed_status}")
+            fetched = oembed
+            reddit_oembed = True
+            primary_exc = None
+        except Exception as oembed_exc:
+            primary_exc = RuntimeError(
+                f"Reddit JSON failed ({primary_exc}); oEmbed failed ({oembed_exc})"
             )
-            detail = redact_secrets(
-                primary_exc,
-                cfg.firecrawl_api_key,
-                cfg.classifier_api_key,
-                *backend_passwords,
+
+    if primary_exc is not None:
+        backend_passwords = tuple(
+            urlparse(endpoint).password or ""
+            for endpoint in (
+                cfg.flaresolverr_url,
+                cfg.firecrawl_api_url,
+                cfg.tika_url,
+                cfg.classifier_api_url,
             )
-            detail = detail.strip() or type(primary_exc).__name__
-            raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
+            if endpoint
+        )
+        detail = redact_secrets(
+            primary_exc,
+            cfg.firecrawl_api_key,
+            cfg.classifier_api_key,
+            *backend_passwords,
+        )
+        detail = detail.strip() or type(primary_exc).__name__
+        raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
+
+    if fetched is None:  # Defensive invariant for type checkers and future edits.
+        raise ToolError(f"Fetch failed for {fetch_url}: no acquisition result")
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
@@ -729,10 +758,10 @@ async def _fetch_one(
     text = fetched.get("text") or ""
 
     # Reddit / JSON responses
-    if reddit_rewritten or "json" in ctype:
+    if reddit_request or "json" in ctype:
         try:
             parsed = json.loads(text)
-            compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
+            compact = _compact_reddit_json(parsed) if reddit_request else parsed
             json_payload = {
                 "url": fetch_url,
                 **_provenance(url, fetch_url, status, ctype or "application/json", via),

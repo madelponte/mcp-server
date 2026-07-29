@@ -108,16 +108,31 @@ def _known_direct_url(url: str) -> bool:
     return path.endswith((".json", ".xml", ".rss", ".atom", ".txt", ".csv"))
 
 
-def _classifier_enabled() -> bool:
-    return bool(cfg.classifier_api_url.strip() and cfg.classifier_model.strip())
-
-
 def _accepted(assessment: PageAssessment) -> bool:
     if assessment.verdict is PageVerdict.ACCEPT:
         return True
-    # If no semantic classifier is configured, intentionally skip that hybrid
-    # stage and accept concise-but-not-obviously-blocked pages.
-    return assessment.verdict is PageVerdict.UNCERTAIN and not _classifier_enabled()
+    # Deterministically uncertain pages are concise but not obviously blocked.
+    # Accept them both when the optional classifier is disabled and when a
+    # configured classifier failed and assess_page preserved the deterministic
+    # result. A classifier that actually returned a low-confidence/uncertain
+    # verdict has source="llm" and remains rejected.
+    return (
+        assessment.verdict is PageVerdict.UNCERTAIN
+        and assessment.source == "deterministic"
+    )
+
+
+def _counts_toward_circuit(assessment: PageAssessment) -> bool:
+    """Whether a rejected render is evidence of a host-level browser problem."""
+    if assessment.verdict is PageVerdict.BLOCKED:
+        return True
+    if assessment.verdict is PageVerdict.UNUSABLE:
+        # A normal origin response such as 404/410 is specific to that URL. It
+        # says nothing about whether FlareSolverr can render another URL on the
+        # host, so it must not poison the host circuit.
+        return not assessment.reason.startswith("http_")
+    # An uncertain classifier verdict is not evidence that the browser failed.
+    return False
 
 
 async def _assess(fetched: dict, url: str) -> PageAssessment:
@@ -160,6 +175,12 @@ async def _firecrawl_document(url: str) -> tuple[dict | None, str | None]:
         return None, "Firecrawl is not configured"
     try:
         fetched = await _render_document_with_firecrawl(url)
+        assessment = await _assess(fetched, url)
+        if not _accepted(assessment):
+            return None, (
+                "Firecrawl document recovery was "
+                f"{assessment.verdict.value} ({assessment.reason})"
+            )
         _cache_page(url, fetched)
         return fetched, None
     except Exception as exc:
@@ -186,7 +207,8 @@ async def _browser(url: str) -> tuple[dict | None, str | None]:
             _record_browser_success(url)
             _cache_page(url, rendered)
             return rendered, None
-        _record_browser_failure(url)
+        if _counts_toward_circuit(assessment):
+            _record_browser_failure(url)
         return None, f"FlareSolverr page was {assessment.verdict.value} ({assessment.reason})"
     except (SSRFError, DownloadTooLargeError):
         raise

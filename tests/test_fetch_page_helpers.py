@@ -13,6 +13,7 @@ from tools.fetch_page import (
     QueryMatchTimeoutError,
     _format_match_windows,
     _normalize_reddit_url,
+    _reddit_oembed_url,
     _compact_reddit_json,
     _provenance,
     _is_contentless,
@@ -232,6 +233,15 @@ def test_normalize_reddit_url_non_reddit_unchanged():
 def test_normalize_reddit_url_lookalike_unchanged():
     url = "https://notreddit.com/r/x/comments/abc"
     assert _normalize_reddit_url(url) == url
+
+
+def test_reddit_oembed_url_uses_post_url_not_json_endpoint():
+    out = _reddit_oembed_url(
+        "https://old.reddit.com/r/x/comments/abc/title.json?context=3"
+    )
+    assert "/oembed?" in out
+    assert "title.json" not in out
+    assert "www.reddit.com" in out
 
 
 # --------------------------- _compact_reddit_json ---------------------------
