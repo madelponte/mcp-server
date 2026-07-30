@@ -50,6 +50,18 @@ _CHALLENGE_TERMS = re.compile(
     re.I,
 )
 _INTERACTION_ATTR = re.compile(r"captcha|challenge|human|verification", re.I)
+# Strong error-page labels only. This deliberately does not match titles such as
+# "How to fix 404 errors": a rendered page is considered a soft 404 only when
+# the direct probe also saw an HTTP error and the title/first H1 itself is an
+# error label, optionally followed by a site name.
+_SOFT_404_LABEL = re.compile(
+    r"^(?:"
+    r"page\s+not\s+found"
+    r"|(?:error\s*)?404\s*(?::|[-–—])?\s*(?:(?:page|file)\s+)?not\s+found"
+    r")"
+    r"(?:\s*(?:[|·]|[-–—])\s*.+)?$",
+    re.I,
+)
 
 
 def _visible_sample(soup: BeautifulSoup) -> str:
@@ -58,7 +70,26 @@ def _visible_sample(soup: BeautifulSoup) -> str:
     return " ".join(soup.get_text(" ", strip=True).split())
 
 
-def deterministic_assessment(status: int | None, html: str) -> PageAssessment:
+def _soft_404_surface(soup: BeautifulSoup) -> str | None:
+    """Return the matching title/H1 label when a render is a strong soft 404."""
+    candidates = []
+    if soup.title:
+        candidates.append(soup.title.get_text(" ", strip=True))
+    first_h1 = soup.find("h1")
+    if first_h1:
+        candidates.append(first_h1.get_text(" ", strip=True))
+    for candidate in candidates:
+        normalized = " ".join(candidate.split())
+        if _SOFT_404_LABEL.fullmatch(normalized):
+            return normalized[:200]
+    return None
+
+
+def deterministic_assessment(
+    status: int | None,
+    html: str,
+    probe_status: int | None = None,
+) -> PageAssessment:
     """Classify obvious success/block/failure cases from generic page qualities."""
     if status == 429:
         return PageAssessment(PageVerdict.BLOCKED, 1.0, "rate_limited", {})
@@ -86,6 +117,7 @@ def deterministic_assessment(status: int | None, html: str) -> PageAssessment:
                 interactive += 1
         challenge_language = bool(_CHALLENGE_TERMS.search(visible[:12000]))
         unique_ratio = len({w.lower() for w in words}) / word_count if word_count else 0.0
+        soft_404_surface = _soft_404_surface(soup)
     except Exception:
         return PageAssessment(PageVerdict.UNCERTAIN, 0.3, "dom_parse_failed", {})
 
@@ -99,6 +131,26 @@ def deterministic_assessment(status: int | None, html: str) -> PageAssessment:
         "challenge_language": challenge_language,
         "unique_word_ratio": round(unique_ratio, 3),
     }
+    if probe_status is not None:
+        metrics["probe_status"] = probe_status
+
+    # Some origins return a bot-like 403 to the direct browser User-Agent, while
+    # the renderer receives a branded "Page Not Found" document reported as 200.
+    # Requiring both the failed probe and an exact title/first-H1 error label
+    # catches that status laundering without rejecting legitimate 404 articles.
+    if (
+        probe_status is not None
+        and probe_status >= 400
+        and (status is None or status < 400)
+        and soft_404_surface is not None
+    ):
+        metrics["soft_404_label"] = True
+        return PageAssessment(
+            PageVerdict.UNUSABLE,
+            0.99,
+            f"soft_404_after_http_{probe_status}",
+            metrics,
+        )
 
     if word_count == 0:
         return PageAssessment(PageVerdict.UNUSABLE, 1.0, "no_readable_text", metrics)
@@ -203,8 +255,16 @@ async def classify_ambiguous_page(
         return assessment
 
 
-async def assess_page(url: str, status: int | None, html: str) -> PageAssessment:
-    assessment = await anyio.to_thread.run_sync(deterministic_assessment, status, html)
+async def assess_page(
+    url: str,
+    status: int | None,
+    html: str,
+    *,
+    probe_status: int | None = None,
+) -> PageAssessment:
+    assessment = await anyio.to_thread.run_sync(
+        deterministic_assessment, status, html, probe_status
+    )
     if assessment.verdict is PageVerdict.UNCERTAIN:
         assessment = await classify_ambiguous_page(
             url=url, status=status, html=html, assessment=assessment

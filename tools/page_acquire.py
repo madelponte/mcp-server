@@ -137,13 +137,28 @@ def _counts_toward_circuit(assessment: PageAssessment) -> bool:
         # A normal origin response such as 404/410 is specific to that URL. It
         # says nothing about whether FlareSolverr can render another URL on the
         # host, so it must not poison the host circuit.
-        return not assessment.reason.startswith("http_")
+        return not assessment.reason.startswith(("http_", "soft_404_"))
     # An uncertain classifier verdict is not evidence that the browser failed.
     return False
 
 
-async def _assess(fetched: dict, url: str) -> PageAssessment:
-    assessment = await assess_page(url, fetched.get("status"), fetched.get("text") or "")
+async def _assess(
+    fetched: dict,
+    url: str,
+    *,
+    probe_status: int | None = None,
+) -> PageAssessment:
+    if probe_status is None:
+        assessment = await assess_page(
+            url, fetched.get("status"), fetched.get("text") or ""
+        )
+    else:
+        assessment = await assess_page(
+            url,
+            fetched.get("status"),
+            fetched.get("text") or "",
+            probe_status=probe_status,
+        )
     fetched["assessment"] = {
         "verdict": assessment.verdict.value,
         "confidence": assessment.confidence,
@@ -163,12 +178,16 @@ async def _assess(fetched: dict, url: str) -> PageAssessment:
     return assessment
 
 
-async def _firecrawl(url: str) -> tuple[dict | None, str | None]:
+async def _firecrawl(
+    url: str,
+    *,
+    probe_status: int | None = None,
+) -> tuple[dict | None, str | None]:
     if not cfg.firecrawl_api_key.strip():
         return None, "Firecrawl is not configured"
     try:
         fetched = await _render_with_firecrawl(url)
-        assessment = await _assess(fetched, url)
+        assessment = await _assess(fetched, url, probe_status=probe_status)
         if _accepted(assessment):
             _cache_page(url, fetched)
             return fetched, None
@@ -194,12 +213,18 @@ async def _firecrawl_document(url: str) -> tuple[dict | None, str | None]:
         return None, _error_detail(exc)
 
 
-async def _delayed_firecrawl(url: str) -> tuple[dict | None, str | None]:
+async def _delayed_firecrawl(
+    url: str,
+    probe_status: int | None = None,
+) -> tuple[dict | None, str | None]:
     await asyncio.sleep(max(0.0, cfg.firecrawl_hedge_delay_seconds))
-    return await _firecrawl(url)
+    return await _firecrawl(url, probe_status=probe_status)
 
 
-async def _browser(url: str) -> tuple[dict | None, str | None]:
+async def _browser(
+    url: str,
+    probe_status: int | None = None,
+) -> tuple[dict | None, str | None]:
     """Render and assess FlareSolverr output, updating the host circuit."""
     try:
         if cfg.firecrawl_api_key.strip():
@@ -209,7 +234,7 @@ async def _browser(url: str) -> tuple[dict | None, str | None]:
             )
         else:
             rendered = await _render_with_flaresolverr(url)
-        assessment = await _assess(rendered, url)
+        assessment = await _assess(rendered, url, probe_status=probe_status)
         if _accepted(assessment):
             _record_browser_success(url)
             _cache_page(url, rendered)
@@ -240,9 +265,12 @@ async def _cancel(task: asyncio.Task | None) -> None:
         pass
 
 
-async def _hedged_browser_fetch(url: str) -> dict:
-    browser_task = asyncio.create_task(_browser(url))
-    hedge_task = asyncio.create_task(_delayed_firecrawl(url))
+async def _hedged_browser_fetch(
+    url: str,
+    probe_status: int | None = None,
+) -> dict:
+    browser_task = asyncio.create_task(_browser(url, probe_status))
+    hedge_task = asyncio.create_task(_delayed_firecrawl(url, probe_status))
     try:
         done, _pending = await asyncio.wait(
             {browser_task, hedge_task}, return_when=asyncio.FIRST_COMPLETED
@@ -353,6 +381,8 @@ async def _acquire_page(url: str) -> dict:
         # page into a successful-looking 200 artifact.
         return _direct_result(url, status, body, ctype)
 
+    renderer_probe_status = status if status >= 400 else None
+
     if is_html and direct_only:
         if _is_tika_document("", url):
             recovered, document_error = await _firecrawl_document(url)
@@ -394,18 +424,24 @@ async def _acquire_page(url: str) -> dict:
             raise
         except Exception as exc:
             direct_error = _error_detail(exc)
-            recovered, firecrawl_error = await _firecrawl(url)
+            recovered, firecrawl_error = await _firecrawl(
+                url, probe_status=renderer_probe_status
+            )
             if recovered is not None:
                 return recovered
             raise PageAcquisitionError(
                 f"Direct HTML fetch failed: {direct_error}; {firecrawl_error}"
             ) from exc
         fetched = _direct_result(url, status, body, ctype)
-        assessment = await _assess(fetched, url)
+        assessment = await _assess(
+            fetched, url, probe_status=renderer_probe_status
+        )
         if _accepted(assessment):
             _cache_page(url, fetched)
             return fetched
-        recovered, error = await _firecrawl(url)
+        recovered, error = await _firecrawl(
+            url, probe_status=renderer_probe_status
+        )
         if recovered is not None:
             return recovered
         raise PageAcquisitionError(
@@ -413,7 +449,9 @@ async def _acquire_page(url: str) -> dict:
         )
 
     if _circuit_open(url):
-        recovered, error = await _firecrawl(url)
+        recovered, error = await _firecrawl(
+            url, probe_status=renderer_probe_status
+        )
         if recovered is not None:
             return recovered
         prefix = f"Direct probe failed: {probe_error}; " if probe_error else ""
@@ -421,7 +459,7 @@ async def _acquire_page(url: str) -> dict:
 
     if cfg.firecrawl_hedge_enabled and cfg.firecrawl_api_key.strip():
         try:
-            return await _hedged_browser_fetch(url)
+            return await _hedged_browser_fetch(url, renderer_probe_status)
         except PageAcquisitionError as exc:
             if probe_error:
                 raise PageAcquisitionError(
@@ -429,10 +467,12 @@ async def _acquire_page(url: str) -> dict:
                 ) from exc
             raise
 
-    rendered, browser_error = await _browser(url)
+    rendered, browser_error = await _browser(url, renderer_probe_status)
     if rendered is not None:
         return rendered
-    recovered, firecrawl_error = await _firecrawl(url)
+    recovered, firecrawl_error = await _firecrawl(
+        url, probe_status=renderer_probe_status
+    )
     if recovered is not None:
         return recovered
     prefix = f"Direct probe failed: {probe_error}; " if probe_error else ""

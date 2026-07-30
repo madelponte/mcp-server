@@ -42,6 +42,28 @@ def test_sparse_page_is_uncertain():
     assert out.verdict is pq.PageVerdict.UNCERTAIN
 
 
+def test_soft_404_after_failed_probe_is_unusable():
+    html = (
+        "<html><head><title>Page Not Found | W3C</title></head>"
+        "<body><h1>Page Not Found</h1><p>The requested page does not exist.</p></body></html>"
+    )
+    out = pq.deterministic_assessment(200, html, probe_status=403)
+    assert out.verdict is pq.PageVerdict.UNUSABLE
+    assert out.reason == "soft_404_after_http_403"
+    assert out.metrics["soft_404_label"] is True
+
+
+def test_article_about_404_is_not_a_soft_404():
+    html = (
+        "<article><h1>How to fix 404 Not Found errors</h1>"
+        "<p>This troubleshooting guide explains why missing routes occur.</p>"
+        "<p>It also describes several ways to repair links and redirects.</p></article>"
+    )
+    out = pq.deterministic_assessment(200, html, probe_status=403)
+    assert out.verdict is pq.PageVerdict.ACCEPT
+    assert out.reason == "substantive_content"
+
+
 def test_optional_openai_classifier_resolves_uncertain(monkeypatch, patch_httpx):
     monkeypatch.setattr(pq.cfg, "classifier_api_url", "http://classifier:8000/v1")
     monkeypatch.setattr(pq.cfg, "classifier_api_key", "secret")

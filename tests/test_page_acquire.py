@@ -204,7 +204,8 @@ def test_blocked_html_status_still_uses_browser_recovery(monkeypatch):
         calls.append("flaresolverr")
         return _artifact("<main><p>Recovered browser content.</p></main>")
 
-    async def accepted(url, status, html):
+    async def accepted(url, status, html, *, probe_status=None):
+        assert probe_status == 403
         return pa.PageAssessment(
             pa.PageVerdict.ACCEPT,
             0.96,
@@ -219,6 +220,49 @@ def test_blocked_html_status_still_uses_browser_recovery(monkeypatch):
     assert calls == ["probe", "flaresolverr"]
     assert out["status"] == 200
     assert out["via"] == "flaresolverr"
+
+
+def test_failed_probe_soft_404_is_rejected_by_both_renderers(monkeypatch):
+    calls = []
+    assessed_probe_statuses = []
+
+    async def direct(*args, **kwargs):
+        calls.append("probe")
+        return 403, {}, b"", "text/html", True
+
+    async def browser(url):
+        calls.append("flaresolverr")
+        return _artifact(
+            "<title>Page Not Found | W3C</title><h1>Page Not Found</h1>"
+        )
+
+    async def firecrawl(url):
+        calls.append("firecrawl")
+        return _artifact(
+            "<title>Page Not Found | W3C</title><h1>Page Not Found</h1>",
+            via="firecrawl",
+        )
+
+    async def soft_404(url, status, html, *, probe_status=None):
+        assessed_probe_statuses.append(probe_status)
+        return pa.PageAssessment(
+            pa.PageVerdict.UNUSABLE,
+            0.99,
+            "soft_404_after_http_403",
+            {"probe_status": 403, "soft_404_label": True},
+        )
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "_render_with_firecrawl", firecrawl)
+    monkeypatch.setattr(pa, "assess_page", soft_404)
+    with pytest.raises(pa.PageAcquisitionError, match="soft_404_after_http_403"):
+        run(pa.acquire_page("https://www.w3.org/missing"))
+    assert calls == ["probe", "flaresolverr", "firecrawl"]
+    assert assessed_probe_statuses == [403, 403]
+    assert pa._host_failures == {}
+    assert pa._open_circuits == {}
 
 
 def test_blocked_browser_render_falls_back_to_firecrawl(monkeypatch):
