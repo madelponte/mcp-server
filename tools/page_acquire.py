@@ -39,6 +39,13 @@ class PageAcquisitionError(RuntimeError):
     """No acquisition provider returned acceptable page content."""
 
 
+# A direct probe sees the origin/CDN status before any browser renderer can
+# replace it with a synthetic 200 for a branded error document. These statuses
+# definitively mean the requested resource is unavailable; rendering the same
+# URL cannot recover it and risks returning a polished 404 page as real content.
+_AUTHORITATIVE_HTML_ERROR_STATUSES = frozenset({404, 410, 451})
+
+
 # host -> {URL: last failure monotonic time}; opened circuits have an expiry.
 _host_failures: dict[str, dict[str, float]] = defaultdict(dict)
 _open_circuits: dict[str, float] = {}
@@ -337,6 +344,15 @@ async def _acquire_page(url: str) -> dict:
         is_html = True
         status, body, ctype = 0, b"", "text/html"
         log.debug("Direct resource probe failed for %s: %s", url, probe_error)
+
+    if is_html and status in _AUTHORITATIVE_HTML_ERROR_STATUSES:
+        # Declared HTML probes intentionally do not consume the response body.
+        # Return an empty direct artifact carrying the authoritative status;
+        # fetch_page's normal HTTP-error invariant will surface it as an error.
+        # In particular, do not let FlareSolverr/Firecrawl turn a branded error
+        # page into a successful-looking 200 artifact.
+        return _direct_result(url, status, body, ctype)
+
     if is_html and direct_only:
         if _is_tika_document("", url):
             recovered, document_error = await _firecrawl_document(url)

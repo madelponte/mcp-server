@@ -163,6 +163,64 @@ def test_html_probe_routes_to_flaresolverr_first(monkeypatch):
     assert out["via"] == "flaresolverr"
 
 
+@pytest.mark.parametrize("status", [404, 410, 451])
+def test_missing_html_status_is_authoritative(monkeypatch, status):
+    calls = []
+
+    async def direct(*args, **kwargs):
+        calls.append("probe")
+        return status, {}, b"", "text/html", True
+
+    async def browser(url):
+        calls.append("flaresolverr")
+        return _artifact("<main><h1>Branded missing page</h1></main>")
+
+    async def firecrawl(url):
+        calls.append("firecrawl")
+        return _artifact(
+            "<main><h1>Branded missing page</h1></main>",
+            via="firecrawl",
+        )
+
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "_render_with_firecrawl", firecrawl)
+    out = run(pa.acquire_page("https://example.com/missing"))
+    assert calls == ["probe"]
+    assert out["status"] == status
+    assert out["via"] == "direct"
+    assert out["text"] == ""
+
+
+def test_blocked_html_status_still_uses_browser_recovery(monkeypatch):
+    calls = []
+
+    async def direct(*args, **kwargs):
+        calls.append("probe")
+        return 403, {}, b"", "text/html", True
+
+    async def browser(url):
+        calls.append("flaresolverr")
+        return _artifact("<main><p>Recovered browser content.</p></main>")
+
+    async def accepted(url, status, html):
+        return pa.PageAssessment(
+            pa.PageVerdict.ACCEPT,
+            0.96,
+            "substantive_content",
+            {"main_content": True},
+        )
+
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(pa, "_render_with_flaresolverr", browser)
+    monkeypatch.setattr(pa, "assess_page", accepted)
+    out = run(pa.acquire_page("https://example.com/protected"))
+    assert calls == ["probe", "flaresolverr"]
+    assert out["status"] == 200
+    assert out["via"] == "flaresolverr"
+
+
 def test_blocked_browser_render_falls_back_to_firecrawl(monkeypatch):
     calls = []
 
