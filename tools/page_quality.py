@@ -46,6 +46,7 @@ _WORD_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
 _CHALLENGE_TERMS = re.compile(
     r"\b(captcha|verify (?:that )?you are human|confirm (?:that )?you are human|"
     r"press and hold|security check|automated (?:request|tool)|access denied|"
+    r"please wait for verification|verification required|"
     r"enable javascript and cookies)\b",
     re.I,
 )

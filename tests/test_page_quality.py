@@ -28,6 +28,15 @@ def test_generic_challenge_structure_is_blocked():
     assert out.verdict is pq.PageVerdict.BLOCKED
 
 
+def test_reddit_wait_for_verification_is_blocked():
+    html = (
+        "<html><head><title>Reddit - Please wait for verification</title></head>"
+        "<body><form><button>Continue</button></form></body></html>"
+    )
+    out = pq.deterministic_assessment(200, html)
+    assert out.verdict is pq.PageVerdict.BLOCKED
+
+
 def test_article_discussing_captchas_is_not_blocked():
     html = "<article><h1>CAPTCHA accessibility</h1>" + "".join(
         f"<p>Paragraph {i} discusses accessible web design and practical alternatives.</p>"

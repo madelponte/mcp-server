@@ -183,6 +183,8 @@ async def _firecrawl(
     *,
     probe_status: int | None = None,
 ) -> tuple[dict | None, str | None]:
+    if _host(url) == "reddit.com":
+        return None, "Firecrawl does not support Reddit"
     if not cfg.firecrawl_api_key.strip():
         return None, "Firecrawl is not configured"
     try:

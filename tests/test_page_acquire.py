@@ -265,6 +265,16 @@ def test_failed_probe_soft_404_is_rejected_by_both_renderers(monkeypatch):
     assert pa._open_circuits == {}
 
 
+def test_firecrawl_is_skipped_for_unsupported_reddit_host(monkeypatch):
+    monkeypatch.setattr(pa.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(
+        pa, "_render_with_firecrawl", lambda url: pytest.fail("Firecrawl called")
+    )
+    fetched, error = run(pa._firecrawl("https://www.reddit.com/r/python/"))
+    assert fetched is None
+    assert error == "Firecrawl does not support Reddit"
+
+
 def test_blocked_browser_render_falls_back_to_firecrawl(monkeypatch):
     calls = []
 

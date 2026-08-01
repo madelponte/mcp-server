@@ -5,7 +5,8 @@ Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
 structured metadata summary) or, when handed a YouTube video URL, that video's
 transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
-links use the full JSON API with official oEmbed metadata as a fallback. An optional
+tries JSON first, then uses oEmbed for posts or rendered HTML for listings/searches.
+An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
 content too long to return at once.
@@ -347,9 +348,10 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
 # ---------------------------------------------------------------------------
 # Reddit handling
 #
-# Reddit blocks HTML scraping, so a reddit link is rewritten to its .json
-# endpoint before fetching and the verbose response is compacted to just the
-# post + comment fields the model needs.
+# Reddit links try their .json endpoint first and compact post/comment payloads.
+# If Reddit blocks unauthenticated JSON from the server IP, individual posts use
+# official oEmbed metadata while searches/listings retry canonical HTML through
+# FlareSolverr.
 # ---------------------------------------------------------------------------
 
 def _is_reddit_url(url: str) -> bool:
@@ -387,6 +389,25 @@ def _reddit_oembed_url(url: str) -> str:
         (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
     )
     return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
+
+
+def _reddit_fallback_url(url: str) -> tuple[str, bool]:
+    """Return (fallback URL, is_oembed) for a blocked Reddit JSON request.
+
+    oEmbed applies only to individual ``/comments/`` posts. Searches, listings,
+    and wiki pages retry their canonical www HTML through browser acquisition;
+    old.reddit.com itself now returns a hard 403 from many server networks.
+    """
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    if "/comments/" in path.lower():
+        return _reddit_oembed_url(url), True
+    if path.endswith(".json"):
+        path = path[:-5]
+    html_url = urlunparse(
+        (parsed.scheme or "https", "www.reddit.com", path, "", parsed.query, "")
+    )
+    return html_url, False
 
 
 def _compact_reddit_json(data: Any) -> Any:
@@ -620,6 +641,7 @@ async def _fetch_one(
     fetch_url = _normalize_reddit_url(url)
 
     reddit_oembed = False
+    reddit_html_fallback = False
     fetched: dict | None = None
     primary_exc: Exception | None = None
     try:
@@ -630,9 +652,10 @@ async def _fetch_one(
     except Exception as exc:
         primary_exc = exc
 
-    # Reddit frequently blocks its post/comments .json endpoint from server
-    # IPs. Direct-resource HTTP errors are returned as artifacts rather than
-    # acquisition exceptions, so treat either form as a reason to try oEmbed.
+    # Reddit frequently blocks unauthenticated .json endpoints from server IPs.
+    # Direct-resource HTTP errors are returned as artifacts rather than
+    # acquisition exceptions. Posts can fall back to official oEmbed metadata;
+    # searches/listings instead retry their original HTML through FlareSolverr.
     primary_status = fetched.get("status") if fetched is not None else None
     if reddit_request and (
         primary_exc is not None
@@ -640,18 +663,22 @@ async def _fetch_one(
     ):
         if primary_exc is None:
             primary_exc = RuntimeError(f"Reddit JSON returned HTTP {primary_status}")
-        fetch_url = _reddit_oembed_url(url)
+        fetch_url, reddit_oembed = _reddit_fallback_url(url)
+        reddit_html_fallback = not reddit_oembed
+        fallback_name = "oEmbed" if reddit_oembed else "rendered HTML"
         try:
-            oembed = await _acquire_page(fetch_url)
-            oembed_status = oembed.get("status")
-            if oembed_status is not None and oembed_status >= 400:
-                raise RuntimeError(f"Reddit oEmbed returned HTTP {oembed_status}")
-            fetched = oembed
-            reddit_oembed = True
+            fallback = await _acquire_page(fetch_url)
+            fallback_status = fallback.get("status")
+            if fallback_status is not None and fallback_status >= 400:
+                raise RuntimeError(
+                    f"Reddit {fallback_name} returned HTTP {fallback_status}"
+                )
+            fetched = fallback
             primary_exc = None
-        except Exception as oembed_exc:
+        except Exception as fallback_exc:
             primary_exc = RuntimeError(
-                f"Reddit JSON failed ({primary_exc}); oEmbed failed ({oembed_exc})"
+                f"Reddit JSON failed ({primary_exc}); "
+                f"{fallback_name} failed ({fallback_exc})"
             )
 
     if primary_exc is not None:
@@ -838,6 +865,10 @@ async def _fetch_one(
             "format": "structured",
             "content": structured,
         }
+        if reddit_html_fallback:
+            payload["note"] = (
+                "Reddit blocked its JSON endpoint; returned browser-rendered HTML."
+            )
         return payload
 
     # mode == "text"
@@ -877,6 +908,11 @@ async def _fetch_one(
         else:
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
         _set_content(section_payload, section_body, offset=offset)
+        if reddit_html_fallback:
+            section_payload["note"] = _join_note(
+                section_payload.get("note"),
+                "Reddit blocked its JSON endpoint; returned browser-rendered HTML.",
+            )
         return section_payload
 
     # An undetected/bypassed block can't reach here: a detected wall on the
@@ -888,6 +924,11 @@ async def _fetch_one(
         "format": text_format,
         "title": soup_title,
     }
+
+    if reddit_html_fallback:
+        text_payload["note"] = (
+            "Reddit blocked its JSON endpoint; returned browser-rendered HTML."
+        )
 
     if query:
         qres = await _query_payload(plain, query, fetch_url, kind="content")

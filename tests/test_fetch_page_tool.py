@@ -376,6 +376,45 @@ def test_reddit_json_http_error_uses_oembed(monkeypatch, tool_fns):
     assert "without comments" in out["note"]
 
 
+def test_reddit_search_json_error_uses_rendered_html(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        if ".json?" in url:
+            return _fetched(
+                text='{"message":"Forbidden"}',
+                content_type="application/json",
+                status=403,
+            )
+        return _fetched(
+            text=(
+                "<html><head><title>Search results</title></head><body><main>"
+                "<h1>Search results for bunker</h1>"
+                "<p>A bunker-inspired living space with concrete walls.</p>"
+                "</main></body></html>"
+            ),
+            via="flaresolverr",
+        )
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url=(
+                    "https://old.reddit.com/r/malelivingspace/search?"
+                    "q=bunker&restrict_sr=1&sort=new&t=month"
+                )
+            )
+        )
+    )
+    assert ".json?" in calls[0]
+    assert calls[1].startswith("https://www.reddit.com/r/malelivingspace/search?")
+    assert out["via"] == "flaresolverr"
+    assert "bunker-inspired" in out["content"]
+    assert "browser-rendered HTML" in out["note"]
+
+
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(text='{"key": "value"}', content_type="application/json"))
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/api")))

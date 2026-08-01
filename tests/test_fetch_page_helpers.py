@@ -14,6 +14,7 @@ from tools.fetch_page import (
     _format_match_windows,
     _normalize_reddit_url,
     _reddit_oembed_url,
+    _reddit_fallback_url,
     _compact_reddit_json,
     _provenance,
     _is_contentless,
@@ -223,6 +224,22 @@ def test_normalize_reddit_url_already_json():
     url = "https://www.reddit.com/r/x/comments/abc/title.json"
     assert _normalize_reddit_url(url).endswith(".json")
     assert _normalize_reddit_url(url).count(".json") == 1
+
+
+def test_reddit_post_fallback_uses_oembed():
+    url, is_oembed = _reddit_fallback_url(
+        "https://old.reddit.com/r/python/comments/abc/title"
+    )
+    assert "/oembed?" in url
+    assert is_oembed is True
+
+
+def test_reddit_search_fallback_uses_canonical_html():
+    url, is_oembed = _reddit_fallback_url(
+        "https://old.reddit.com/r/python/search?q=asyncio&restrict_sr=1"
+    )
+    assert url == "https://www.reddit.com/r/python/search?q=asyncio&restrict_sr=1"
+    assert is_oembed is False
 
 
 def test_normalize_reddit_url_non_reddit_unchanged():
