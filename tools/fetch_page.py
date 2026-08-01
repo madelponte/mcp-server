@@ -5,7 +5,8 @@ Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
 structured metadata summary) or, when handed a YouTube video URL, that video's
 transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
-tries JSON first, then uses oEmbed for posts or rendered HTML for listings/searches.
+uses authenticated OAuth JSON when configured, then tries RSS, old.reddit HTML,
+and finally oEmbed metadata for individual posts.
 An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
@@ -24,9 +25,10 @@ import re
 import time
 from functools import partial
 from typing import Any
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import anyio
+import httpx
 import regex as safe_regex
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
@@ -36,6 +38,8 @@ from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
+    DownloadTooLargeError,
+    _decode_body,
     _is_tika_document,
     _sniff_document_bytes,
     _tika_extract,
@@ -348,11 +352,16 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
 # ---------------------------------------------------------------------------
 # Reddit handling
 #
-# Reddit links try their .json endpoint first and compact post/comment payloads.
-# If Reddit blocks unauthenticated JSON from the server IP, individual posts use
-# official oEmbed metadata while searches/listings retry canonical HTML through
-# FlareSolverr.
+# Authenticated JSON is the durable first choice. Anonymous hosted-provider
+# traffic is commonly blocked, so the remaining representations are best-effort:
+# RSS, targeted old.reddit HTML, and (for posts) official oEmbed metadata.
 # ---------------------------------------------------------------------------
+
+_REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+_reddit_access_token: str | None = None
+_reddit_access_token_expires_at = 0.0
+_reddit_access_token_credentials: tuple[str, str] | None = None
+
 
 def _is_reddit_url(url: str) -> bool:
     """Whether a URL targets reddit.com or one of its real subdomains."""
@@ -369,7 +378,7 @@ def _is_reddit_url(url: str) -> bool:
 
 
 def _normalize_reddit_url(url: str) -> str:
-    """Reddit blocks HTML scraping; force the .json endpoint for reddit links."""
+    """Return the legacy unauthenticated JSON representation of a Reddit URL."""
     if not _is_reddit_url(url):
         return url
     p = urlparse(url)
@@ -381,33 +390,219 @@ def _normalize_reddit_url(url: str) -> str:
     return urlunparse((p.scheme or "https", "www.reddit.com", path, "", p.query, ""))
 
 
+def _reddit_clean_path(url: str) -> str:
+    """Strip a Reddit representation suffix and return its canonical path."""
+    path = urlparse(url).path or "/"
+    for suffix in (".json", ".rss"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return path
+
+
+def _is_reddit_post_url(url: str) -> bool:
+    return "/comments/" in _reddit_clean_path(url).lower()
+
+
+def _reddit_oauth_url(url: str) -> str:
+    """Build the OAuth Data API URL corresponding to a public Reddit URL."""
+    parsed = urlparse(url)
+    path = _reddit_clean_path(url).rstrip("/") or "/"
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params["raw_json"] = "1"
+    if "/comments/" in path.lower():
+        params.setdefault("limit", "500")
+    return urlunparse(("https", "oauth.reddit.com", path, "", urlencode(params), ""))
+
+
+def _reddit_rss_url(url: str) -> str:
+    """Build a Reddit Atom feed URL for a post or listing."""
+    parsed = urlparse(url)
+    path = _reddit_clean_path(url).rstrip("/")
+    path += "/.rss" if _is_reddit_post_url(url) else ".rss"
+    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", parsed.query, ""))
+
+
+def _reddit_old_url(url: str) -> str:
+    """Build the old.reddit HTML URL for a post or listing."""
+    parsed = urlparse(url)
+    return urlunparse(
+        ("https", "old.reddit.com", _reddit_clean_path(url), "", parsed.query, "")
+    )
+
+
 def _reddit_oembed_url(url: str) -> str:
     """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
     p = urlparse(url)
-    path = p.path[:-5] if p.path.endswith(".json") else p.path
+    path = _reddit_clean_path(url)
     post_url = urlunparse(
         (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
     )
     return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
 
 
-def _reddit_fallback_url(url: str) -> tuple[str, bool]:
-    """Return (fallback URL, is_oembed) for a blocked Reddit JSON request.
+def _reddit_fragment_text(fragment: str, base_url: str) -> str:
+    """Render Reddit's HTML-in-XML/body fragment without surrounding chrome."""
+    soup = BeautifulSoup(fragment or "", "lxml")
+    root = soup.select_one(".md") or soup.body or soup
+    if cfg.markdown:
+        return _markdown_from_soup(root, base_url).strip()
+    return _plain_text_from_soup(root).strip()
 
-    oEmbed applies only to individual ``/comments/`` posts. Searches, listings,
-    and wiki pages retry their canonical www HTML through browser acquisition;
-    old.reddit.com itself now returns a hard 403 from many server networks.
-    """
-    parsed = urlparse(url)
-    path = parsed.path or "/"
-    if "/comments/" in path.lower():
-        return _reddit_oembed_url(url), True
-    if path.endswith(".json"):
-        path = path[:-5]
-    html_url = urlunparse(
-        (parsed.scheme or "https", "www.reddit.com", path, "", parsed.query, "")
-    )
-    return html_url, False
+
+def _compact_reddit_rss(xml: str, url: str) -> dict | None:
+    """Convert a Reddit Atom feed into the compact Reddit result shape."""
+    try:
+        soup = BeautifulSoup(xml, "xml")
+        entries = soup.find_all("entry")
+        if not entries:
+            return None
+
+        parsed_entries = []
+        for entry in entries:
+            id_tag = entry.find("id")
+            author_tag = entry.find("author")
+            name_tag = author_tag.find("name") if author_tag else None
+            author = name_tag.get_text(strip=True) if name_tag else None
+            if author and author.startswith("/u/"):
+                author = author[3:]
+            title_tag = entry.find("title")
+            content_tag = entry.find("content")
+            link_tag = entry.find("link", href=True)
+            updated_tag = entry.find("updated")
+            parsed_entries.append(
+                {
+                    "id": id_tag.get_text(strip=True) if id_tag else None,
+                    "title": title_tag.get_text(" ", strip=True) if title_tag else None,
+                    "author": author,
+                    "url": link_tag.get("href") if link_tag else None,
+                    "body": _reddit_fragment_text(
+                        content_tag.get_text() if content_tag else "", url
+                    ),
+                    "updated": updated_tag.get_text(strip=True) if updated_tag else None,
+                }
+            )
+
+        # A post feed begins with the submission (t3), followed by comments (t1).
+        if (parsed_entries[0].get("id") or "").startswith("t3_"):
+            first = parsed_entries[0]
+            post = {
+                "title": first["title"],
+                "author": first["author"],
+                "permalink": first["url"],
+                "selftext": first["body"],
+                "created": first["updated"],
+            }
+            comments = [
+                {
+                    "id": item["id"],
+                    "author": item["author"],
+                    "body": item["body"],
+                    "permalink": item["url"],
+                    "created": item["updated"],
+                }
+                for item in parsed_entries[1:]
+                if (item.get("id") or "").startswith("t1_")
+            ]
+            return {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+                "comments_incomplete": True,
+            }
+
+        return {"items": parsed_entries, "items_returned": len(parsed_entries)}
+    except Exception:
+        return None
+
+
+def _old_reddit_entry_body(node, url: str) -> str:
+    entry = node.find("div", class_="entry", recursive=False)
+    body = entry.select_one(".usertext-body") if entry else None
+    return _reddit_fragment_text(str(body), url) if body else ""
+
+
+def _compact_reddit_html(html: str, url: str) -> dict | None:
+    """Extract posts/comments from old.reddit HTML without page chrome."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        links = soup.select("div.thing.link[data-fullname^='t3_']")
+        comments = []
+        for node in soup.select("div.thing.comment[data-fullname^='t1_']"):
+            author_node = node.select_one(".author")
+            score_node = node.select_one(".score.unvoted, .score.likes, .score.dislikes")
+            depth = sum(
+                1
+                for parent in node.parents
+                if getattr(parent, "get", lambda *_: None)("data-type") == "comment"
+            )
+            comments.append(
+                {
+                    "id": node.get("data-fullname"),
+                    "author": (
+                        author_node.get_text(" ", strip=True)
+                        if author_node
+                        else node.get("data-author")
+                    ),
+                    "score": score_node.get_text(" ", strip=True) if score_node else None,
+                    "depth": depth,
+                    "body": _old_reddit_entry_body(node, url),
+                    "permalink": node.get("data-permalink"),
+                }
+            )
+
+        if _is_reddit_post_url(url) and links:
+            node = links[0]
+            title_node = node.select_one("a.title")
+            reported = node.get("data-comments-count")
+            try:
+                reported = int(reported) if reported is not None else None
+            except (TypeError, ValueError):
+                reported = None
+            post = {
+                "title": title_node.get_text(" ", strip=True) if title_node else None,
+                "author": node.get("data-author"),
+                "subreddit": node.get("data-subreddit"),
+                "score": (
+                    int(node.get("data-score"))
+                    if str(node.get("data-score", "")).isdigit()
+                    else None
+                ),
+                "num_comments": reported,
+                "permalink": node.get("data-permalink"),
+                "url": node.get("data-url"),
+                "selftext": _old_reddit_entry_body(node, url),
+            }
+            result = {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+                "more_comment_placeholders": len(soup.select(".morecomments")),
+            }
+            if reported is not None:
+                result["comments_reported"] = reported
+                result["comments_incomplete"] = len(comments) < reported
+            return result
+
+        items = []
+        for node in links:
+            title_node = node.select_one("a.title")
+            items.append(
+                {
+                    "id": node.get("data-fullname"),
+                    "title": title_node.get_text(" ", strip=True) if title_node else None,
+                    "author": node.get("data-author"),
+                    "subreddit": node.get("data-subreddit"),
+                    "score": node.get("data-score"),
+                    "num_comments": node.get("data-comments-count"),
+                    "permalink": node.get("data-permalink"),
+                    "url": node.get("data-url"),
+                    "selftext": _old_reddit_entry_body(node, url),
+                }
+            )
+        return {"items": items, "items_returned": len(items)} if items else None
+    except Exception:
+        return None
 
 
 def _compact_reddit_json(data: Any) -> Any:
@@ -436,12 +631,17 @@ def _compact_reddit_json(data: Any) -> Any:
                 }
 
             comments = []
+            more_children = 0
 
             def walk(node, depth=0):
+                nonlocal more_children
                 if not isinstance(node, dict):
                     return
                 kind = node.get("kind")
                 d = node.get("data") or {}
+                if kind == "more":
+                    more_children += len(d.get("children") or [])
+                    return
                 if kind == "t1":
                     comments.append(
                         {
@@ -459,10 +659,182 @@ def _compact_reddit_json(data: Any) -> Any:
             for c in child_of(comments_listing):
                 walk(c, 0)
 
-            return {"post": post, "comments": comments}
+            result = {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+            }
+            if post and post.get("num_comments") is not None:
+                result["comments_reported"] = post["num_comments"]
+                result["comments_incomplete"] = len(comments) < post["num_comments"]
+            if more_children:
+                result["more_children"] = more_children
+            return result
     except Exception:
         pass
     return data
+
+
+async def _reddit_token() -> str:
+    """Return a cached application-only Reddit OAuth token."""
+    global _reddit_access_token
+    global _reddit_access_token_expires_at
+    global _reddit_access_token_credentials
+
+    client_id = cfg.reddit_client_id.strip()
+    client_secret = cfg.reddit_client_secret.strip()
+    user_agent = cfg.reddit_user_agent.strip()
+    missing = [
+        name
+        for name, value in (
+            ("WEB_SEARCH_REDDIT_CLIENT_ID", client_id),
+            ("WEB_SEARCH_REDDIT_CLIENT_SECRET", client_secret),
+            ("WEB_SEARCH_REDDIT_USER_AGENT", user_agent),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Incomplete Reddit OAuth configuration: " + ", ".join(missing)
+        )
+
+    credentials = (client_id, client_secret)
+    now = time.monotonic()
+    if (
+        _reddit_access_token
+        and _reddit_access_token_credentials == credentials
+        and now < _reddit_access_token_expires_at - 30
+    ):
+        return _reddit_access_token
+
+    async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+        response = await client.post(
+            _REDDIT_TOKEN_URL,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": user_agent, "Accept": "application/json"},
+            timeout=cfg.http_timeout_seconds,
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Reddit OAuth token endpoint returned HTTP {response.status_code}"
+        )
+    try:
+        data = response.json()
+        token = str(data["access_token"]).strip()
+        expires_in = max(60, int(data.get("expires_in", 3600)))
+    except Exception as exc:
+        raise RuntimeError("Reddit OAuth token endpoint returned invalid JSON") from exc
+    if not token:
+        raise RuntimeError("Reddit OAuth token endpoint returned an empty access token")
+
+    _reddit_access_token = token
+    _reddit_access_token_expires_at = time.monotonic() + expires_in
+    _reddit_access_token_credentials = credentials
+    return token
+
+
+async def _fetch_reddit_oauth(url: str) -> dict:
+    """Fetch one Reddit JSON representation using application-only OAuth."""
+    token = await _reddit_token()
+    fetch_url = _reddit_oauth_url(url)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": cfg.reddit_user_agent.strip(),
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+        async with client.stream(
+            "GET", fetch_url, headers=headers, timeout=cfg.http_timeout_seconds
+        ) as response:
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if cfg.max_download_bytes and total > cfg.max_download_bytes:
+                    raise DownloadTooLargeError(
+                        f"Reddit OAuth response exceeds the {cfg.max_download_bytes}-byte "
+                        "WEB_SEARCH_MAX_DOWNLOAD_BYTES cap."
+                    )
+                chunks.append(chunk)
+            status = response.status_code
+            ctype = response.headers.get("content-type", "application/json")
+    if status >= 400:
+        raise RuntimeError(f"Reddit OAuth JSON returned HTTP {status}")
+    body = b"".join(chunks)
+    return {
+        "url": fetch_url,
+        "status": status,
+        "content_type": ctype,
+        "text": _decode_body(body, ctype),
+        "bytes": None,
+        "via": "reddit_oauth",
+        "blocked_detected": False,
+    }
+
+
+def _reddit_oauth_requested() -> bool:
+    return any(
+        value.strip()
+        for value in (
+            cfg.reddit_client_id,
+            cfg.reddit_client_secret,
+            cfg.reddit_user_agent,
+        )
+    )
+
+
+async def _acquire_reddit(url: str) -> tuple[dict, Any, str]:
+    """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
+    errors: list[str] = []
+
+    if _reddit_oauth_requested():
+        try:
+            fetched = await _fetch_reddit_oauth(url)
+            parsed = json.loads(fetched.get("text") or "")
+            return fetched, _compact_reddit_json(parsed), "oauth"
+        except Exception as exc:
+            errors.append(f"OAuth JSON: {str(exc).strip() or type(exc).__name__}")
+
+    rss_url = _reddit_rss_url(url)
+    try:
+        fetched = await _acquire_page(rss_url)
+        if fetched.get("status", 0) >= 400:
+            raise RuntimeError(f"HTTP {fetched['status']}")
+        compact = await anyio.to_thread.run_sync(
+            _compact_reddit_rss, fetched.get("text") or "", url
+        )
+        if compact is None:
+            raise RuntimeError("feed contained no Reddit entries")
+        return fetched, compact, "rss"
+    except Exception as exc:
+        errors.append(f"RSS: {str(exc).strip() or type(exc).__name__}")
+
+    old_url = _reddit_old_url(url)
+    try:
+        fetched = await _acquire_page(old_url)
+        if fetched.get("status", 0) >= 400:
+            raise RuntimeError(f"HTTP {fetched['status']}")
+        compact = await anyio.to_thread.run_sync(
+            _compact_reddit_html, fetched.get("text") or "", url
+        )
+        if compact is None:
+            raise RuntimeError("page contained no extractable Reddit entries")
+        return fetched, compact, "old_html"
+    except Exception as exc:
+        errors.append(f"old.reddit HTML: {str(exc).strip() or type(exc).__name__}")
+
+    if _is_reddit_post_url(url):
+        oembed_url = _reddit_oembed_url(url)
+        try:
+            fetched = await _acquire_page(oembed_url)
+            if fetched.get("status", 0) >= 400:
+                raise RuntimeError(f"HTTP {fetched['status']}")
+            return fetched, json.loads(fetched.get("text") or ""), "oembed"
+        except Exception as exc:
+            errors.append(f"oEmbed: {str(exc).strip() or type(exc).__name__}")
+
+    raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
 
 
 # ---------------------------------------------------------------------------
@@ -638,10 +1010,64 @@ async def _fetch_one(
     section = (section or "").strip() or None
 
     reddit_request = _is_reddit_url(url)
-    fetch_url = _normalize_reddit_url(url)
+    if reddit_request:
+        try:
+            fetched, compact, reddit_source = await _acquire_reddit(url)
+        except Exception as exc:
+            backend_passwords = tuple(
+                urlparse(endpoint).password or ""
+                for endpoint in (
+                    cfg.flaresolverr_url,
+                    cfg.firecrawl_api_url,
+                    cfg.tika_url,
+                    cfg.classifier_api_url,
+                )
+                if endpoint
+            )
+            detail = redact_secrets(
+                exc,
+                cfg.reddit_client_secret,
+                cfg.firecrawl_api_key,
+                cfg.classifier_api_key,
+                *backend_passwords,
+            )
+            raise ToolError(f"Fetch failed for {url}: {detail}")
 
-    reddit_oembed = False
-    reddit_html_fallback = False
+        source_url = {
+            "oauth": _reddit_oauth_url(url),
+            "rss": _reddit_rss_url(url),
+            "old_html": _reddit_old_url(url),
+            "oembed": _reddit_oembed_url(url),
+        }[reddit_source]
+        status = fetched.get("status")
+        ctype = (fetched.get("content_type") or "").lower()
+        payload = {
+            "url": source_url,
+            **_provenance(url, source_url, status, ctype, fetched.get("via")),
+            "format": "json",
+        }
+        _set_content(payload, to_json(compact), hint=False, offset=offset)
+        if reddit_source == "rss":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Returned Reddit's RSS feed; it may contain only an initial "
+                "snapshot of the comments.",
+            )
+        elif reddit_source == "old_html":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Reddit OAuth JSON and RSS were unavailable; returned targeted "
+                "old.reddit HTML extraction, which may omit unloaded comments.",
+            )
+        elif reddit_source == "oembed":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
+                "returning official oEmbed post metadata without comments.",
+            )
+        return payload
+
+    fetch_url = url
     fetched: dict | None = None
     primary_exc: Exception | None = None
     try:
@@ -651,35 +1077,6 @@ async def _fetch_one(
         fetched = await _acquire_page(fetch_url)
     except Exception as exc:
         primary_exc = exc
-
-    # Reddit frequently blocks unauthenticated .json endpoints from server IPs.
-    # Direct-resource HTTP errors are returned as artifacts rather than
-    # acquisition exceptions. Posts can fall back to official oEmbed metadata;
-    # searches/listings instead retry their original HTML through FlareSolverr.
-    primary_status = fetched.get("status") if fetched is not None else None
-    if reddit_request and (
-        primary_exc is not None
-        or (primary_status is not None and primary_status >= 400)
-    ):
-        if primary_exc is None:
-            primary_exc = RuntimeError(f"Reddit JSON returned HTTP {primary_status}")
-        fetch_url, reddit_oembed = _reddit_fallback_url(url)
-        reddit_html_fallback = not reddit_oembed
-        fallback_name = "oEmbed" if reddit_oembed else "rendered HTML"
-        try:
-            fallback = await _acquire_page(fetch_url)
-            fallback_status = fallback.get("status")
-            if fallback_status is not None and fallback_status >= 400:
-                raise RuntimeError(
-                    f"Reddit {fallback_name} returned HTTP {fallback_status}"
-                )
-            fetched = fallback
-            primary_exc = None
-        except Exception as fallback_exc:
-            primary_exc = RuntimeError(
-                f"Reddit JSON failed ({primary_exc}); "
-                f"{fallback_name} failed ({fallback_exc})"
-            )
 
     if primary_exc is not None:
         backend_passwords = tuple(
@@ -784,11 +1181,11 @@ async def _fetch_one(
 
     text = fetched.get("text") or ""
 
-    # Reddit / JSON responses
-    if reddit_request or "json" in ctype:
+    # JSON responses
+    if "json" in ctype:
         try:
             parsed = json.loads(text)
-            compact = _compact_reddit_json(parsed) if reddit_request else parsed
+            compact = parsed
             json_payload = {
                 "url": fetch_url,
                 **_provenance(url, fetch_url, status, ctype or "application/json", via),
@@ -797,12 +1194,6 @@ async def _fetch_one(
             # query=/section= can't narrow JSON, so flag truncation without
             # the retry hint that points at them — but offset= still pages it.
             _set_content(json_payload, to_json(compact), hint=False, offset=offset)
-            if reddit_oembed:
-                json_payload["note"] = _join_note(
-                    json_payload.get("note"),
-                    "Reddit blocked its full post/comments JSON; returning official "
-                    "oEmbed post metadata without comments.",
-                )
             return json_payload
         except Exception:
             pass
@@ -865,10 +1256,6 @@ async def _fetch_one(
             "format": "structured",
             "content": structured,
         }
-        if reddit_html_fallback:
-            payload["note"] = (
-                "Reddit blocked its JSON endpoint; returned browser-rendered HTML."
-            )
         return payload
 
     # mode == "text"
@@ -908,11 +1295,6 @@ async def _fetch_one(
         else:
             section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
         _set_content(section_payload, section_body, offset=offset)
-        if reddit_html_fallback:
-            section_payload["note"] = _join_note(
-                section_payload.get("note"),
-                "Reddit blocked its JSON endpoint; returned browser-rendered HTML.",
-            )
         return section_payload
 
     # An undetected/bypassed block can't reach here: a detected wall on the
@@ -924,11 +1306,6 @@ async def _fetch_one(
         "format": text_format,
         "title": soup_title,
     }
-
-    if reddit_html_fallback:
-        text_payload["note"] = (
-            "Reddit blocked its JSON endpoint; returned browser-rendered HTML."
-        )
 
     if query:
         qres = await _query_payload(plain, query, fetch_url, kind="content")

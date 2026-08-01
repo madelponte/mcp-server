@@ -241,6 +241,24 @@ class WebSearchSettings(BaseSettings):
     )
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
     user_agent: str = Field(DEFAULT_UA, description="User-Agent sent with direct fetches.")
+    reddit_client_id: str = Field(
+        "",
+        description=(
+            "Reddit OAuth application client ID. When this, reddit_client_secret, "
+            "and reddit_user_agent are set, fetch_page uses Reddit's authenticated "
+            "Data API before its anonymous RSS/HTML fallbacks."
+        ),
+    )
+    reddit_client_secret: str = Field(
+        "", description="Reddit OAuth application client secret."
+    )
+    reddit_user_agent: str = Field(
+        "",
+        description=(
+            "Descriptive User-Agent required by Reddit, for example "
+            "'linux:mcp-server:1.0 (by /u/your_username)'."
+        ),
+    )
     ssrf_allowlist: str = Field(
         "",
         description=(

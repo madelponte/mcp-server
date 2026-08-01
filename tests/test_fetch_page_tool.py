@@ -20,6 +20,12 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "")
     monkeypatch.setattr(fp.cfg, "markdown", True)
     monkeypatch.setattr(fp.cfg, "max_page_chars", 100000)
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", "")
+    monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
+    monkeypatch.setattr(fp, "_reddit_access_token", None)
+    monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
+    monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
 
 
 @pytest.fixture(autouse=True)
@@ -315,26 +321,94 @@ def test_direct_resource_http_error_raises(monkeypatch, tool_fns):
 
 # --------------------------- Reddit / JSON ---------------------------
 
-def test_reddit_url_compacted(monkeypatch, tool_fns):
+def test_reddit_oauth_json_compacted(monkeypatch, tool_fns, patch_httpx):
     reddit_json = json.dumps([
         {"data": {"children": [{"data": {"title": "Post Title", "author": "u", "selftext": "hi"}}]}},
         {"data": {"children": [{"kind": "t1", "data": {"author": "c", "score": 3, "body": "a comment"}}]}},
     ])
-    _patch_fetch(monkeypatch, _fetched(text=reddit_json, content_type="application/json"))
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", "client-secret")
+    monkeypatch.setattr(fp.cfg, "reddit_user_agent", "linux:mcp-server:1.0 (by /u/tester)")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/api/v1/access_token":
+            return fp.httpx.Response(
+                200,
+                json={"access_token": "token", "expires_in": 3600},
+                request=request,
+            )
+        return fp.httpx.Response(
+            200,
+            text=reddit_json,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    patch_httpx(handler)
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.reddit.com/r/x/comments/abc/title")))
     assert out["format"] == "json"
+    assert out["via"] == "reddit_oauth"
     content = json.loads(out["content"])
     assert content["post"]["title"] == "Post Title"
     assert content["comments"][0]["body"] == "a comment"
+    assert requests[0].headers["authorization"].startswith("Basic ")
+    assert requests[1].headers["authorization"] == "Bearer token"
+    assert requests[1].url.host == "oauth.reddit.com"
+    assert requests[1].url.params["raw_json"] == "1"
 
 
-def test_reddit_json_failure_uses_oembed(monkeypatch, tool_fns):
+def test_reddit_without_oauth_uses_rss(monkeypatch, tool_fns):
+    calls = []
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <author><name>/u/poster</name></author><content type="html">&lt;div class="md"&gt;&lt;p&gt;RSS body&lt;/p&gt;&lt;/div&gt;</content>
+      <id>t3_abc</id><link href="https://reddit.com/comments/abc"/><updated>2026-01-01T00:00:00Z</updated><title>RSS title</title>
+    </entry></feed>"""
+
+    async def acquire(url):
+        calls.append(url)
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls == ["https://www.reddit.com/r/python/comments/abc/title/.rss"]
+    assert json.loads(out["content"])["post"]["title"] == "RSS title"
+    assert "RSS feed" in out["note"]
+
+
+def test_reddit_rss_failure_uses_old_html(monkeypatch, tool_fns):
+    calls = []
+    old_html = """<html><body><div class="thing link" data-fullname="t3_abc"
+      data-author="poster" data-subreddit="python" data-score="5" data-comments-count="0">
+      <a class="title">Old title</a><div class="entry"><div class="usertext-body"><div class="md"><p>Old body</p></div></div></div>
+    </div></body></html>"""
+
+    async def acquire(url):
+        calls.append(url)
+        if url.endswith(".rss"):
+            raise RuntimeError("RSS blocked")
+        return _fetched(text=old_html)
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith("/.rss")
+    assert calls[1].startswith("https://old.reddit.com/")
+    assert json.loads(out["content"])["post"]["title"] == "Old title"
+    assert "old.reddit" in out["note"]
+
+
+def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
     calls = []
 
     async def acquire(url):
         calls.append(url)
-        if url.endswith(".json"):
-            raise RuntimeError("Reddit JSON returned HTML")
+        if "/oembed?" not in url:
+            raise RuntimeError("blocked")
         return _fetched(
             text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
             content_type="application/json",
@@ -344,75 +418,11 @@ def test_reddit_json_failure_uses_oembed(monkeypatch, tool_fns):
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
-    assert calls[0].endswith(".json")
-    assert "/oembed?" in calls[1]
+    assert calls[0].endswith("/.rss")
+    assert calls[1].startswith("https://old.reddit.com/")
+    assert "/oembed?" in calls[2]
     assert json.loads(out["content"])["title"] == "Fallback title"
     assert "without comments" in out["note"]
-
-
-def test_reddit_json_http_error_uses_oembed(monkeypatch, tool_fns):
-    calls = []
-
-    async def acquire(url):
-        calls.append(url)
-        if url.endswith(".json"):
-            return _fetched(
-                text='{"message":"Forbidden"}',
-                content_type="application/json",
-                status=403,
-            )
-        return _fetched(
-            text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
-            content_type="application/json",
-        )
-
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
-    out = json.loads(
-        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
-    )
-    assert calls[0].endswith(".json")
-    assert "/oembed?" in calls[1]
-    assert json.loads(out["content"])["title"] == "Fallback title"
-    assert "without comments" in out["note"]
-
-
-def test_reddit_search_json_error_uses_rendered_html(monkeypatch, tool_fns):
-    calls = []
-
-    async def acquire(url):
-        calls.append(url)
-        if ".json?" in url:
-            return _fetched(
-                text='{"message":"Forbidden"}',
-                content_type="application/json",
-                status=403,
-            )
-        return _fetched(
-            text=(
-                "<html><head><title>Search results</title></head><body><main>"
-                "<h1>Search results for bunker</h1>"
-                "<p>A bunker-inspired living space with concrete walls.</p>"
-                "</main></body></html>"
-            ),
-            via="flaresolverr",
-        )
-
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
-    out = json.loads(
-        run(
-            tool_fns["fetch_page"](
-                url=(
-                    "https://old.reddit.com/r/malelivingspace/search?"
-                    "q=bunker&restrict_sr=1&sort=new&t=month"
-                )
-            )
-        )
-    )
-    assert ".json?" in calls[0]
-    assert calls[1].startswith("https://www.reddit.com/r/malelivingspace/search?")
-    assert out["via"] == "flaresolverr"
-    assert "bunker-inspired" in out["content"]
-    assert "browser-rendered HTML" in out["note"]
 
 
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
