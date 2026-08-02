@@ -1,6 +1,6 @@
 """Integration tests for the fetch_page tool's _fetch_one logic.
 
-The network layer (`_cached_resilient_fetch`), the YouTube transcript helper, and
+The acquisition layer (`_acquire_page`), the YouTube transcript helper, and
 Tika extraction are monkeypatched so the routing/formatting logic is exercised
 offline. FlareSolverr and Firecrawl fallbacks are disabled unless a test needs them.
 """
@@ -20,6 +20,12 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "")
     monkeypatch.setattr(fp.cfg, "markdown", True)
     monkeypatch.setattr(fp.cfg, "max_page_chars", 100000)
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", "")
+    monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
+    monkeypatch.setattr(fp, "_reddit_access_token", None)
+    monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
+    monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +66,7 @@ def _patch_fetch(monkeypatch, result):
     async def fake_fetch(url):
         return result if not callable(result) else result(url)
 
-    monkeypatch.setattr(fp, "_cached_resilient_fetch", fake_fetch)
+    monkeypatch.setattr(fp, "_acquire_page", fake_fetch)
 
 
 # --------------------------- input validation ---------------------------
@@ -236,6 +242,20 @@ def test_document_routed_to_tika(monkeypatch, tool_fns):
     assert out["content"] == "Extracted PDF text."
 
 
+def test_firecrawl_recovered_document_text_skips_tika(monkeypatch, tool_fns):
+    fetched = _fetched(text="Recovered protected PDF content.", via="firecrawl")
+    fetched["resource_kind"] = "document_text"
+    fetched["content_type"] = "text/markdown"
+    _patch_fetch(monkeypatch, fetched)
+    monkeypatch.setattr(
+        fp, "_tika_extract", lambda *a, **k: pytest.fail("Tika should not run")
+    )
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report.pdf")))
+    assert out["format"] == "document_text"
+    assert out["via"] == "firecrawl"
+    assert out["content"] == "Recovered protected PDF content."
+
+
 def test_document_no_content_raises(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(content_type="application/pdf", body=None, text=None))
     with pytest.raises(ToolError):
@@ -287,89 +307,154 @@ def test_mislabeled_pdf_sniffed_to_tika(monkeypatch, tool_fns):
     assert out["content"] == "Sniffed PDF text."
 
 
-# --------------------------- HTTP-error fallback chain ---------------------------
+# --------------------------- direct-resource HTTP errors ---------------------------
 
-def test_http_error_tries_flaresolverr_then_firecrawl(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
+def test_direct_resource_http_error_raises(monkeypatch, tool_fns):
     _patch_fetch(
         monkeypatch,
-        _fetched(text="<html><body>Not Found</body></html>", status=404),
+        _fetched(text='{"error":"not found"}', content_type="application/json", status=404),
     )
-    calls = []
-
-    async def fake_flaresolverr(url):
-        calls.append("flaresolverr")
-        return _fetched(text="<p>Still not found</p>", status=404, via="flaresolverr")
-
-    async def fake_firecrawl(url):
-        calls.append("firecrawl")
-        return _fetched(
-            text="<html><body><article>Recovered article body.</article></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_flaresolverr)
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/dead")))
-    assert calls == ["flaresolverr", "firecrawl"]
-    assert out["via"] == "firecrawl"
-    assert "Recovered article body." in out["content"]
-    assert "archived_snapshot" not in out
-
-
-def test_http_error_without_firecrawl_hit_raises(monkeypatch, tool_fns):
-    """An unrecovered error response is never returned as page content."""
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-secret")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(text="<html><body><p>Page not found here.</p></body></html>", status=404),
-    )
-
-    async def failed_firecrawl(url):
-        raise RuntimeError("scrape failed")
-
-    monkeypatch.setattr(fp, "_render_with_firecrawl", failed_firecrawl)
     with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/dead"))
+        run(tool_fns["fetch_page"](url="https://example.com/api"))
     assert "HTTP 404" in str(exc.value)
-    assert "Firecrawl failed" in str(exc.value)
-    assert "fc-secret" not in str(exc.value)
-
-
-def test_server_error_raises_instead_of_returning_error_page(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(
-            text="<html><body><p>Upstream service unavailable.</p></body></html>",
-            status=502,
-        ),
-    )
-    monkeypatch.setattr(
-        fp,
-        "_render_with_firecrawl",
-        lambda url: pytest.fail("Firecrawl should not be spent on a plain HTTP 502"),
-    )
-    with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/article"))
-    assert "HTTP 502" in str(exc.value)
-    assert "Upstream service unavailable" not in str(exc.value)
 
 
 # --------------------------- Reddit / JSON ---------------------------
 
-def test_reddit_url_compacted(monkeypatch, tool_fns):
+def test_reddit_oauth_json_compacted(monkeypatch, tool_fns, patch_httpx):
     reddit_json = json.dumps([
         {"data": {"children": [{"data": {"title": "Post Title", "author": "u", "selftext": "hi"}}]}},
         {"data": {"children": [{"kind": "t1", "data": {"author": "c", "score": 3, "body": "a comment"}}]}},
     ])
-    _patch_fetch(monkeypatch, _fetched(text=reddit_json, content_type="application/json"))
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", "client-secret")
+    monkeypatch.setattr(fp.cfg, "reddit_user_agent", "linux:mcp-server:1.0 (by /u/tester)")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/api/v1/access_token":
+            return fp.httpx.Response(
+                200,
+                json={"access_token": "token", "expires_in": 3600},
+                request=request,
+            )
+        return fp.httpx.Response(
+            200,
+            text=reddit_json,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    patch_httpx(handler)
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.reddit.com/r/x/comments/abc/title")))
     assert out["format"] == "json"
+    assert out["via"] == "reddit_oauth"
     content = json.loads(out["content"])
     assert content["post"]["title"] == "Post Title"
     assert content["comments"][0]["body"] == "a comment"
+    assert requests[0].headers["authorization"].startswith("Basic ")
+    assert requests[1].headers["authorization"] == "Bearer token"
+    assert requests[1].url.host == "oauth.reddit.com"
+    assert requests[1].url.params["raw_json"] == "1"
+
+
+def test_reddit_without_oauth_uses_rss(monkeypatch, tool_fns):
+    calls = []
+    monkeypatch.setattr(fp.server_settings, "debug", False)
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <author><name>/u/poster</name></author><content type="html">&lt;div class="md"&gt;&lt;p&gt;RSS body&lt;/p&gt;&lt;/div&gt;</content>
+      <id>t3_abc</id><link href="https://reddit.com/comments/abc"/><updated>2026-01-01T00:00:00Z</updated><title>RSS title</title>
+    </entry></feed>"""
+
+    async def acquire(url):
+        calls.append(url)
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls == ["https://www.reddit.com/r/python/comments/abc/title/.rss"]
+    assert json.loads(out["content"])["post"]["title"] == "RSS title"
+    assert "RSS feed" in out["note"]
+    assert "fallback trace" not in out["note"]
+
+
+def test_reddit_debug_note_traces_and_redacts_fallbacks(monkeypatch, tool_fns):
+    secret = "super-secret-reddit-value"
+    monkeypatch.setattr(fp.server_settings, "debug", True)
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", secret)
+    monkeypatch.setattr(
+        fp.cfg, "reddit_user_agent", "linux:mcp-server:1.0 (by /u/tester)"
+    )
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <author><name>/u/poster</name></author><content type="html">&lt;div class="md"&gt;&lt;p&gt;RSS body&lt;/p&gt;&lt;/div&gt;</content>
+      <id>t3_abc</id><link href="https://reddit.com/comments/abc"/><updated>2026-01-01T00:00:00Z</updated><title>RSS title</title>
+    </entry></feed>"""
+
+    async def oauth_failure(url):
+        raise RuntimeError(f"credential {secret} was rejected")
+
+    async def acquire(url):
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    monkeypatch.setattr(fp, "_fetch_reddit_oauth", oauth_failure)
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert "Reddit fallback trace:" in out["note"]
+    assert "OAuth JSON failed (credential REDACTED was rejected)" in out["note"]
+    assert "RSS succeeded" in out["note"]
+    assert secret not in out["note"]
+
+
+def test_reddit_rss_failure_uses_old_html(monkeypatch, tool_fns):
+    calls = []
+    old_html = """<html><body><div class="thing link" data-fullname="t3_abc"
+      data-author="poster" data-subreddit="python" data-score="5" data-comments-count="0">
+      <a class="title">Old title</a><div class="entry"><div class="usertext-body"><div class="md"><p>Old body</p></div></div></div>
+    </div></body></html>"""
+
+    async def acquire(url):
+        calls.append(url)
+        if url.endswith(".rss"):
+            raise RuntimeError("RSS blocked")
+        return _fetched(text=old_html)
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith("/.rss")
+    assert calls[1].startswith("https://old.reddit.com/")
+    assert json.loads(out["content"])["post"]["title"] == "Old title"
+    assert "old.reddit" in out["note"]
+
+
+def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        if "/oembed?" not in url:
+            raise RuntimeError("blocked")
+        return _fetched(
+            text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
+            content_type="application/json",
+        )
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith("/.rss")
+    assert calls[1].startswith("https://old.reddit.com/")
+    assert "/oembed?" in calls[2]
+    assert json.loads(out["content"])["title"] == "Fallback title"
+    assert "without comments" in out["note"]
 
 
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
@@ -381,108 +466,11 @@ def test_json_content_returned_as_json(monkeypatch, tool_fns):
 
 # --------------------------- blocked / contentless ---------------------------
 
-def test_blocked_without_fallback_raises(monkeypatch, tool_fns):
-    _patch_fetch(monkeypatch, _fetched(text="challenge", status=403, blocked=True))
-    with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com"))
-    assert "wall" in str(exc.value).lower() or "could not be retrieved" in str(exc.value)
-
-
-def test_contentless_without_fallback_raises(monkeypatch, tool_fns):
+def test_contentless_accepted_artifact_still_raises(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(text="<html><body>; ;</body></html>"))
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://example.com"))
-    assert "client-side" in str(exc.value) or "no extractable text" in str(exc.value)
-
-
-def test_contentless_section_tries_browser_render_first(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-
-    async def fake_render(url):
-        return _fetched(
-            text=(
-                "<html><body><article><h2>Details</h2>"
-                "<p>Rendered section body.</p></article></body></html>"
-            ),
-            via="flaresolverr",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com", section="Details")))
-    assert out["format"] == "section"
-    assert out["via"] == "flaresolverr"
-    assert "Rendered section body." in out["content"]
-
-
-def test_contentless_structured_tries_browser_render_first(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-
-    async def fake_render(url):
-        return _fetched(
-            text=(
-                "<html><head><title>Rendered</title></head>"
-                "<body><main><h1>Loaded Heading</h1></main></body></html>"
-            ),
-            via="flaresolverr",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_render)
-    out = json.loads(
-        run(tool_fns["fetch_page"](url="https://example.com", mode="structured"))
-    )
-    assert out["format"] == "structured"
-    assert out["via"] == "flaresolverr"
-    assert out["content"]["title"] == "Rendered"
-    assert out["content"]["headings"][0]["text"] == "Loaded Heading"
-
-
-def test_contentless_tries_firecrawl_after_browser(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "flaresolverr_url", "http://flaresolverr:8191")
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(monkeypatch, _fetched(text="<html><body><div id='root'></div></body></html>"))
-    calls = []
-
-    async def fake_flaresolverr(url):
-        calls.append("flaresolverr")
-        return _fetched(
-            text="<html><body><div id='root'></div></body></html>",
-            via="flaresolverr",
-        )
-
-    async def fake_firecrawl(url):
-        calls.append("firecrawl")
-        return _fetched(
-            text="<html><body><main><h1>Loaded</h1><p>Final content.</p></main></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_flaresolverr", fake_flaresolverr)
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
-    assert calls == ["flaresolverr", "firecrawl"]
-    assert out["via"] == "firecrawl"
-    assert "Final content." in out["content"]
-
-
-def test_blocked_after_flaresolverr_uses_firecrawl(monkeypatch, tool_fns):
-    monkeypatch.setattr(fp.cfg, "firecrawl_api_key", "fc-test")
-    _patch_fetch(
-        monkeypatch,
-        _fetched(text="interactive challenge", status=403, via="flaresolverr", blocked=True),
-    )
-
-    async def fake_firecrawl(url):
-        return _fetched(
-            text="<html><body><article>Recovered through Firecrawl.</article></body></html>",
-            via="firecrawl",
-        )
-
-    monkeypatch.setattr(fp, "_render_with_firecrawl", fake_firecrawl)
-    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
-    assert out["via"] == "firecrawl"
-    assert "Recovered through Firecrawl." in out["content"]
+    assert "no extractable text" in str(exc.value)
 
 
 def test_unsupported_binary_media_raises_actionable_error(monkeypatch, tool_fns):

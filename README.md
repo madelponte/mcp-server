@@ -62,8 +62,12 @@ returned `next_offset` to read the next chunk; this works for HTML, documents,
 JSON, Reddit, and transcripts. A YouTube video URL returns the video's transcript
 rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
 
-Reddit URLs are automatically rewritten to Reddit's `.json` API and returned as
-compacted JSON (post + comments tree) rather than the HTML page.
+Reddit URLs are returned as compacted JSON. When Reddit OAuth is configured,
+`fetch_page` uses the authenticated Data API first. It otherwise falls back in
+order to Reddit's RSS feed, targeted `old.reddit.com` HTML extraction, and
+official oEmbed metadata. RSS and old Reddit may expose only an initial comment
+snapshot; the result reports comment counts/completeness when the source makes
+them available.
 
 Fetching is resilient: a direct `httpx` request first, an automatic
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
@@ -213,7 +217,11 @@ for the full list with defaults. Key things to set:
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
 - `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl as the final `fetch_page` fallback after direct fetching and FlareSolverr.
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
+- `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
+- `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
+- `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
+- `WEB_SEARCH_REDDIT_CLIENT_ID` / `WEB_SEARCH_REDDIT_CLIENT_SECRET` / `WEB_SEARCH_REDDIT_USER_AGENT` — optional Reddit OAuth credentials; strongly recommended for reliable Reddit post/comment fetching. See [Reddit Data API setup](#reddit-data-api-setup).
 - `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 - `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL`, clear `GEO_OVERPASS_FALLBACK_URLS` when queries must stay private, and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 - `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
@@ -223,6 +231,39 @@ for the full list with defaults. Key things to set:
 
 Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
 `WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`.
+
+### Reddit Data API setup
+
+Reddit blocks unidentified API traffic from many hosted-server networks. A
+personal, non-commercial project can request free Data API access, subject to
+Reddit's approval and rate limits:
+
+1. Sign in to the Reddit account that will own the application.
+2. Read Reddit's [Developer Platform and Data API access guidance](https://support.reddithelp.com/hc/en-us/articles/14945211791892-Developer-Platform-Accessing-Reddit-Data) and [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy).
+3. Submit Reddit's [Data API access request](https://support.reddithelp.com/hc/en-us/requests/new?ticket_form_id=14868593862164). Describe this as a personal, non-commercial MCP page reader and provide the repository URL if requested. Follow any approval instructions Reddit sends you.
+4. Open [Reddit app preferences](https://www.reddit.com/prefs/apps), select
+   **create another app**, and create a confidential application. For a personal
+   server, the **script** type is normally appropriate. The redirect URI is not
+   used by this server's application-only flow, but Reddit may still require a
+   valid URL such as `http://localhost:8080`.
+5. Copy the short value displayed beneath the application name as the client ID,
+   and copy the value labeled `secret` as the client secret.
+6. Add the credentials to `.env`, replacing `your_username` with the owning
+   Reddit username:
+
+   ```dotenv
+   WEB_SEARCH_REDDIT_CLIENT_ID=your_client_id
+   WEB_SEARCH_REDDIT_CLIENT_SECRET=your_client_secret
+   WEB_SEARCH_REDDIT_USER_AGENT=linux:mcp-server:1.0 (by /u/your_username)
+   ```
+
+7. Restart the MCP server. Do not commit `.env` or expose the client secret.
+
+The server exchanges these credentials for a short-lived application-only OAuth
+token, caches it until shortly before expiration, and sends requests to
+`oauth.reddit.com`. It does not store or require your Reddit password. Reddit's
+current free-access limit is 100 queries per minute per OAuth client ID; consult
+the [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki) for current requirements.
 
 ### Email
 
@@ -243,8 +284,11 @@ raise tool errors instead of being returned as successful sends.
 
 Set `MCP_DEBUG=true` to enable debug mode: tool responses are serialized as
 indented, human-readable JSON (instead of compact JSON) and each tool call emits
-verbose per-call logs to stdout. Useful for troubleshooting; leave it off in
-normal operation so responses stay compact in the model's context window.
+verbose per-call logs to stdout. Reddit `fetch_page` results also append a
+redacted fallback trace to `note`, showing whether OAuth JSON, RSS, old Reddit,
+and oEmbed were skipped, failed, or succeeded. Useful for troubleshooting; leave
+it off in normal operation so responses stay compact in the model's context
+window.
 
 ### Tool-name prefix in cross-references
 
