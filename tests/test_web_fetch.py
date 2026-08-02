@@ -19,7 +19,6 @@ from tools.web_fetch import (
     _ip_of,
     _addr_is_blocked,
     _assert_url_allowed,
-    _cached_resilient_fetch,
     BrowserRenderError,
     DownloadTooLargeError,
     SSRFError,
@@ -228,94 +227,52 @@ def test_decode_empty_body():
     assert _decode_body(b"", "text/html") == ""
 
 
-def test_resilient_fetch_sniffs_octet_stream_html(monkeypatch, patch_httpx):
-    """HTML served as octet-stream should still be decoded as page text."""
-    _clear_allowlist(monkeypatch)
-    monkeypatch.setattr(
-        web_fetch.socket, "getaddrinfo",
-        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
-    )
-
+def test_direct_resource_probe_identifies_octet_stream_html(monkeypatch, patch_httpx):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200,
-            content=b"<!doctype html><html><body><p>Generic typed page.</p></body></html>",
+            200, content=b"<!doctype html><html><body>Page</body></html>",
             headers={"content-type": "application/octet-stream"},
         )
 
     patch_httpx(handler)
-    out = run(
-        web_fetch._resilient_fetch(
-            "https://example.com/generic",
-            timeout=5,
-            user_agent="t",
-            verify_ssl=False,
-            flaresolverr_url=None,
-            flaresolverr_timeout_ms=1000,
+    status, _headers, body, ctype, is_html = run(
+        web_fetch._direct_resource_fetch(
+            "https://example.com/generic", 5, "t", False
         )
     )
-    assert out["text"] is not None
-    assert "Generic typed page" in out["text"]
-    assert out["bytes"] is None
+    assert status == 200
+    assert body == b""
+    assert ctype == "text/html"
+    assert is_html is True
 
 
-def test_resilient_fetch_sniffs_octet_stream_json(monkeypatch, patch_httpx):
-    _clear_allowlist(monkeypatch)
-    monkeypatch.setattr(
-        web_fetch.socket, "getaddrinfo",
-        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            content=b'{"ok": true}',
-            headers={"content-type": "application/octet-stream"},
-        )
-
-    patch_httpx(handler)
-    out = run(
-        web_fetch._resilient_fetch(
-            "https://example.com/generic-json",
-            timeout=5,
-            user_agent="t",
-            verify_ssl=False,
-            flaresolverr_url=None,
-            flaresolverr_timeout_ms=1000,
+def test_direct_resource_probe_keeps_json(monkeypatch, patch_httpx):
+    patch_httpx(lambda request: httpx.Response(
+        200, content=b'{"ok":true}', headers={"content-type": "application/octet-stream"}
+    ))
+    _status, _headers, body, ctype, is_html = run(
+        web_fetch._direct_resource_fetch(
+            "https://example.com/api", 5, "t", False
         )
     )
-    assert out["content_type"] == "application/json"
-    assert out["text"] == '{"ok": true}'
-    assert out["bytes"] is None
+    assert body == b'{"ok":true}'
+    assert ctype == "application/json"
+    assert is_html is False
 
 
-def test_resilient_fetch_leaves_unsupported_binary_as_bytes(monkeypatch, patch_httpx):
-    _clear_allowlist(monkeypatch)
-    monkeypatch.setattr(
-        web_fetch.socket, "getaddrinfo",
-        lambda host, port: [(socket.AF_INET, None, None, "", ("93.184.216.34", 0))],
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            content=b"\x89PNG\r\n\x1a\nbinary image",
-            headers={"content-type": "image/png"},
-        )
-
-    patch_httpx(handler)
-    out = run(
-        web_fetch._resilient_fetch(
-            "https://example.com/image.png",
-            timeout=5,
-            user_agent="t",
-            verify_ssl=False,
-            flaresolverr_url=None,
-            flaresolverr_timeout_ms=1000,
+def test_direct_resource_probe_keeps_binary(monkeypatch, patch_httpx):
+    png = b"\x89PNG\r\n\x1a\nimage"
+    patch_httpx(lambda request: httpx.Response(
+        200, content=png, headers={"content-type": "image/png"}
+    ))
+    _status, _headers, body, ctype, is_html = run(
+        web_fetch._direct_resource_fetch(
+            "https://example.com/image.png", 5, "t", False
         )
     )
-    assert out["text"] is None
-    assert out["bytes"].startswith(b"\x89PNG")
+    assert body == png
+    assert ctype == "image/png"
+    assert is_html is False
 
 
 # --------------------------- download size cap ---------------------------
@@ -458,6 +415,39 @@ def test_firecrawl_fetch_uses_v2_scrape_contract(patch_httpx):
     assert title == "Canonical page title"
 
 
+def test_firecrawl_fetch_can_request_markdown_for_document(patch_httpx):
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": "Extracted protected PDF text.",
+                    "metadata": {"statusCode": 200, "title": "Report"},
+                },
+            },
+        )
+
+    patch_httpx(handler)
+    status, ctype, text, title = run(
+        web_fetch._firecrawl_fetch(
+            "https://example.com/report.pdf",
+            api_url="https://api.firecrawl.dev/v2/scrape",
+            api_key="fc-test",
+            timeout_seconds=60,
+            output_format="markdown",
+        )
+    )
+    assert seen["payload"]["formats"] == ["markdown"]
+    assert status == 200
+    assert ctype == "text/markdown"
+    assert text == "Extracted protected PDF text."
+    assert title == "Report"
+
+
 def test_firecrawl_fetch_surfaces_api_error(patch_httpx):
     patch_httpx(
         lambda request: httpx.Response(
@@ -541,40 +531,6 @@ def test_page_cache_keeps_entry_within_item_limit(monkeypatch):
 
 
 # --------------------------- full fetch cache coordination ---------------------------
-
-def test_cached_resilient_fetch_coalesces_concurrent_misses(monkeypatch):
-    calls = 0
-
-    async def fake_resilient_fetch(url, **kwargs):
-        nonlocal calls
-        calls += 1
-        await asyncio.sleep(0.01)
-        return {
-            "url": url,
-            "status": 200,
-            "content_type": "text/html",
-            "text": "<html>ok</html>",
-            "bytes": None,
-            "via": "direct",
-            "blocked_detected": False,
-        }
-
-    async def scenario():
-        return await asyncio.gather(
-            _cached_resilient_fetch("https://example.com/page"),
-            _cached_resilient_fetch("https://example.com/page"),
-            _cached_resilient_fetch("https://example.com/page"),
-        )
-
-    monkeypatch.setattr(web_fetch, "_page_cache", TTLCache(60, 8))
-    web_fetch._page_inflight.clear()
-    monkeypatch.setattr(web_fetch, "_resilient_fetch", fake_resilient_fetch)
-
-    results = run(scenario())
-    assert calls == 1
-    assert [r["url"] for r in results] == ["https://example.com/page"] * 3
-    assert web_fetch._page_inflight == {}
-
 
 def test_enrich_fetch_coalesces_concurrent_misses(monkeypatch):
     calls = 0

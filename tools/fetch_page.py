@@ -3,8 +3,11 @@ Page-fetching MCP tool.
 
 Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
 structured metadata summary) or, when handed a YouTube video URL, that video's
-transcript. PDF/Office/OpenDocument/RTF/EPUB documents are routed to Apache Tika
-and returned as text; Reddit links are read through the JSON API. An optional
+transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
+Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
+uses authenticated OAuth JSON when configured, then tries RSS, old.reddit HTML,
+and finally oEmbed metadata for individual posts.
+An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
 content too long to return at once.
@@ -22,9 +25,10 @@ import re
 import time
 from functools import partial
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import anyio
+import httpx
 import regex as safe_regex
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
@@ -35,14 +39,12 @@ from .serialize import to_json, log_call, log_result, debug_enabled, redact_secr
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     DownloadTooLargeError,
-    SSRFError,
-    _cached_resilient_fetch,
+    _decode_body,
     _is_tika_document,
-    _render_with_firecrawl,
-    _render_with_flaresolverr,
     _sniff_document_bytes,
     _tika_extract,
 )
+from .page_acquire import acquire_page as _acquire_page
 from .web_extract import (
     _find_section,
     _markdown_from_soup,
@@ -105,10 +107,6 @@ def _fetch_page_desc(prefix: str) -> str:
 # is added only for formats those two params can target, so the model can jump
 # straight to what it needs instead of paging.
 # ---------------------------------------------------------------------------
-
-# Statuses where a remote renderer may still recover content even though the
-# direct origin/CDN says the URL is unavailable.
-_GONE_STATUSES = {404, 410, 451}
 
 _OFFSET_HINT = (
     "Content was truncated to fit the size limit; the rest was dropped. To read "
@@ -354,30 +352,257 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
 # ---------------------------------------------------------------------------
 # Reddit handling
 #
-# Reddit blocks HTML scraping, so a reddit link is rewritten to its .json
-# endpoint before fetching and the verbose response is compacted to just the
-# post + comment fields the model needs.
+# Authenticated JSON is the durable first choice. Anonymous hosted-provider
+# traffic is commonly blocked, so the remaining representations are best-effort:
+# RSS, targeted old.reddit HTML, and (for posts) official oEmbed metadata.
 # ---------------------------------------------------------------------------
 
-def _normalize_reddit_url(url: str) -> str:
-    """Reddit blocks HTML scraping; force the .json endpoint for reddit links."""
+_REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+_reddit_access_token: str | None = None
+_reddit_access_token_expires_at = 0.0
+_reddit_access_token_credentials: tuple[str, str] | None = None
+
+
+def _is_reddit_url(url: str) -> bool:
+    """Whether a URL targets reddit.com or one of its real subdomains."""
     try:
         p = urlparse(url)
     except Exception:
-        return url
+        return False
     # Match reddit.com and its subdomains (www./old./np. …) only. A bare
     # `endswith("reddit.com")` on the netloc would also catch look-alike domains
     # like `notreddit.com` (and miss `reddit.com:443`, since the port is part of
     # the netloc), so test the parsed hostname for an exact or dotted-suffix match.
     host = (p.hostname or "").lower()
-    if host != "reddit.com" and not host.endswith(".reddit.com"):
+    return host == "reddit.com" or host.endswith(".reddit.com")
+
+
+def _normalize_reddit_url(url: str) -> str:
+    """Return the legacy unauthenticated JSON representation of a Reddit URL."""
+    if not _is_reddit_url(url):
         return url
+    p = urlparse(url)
     path = p.path or "/"
     if path.endswith("/"):
         path = path[:-1]
     if not path.endswith(".json"):
         path = path + ".json"
     return urlunparse((p.scheme or "https", "www.reddit.com", path, "", p.query, ""))
+
+
+def _reddit_clean_path(url: str) -> str:
+    """Strip a Reddit representation suffix and return its canonical path."""
+    path = urlparse(url).path or "/"
+    for suffix in (".json", ".rss"):
+        if path.lower().endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    return path
+
+
+def _is_reddit_post_url(url: str) -> bool:
+    return "/comments/" in _reddit_clean_path(url).lower()
+
+
+def _reddit_oauth_url(url: str) -> str:
+    """Build the OAuth Data API URL corresponding to a public Reddit URL."""
+    parsed = urlparse(url)
+    path = _reddit_clean_path(url).rstrip("/") or "/"
+    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    params["raw_json"] = "1"
+    if "/comments/" in path.lower():
+        params.setdefault("limit", "500")
+    return urlunparse(("https", "oauth.reddit.com", path, "", urlencode(params), ""))
+
+
+def _reddit_rss_url(url: str) -> str:
+    """Build a Reddit Atom feed URL for a post or listing."""
+    parsed = urlparse(url)
+    path = _reddit_clean_path(url).rstrip("/")
+    path += "/.rss" if _is_reddit_post_url(url) else ".rss"
+    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", parsed.query, ""))
+
+
+def _reddit_old_url(url: str) -> str:
+    """Build the old.reddit HTML URL for a post or listing."""
+    parsed = urlparse(url)
+    return urlunparse(
+        ("https", "old.reddit.com", _reddit_clean_path(url), "", parsed.query, "")
+    )
+
+
+def _reddit_oembed_url(url: str) -> str:
+    """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
+    p = urlparse(url)
+    path = _reddit_clean_path(url)
+    post_url = urlunparse(
+        (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
+    )
+    return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
+
+
+def _reddit_fragment_text(fragment: str, base_url: str) -> str:
+    """Render Reddit's HTML-in-XML/body fragment without surrounding chrome."""
+    soup = BeautifulSoup(fragment or "", "lxml")
+    root = soup.select_one(".md") or soup.body or soup
+    if cfg.markdown:
+        return _markdown_from_soup(root, base_url).strip()
+    return _plain_text_from_soup(root).strip()
+
+
+def _compact_reddit_rss(xml: str, url: str) -> dict | None:
+    """Convert a Reddit Atom feed into the compact Reddit result shape."""
+    try:
+        soup = BeautifulSoup(xml, "xml")
+        entries = soup.find_all("entry")
+        if not entries:
+            return None
+
+        parsed_entries = []
+        for entry in entries:
+            id_tag = entry.find("id")
+            author_tag = entry.find("author")
+            name_tag = author_tag.find("name") if author_tag else None
+            author = name_tag.get_text(strip=True) if name_tag else None
+            if author and author.startswith("/u/"):
+                author = author[3:]
+            title_tag = entry.find("title")
+            content_tag = entry.find("content")
+            link_tag = entry.find("link", href=True)
+            updated_tag = entry.find("updated")
+            parsed_entries.append(
+                {
+                    "id": id_tag.get_text(strip=True) if id_tag else None,
+                    "title": title_tag.get_text(" ", strip=True) if title_tag else None,
+                    "author": author,
+                    "url": link_tag.get("href") if link_tag else None,
+                    "body": _reddit_fragment_text(
+                        content_tag.get_text() if content_tag else "", url
+                    ),
+                    "updated": updated_tag.get_text(strip=True) if updated_tag else None,
+                }
+            )
+
+        # A post feed begins with the submission (t3), followed by comments (t1).
+        if (parsed_entries[0].get("id") or "").startswith("t3_"):
+            first = parsed_entries[0]
+            post = {
+                "title": first["title"],
+                "author": first["author"],
+                "permalink": first["url"],
+                "selftext": first["body"],
+                "created": first["updated"],
+            }
+            comments = [
+                {
+                    "id": item["id"],
+                    "author": item["author"],
+                    "body": item["body"],
+                    "permalink": item["url"],
+                    "created": item["updated"],
+                }
+                for item in parsed_entries[1:]
+                if (item.get("id") or "").startswith("t1_")
+            ]
+            return {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+                "comments_incomplete": True,
+            }
+
+        return {"items": parsed_entries, "items_returned": len(parsed_entries)}
+    except Exception:
+        return None
+
+
+def _old_reddit_entry_body(node, url: str) -> str:
+    entry = node.find("div", class_="entry", recursive=False)
+    body = entry.select_one(".usertext-body") if entry else None
+    return _reddit_fragment_text(str(body), url) if body else ""
+
+
+def _compact_reddit_html(html: str, url: str) -> dict | None:
+    """Extract posts/comments from old.reddit HTML without page chrome."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        links = soup.select("div.thing.link[data-fullname^='t3_']")
+        comments = []
+        for node in soup.select("div.thing.comment[data-fullname^='t1_']"):
+            author_node = node.select_one(".author")
+            score_node = node.select_one(".score.unvoted, .score.likes, .score.dislikes")
+            depth = sum(
+                1
+                for parent in node.parents
+                if getattr(parent, "get", lambda *_: None)("data-type") == "comment"
+            )
+            comments.append(
+                {
+                    "id": node.get("data-fullname"),
+                    "author": (
+                        author_node.get_text(" ", strip=True)
+                        if author_node
+                        else node.get("data-author")
+                    ),
+                    "score": score_node.get_text(" ", strip=True) if score_node else None,
+                    "depth": depth,
+                    "body": _old_reddit_entry_body(node, url),
+                    "permalink": node.get("data-permalink"),
+                }
+            )
+
+        if _is_reddit_post_url(url) and links:
+            node = links[0]
+            title_node = node.select_one("a.title")
+            reported = node.get("data-comments-count")
+            try:
+                reported = int(reported) if reported is not None else None
+            except (TypeError, ValueError):
+                reported = None
+            post = {
+                "title": title_node.get_text(" ", strip=True) if title_node else None,
+                "author": node.get("data-author"),
+                "subreddit": node.get("data-subreddit"),
+                "score": (
+                    int(node.get("data-score"))
+                    if str(node.get("data-score", "")).isdigit()
+                    else None
+                ),
+                "num_comments": reported,
+                "permalink": node.get("data-permalink"),
+                "url": node.get("data-url"),
+                "selftext": _old_reddit_entry_body(node, url),
+            }
+            result = {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+                "more_comment_placeholders": len(soup.select(".morecomments")),
+            }
+            if reported is not None:
+                result["comments_reported"] = reported
+                result["comments_incomplete"] = len(comments) < reported
+            return result
+
+        items = []
+        for node in links:
+            title_node = node.select_one("a.title")
+            items.append(
+                {
+                    "id": node.get("data-fullname"),
+                    "title": title_node.get_text(" ", strip=True) if title_node else None,
+                    "author": node.get("data-author"),
+                    "subreddit": node.get("data-subreddit"),
+                    "score": node.get("data-score"),
+                    "num_comments": node.get("data-comments-count"),
+                    "permalink": node.get("data-permalink"),
+                    "url": node.get("data-url"),
+                    "selftext": _old_reddit_entry_body(node, url),
+                }
+            )
+        return {"items": items, "items_returned": len(items)} if items else None
+    except Exception:
+        return None
 
 
 def _compact_reddit_json(data: Any) -> Any:
@@ -406,12 +631,17 @@ def _compact_reddit_json(data: Any) -> Any:
                 }
 
             comments = []
+            more_children = 0
 
             def walk(node, depth=0):
+                nonlocal more_children
                 if not isinstance(node, dict):
                     return
                 kind = node.get("kind")
                 d = node.get("data") or {}
+                if kind == "more":
+                    more_children += len(d.get("children") or [])
+                    return
                 if kind == "t1":
                     comments.append(
                         {
@@ -429,10 +659,205 @@ def _compact_reddit_json(data: Any) -> Any:
             for c in child_of(comments_listing):
                 walk(c, 0)
 
-            return {"post": post, "comments": comments}
+            result = {
+                "post": post,
+                "comments": comments,
+                "comments_returned": len(comments),
+            }
+            if post and post.get("num_comments") is not None:
+                result["comments_reported"] = post["num_comments"]
+                result["comments_incomplete"] = len(comments) < post["num_comments"]
+            if more_children:
+                result["more_children"] = more_children
+            return result
     except Exception:
         pass
     return data
+
+
+async def _reddit_token() -> str:
+    """Return a cached application-only Reddit OAuth token."""
+    global _reddit_access_token
+    global _reddit_access_token_expires_at
+    global _reddit_access_token_credentials
+
+    client_id = cfg.reddit_client_id.strip()
+    client_secret = cfg.reddit_client_secret.strip()
+    user_agent = cfg.reddit_user_agent.strip()
+    missing = [
+        name
+        for name, value in (
+            ("WEB_SEARCH_REDDIT_CLIENT_ID", client_id),
+            ("WEB_SEARCH_REDDIT_CLIENT_SECRET", client_secret),
+            ("WEB_SEARCH_REDDIT_USER_AGENT", user_agent),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Incomplete Reddit OAuth configuration: " + ", ".join(missing)
+        )
+
+    credentials = (client_id, client_secret)
+    now = time.monotonic()
+    if (
+        _reddit_access_token
+        and _reddit_access_token_credentials == credentials
+        and now < _reddit_access_token_expires_at - 30
+    ):
+        return _reddit_access_token
+
+    async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+        response = await client.post(
+            _REDDIT_TOKEN_URL,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": user_agent, "Accept": "application/json"},
+            timeout=cfg.http_timeout_seconds,
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Reddit OAuth token endpoint returned HTTP {response.status_code}"
+        )
+    try:
+        data = response.json()
+        token = str(data["access_token"]).strip()
+        expires_in = max(60, int(data.get("expires_in", 3600)))
+    except Exception as exc:
+        raise RuntimeError("Reddit OAuth token endpoint returned invalid JSON") from exc
+    if not token:
+        raise RuntimeError("Reddit OAuth token endpoint returned an empty access token")
+
+    _reddit_access_token = token
+    _reddit_access_token_expires_at = time.monotonic() + expires_in
+    _reddit_access_token_credentials = credentials
+    return token
+
+
+async def _fetch_reddit_oauth(url: str) -> dict:
+    """Fetch one Reddit JSON representation using application-only OAuth."""
+    token = await _reddit_token()
+    fetch_url = _reddit_oauth_url(url)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": cfg.reddit_user_agent.strip(),
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
+        async with client.stream(
+            "GET", fetch_url, headers=headers, timeout=cfg.http_timeout_seconds
+        ) as response:
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if cfg.max_download_bytes and total > cfg.max_download_bytes:
+                    raise DownloadTooLargeError(
+                        f"Reddit OAuth response exceeds the {cfg.max_download_bytes}-byte "
+                        "WEB_SEARCH_MAX_DOWNLOAD_BYTES cap."
+                    )
+                chunks.append(chunk)
+            status = response.status_code
+            ctype = response.headers.get("content-type", "application/json")
+    if status >= 400:
+        raise RuntimeError(f"Reddit OAuth JSON returned HTTP {status}")
+    body = b"".join(chunks)
+    return {
+        "url": fetch_url,
+        "status": status,
+        "content_type": ctype,
+        "text": _decode_body(body, ctype),
+        "bytes": None,
+        "via": "reddit_oauth",
+        "blocked_detected": False,
+    }
+
+
+def _reddit_oauth_requested() -> bool:
+    return any(
+        value.strip()
+        for value in (
+            cfg.reddit_client_id,
+            cfg.reddit_client_secret,
+            cfg.reddit_user_agent,
+        )
+    )
+
+
+def _reddit_failure_trace(name: str, exc: BaseException) -> str:
+    """Bound one provider failure so a debug note cannot dominate the result."""
+    detail = " ".join((str(exc).strip() or type(exc).__name__).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return f"{name} failed ({detail})"
+
+
+async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
+    """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
+    errors: list[str] = []
+    trace: list[str] = []
+
+    if _reddit_oauth_requested():
+        try:
+            fetched = await _fetch_reddit_oauth(url)
+            parsed = json.loads(fetched.get("text") or "")
+            trace.append("OAuth JSON succeeded")
+            return fetched, _compact_reddit_json(parsed), "oauth", trace
+        except Exception as exc:
+            failure = _reddit_failure_trace("OAuth JSON", exc)
+            errors.append(failure)
+            trace.append(failure)
+    else:
+        trace.append("OAuth JSON skipped (not configured)")
+
+    rss_url = _reddit_rss_url(url)
+    try:
+        fetched = await _acquire_page(rss_url)
+        if fetched.get("status", 0) >= 400:
+            raise RuntimeError(f"HTTP {fetched['status']}")
+        compact = await anyio.to_thread.run_sync(
+            _compact_reddit_rss, fetched.get("text") or "", url
+        )
+        if compact is None:
+            raise RuntimeError("feed contained no Reddit entries")
+        trace.append("RSS succeeded")
+        return fetched, compact, "rss", trace
+    except Exception as exc:
+        failure = _reddit_failure_trace("RSS", exc)
+        errors.append(failure)
+        trace.append(failure)
+
+    old_url = _reddit_old_url(url)
+    try:
+        fetched = await _acquire_page(old_url)
+        if fetched.get("status", 0) >= 400:
+            raise RuntimeError(f"HTTP {fetched['status']}")
+        compact = await anyio.to_thread.run_sync(
+            _compact_reddit_html, fetched.get("text") or "", url
+        )
+        if compact is None:
+            raise RuntimeError("page contained no extractable Reddit entries")
+        trace.append("old.reddit HTML succeeded")
+        return fetched, compact, "old_html", trace
+    except Exception as exc:
+        failure = _reddit_failure_trace("old.reddit HTML", exc)
+        errors.append(failure)
+        trace.append(failure)
+
+    if _is_reddit_post_url(url):
+        oembed_url = _reddit_oembed_url(url)
+        try:
+            fetched = await _acquire_page(oembed_url)
+            if fetched.get("status", 0) >= 400:
+                raise RuntimeError(f"HTTP {fetched['status']}")
+            trace.append("oEmbed succeeded")
+            return fetched, json.loads(fetched.get("text") or ""), "oembed", trace
+        except Exception as exc:
+            failure = _reddit_failure_trace("oEmbed", exc)
+            errors.append(failure)
+            trace.append(failure)
+
+    raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
 
 
 # ---------------------------------------------------------------------------
@@ -528,25 +953,6 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
-async def _try_firecrawl(fetch_url: str) -> tuple[dict | None, str | None]:
-    """Best-effort Firecrawl fallback, returning a usable fetch or an error note."""
-    if not cfg.firecrawl_api_key.strip():
-        return None, None
-    try:
-        fetched = await _render_with_firecrawl(fetch_url)
-    except Exception as exc:
-        api_password = urlparse(cfg.firecrawl_api_url).password or ""
-        return None, redact_secrets(exc, cfg.firecrawl_api_key, api_password)
-    status = fetched.get("status")
-    if status is not None and status >= 400:
-        return None, f"Firecrawl received HTTP {status} from the target page"
-    if fetched.get("blocked_detected"):
-        return None, "Firecrawl also received a bot/CAPTCHA challenge"
-    if not fetched.get("text"):
-        return None, "Firecrawl returned no rendered HTML"
-    return fetched, None
-
-
 def _unsupported_media_error(
     fetch_url: str, status: int | None, ctype: str, size: int | None
 ) -> ToolError:
@@ -626,148 +1032,126 @@ async def _fetch_one(
 
     section = (section or "").strip() or None
 
-    fetch_url = _normalize_reddit_url(url)
-    reddit_rewritten = fetch_url != url
-
-    try:
-        fetched = await _cached_resilient_fetch(fetch_url)
-    except (SSRFError, DownloadTooLargeError) as e:
-        backend_passwords = tuple(
-            urlparse(endpoint).password or ""
-            for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
-            if endpoint
-        )
-        detail = redact_secrets(e, *backend_passwords)
-        raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
-    except Exception as e:
-        # A network-level direct failure has already gone through FlareSolverr
-        # inside `_cached_resilient_fetch`; Firecrawl is the final tier.
-        fetched, firecrawl_error = await _try_firecrawl(fetch_url)
-        if fetched is None:
+    reddit_request = _is_reddit_url(url)
+    if reddit_request:
+        try:
+            fetched, compact, reddit_source, reddit_trace = await _acquire_reddit(url)
+        except Exception as exc:
             backend_passwords = tuple(
                 urlparse(endpoint).password or ""
-                for endpoint in (cfg.flaresolverr_url, cfg.firecrawl_api_url, cfg.tika_url)
+                for endpoint in (
+                    cfg.flaresolverr_url,
+                    cfg.firecrawl_api_url,
+                    cfg.tika_url,
+                    cfg.classifier_api_url,
+                )
                 if endpoint
             )
-            detail = redact_secrets(e, *backend_passwords)
-            fallback_detail = (
-                f" Firecrawl also failed: {firecrawl_error}."
-                if firecrawl_error
-                else ""
+            detail = redact_secrets(
+                exc,
+                cfg.reddit_client_secret,
+                cfg.firecrawl_api_key,
+                cfg.classifier_api_key,
+                *backend_passwords,
             )
-            raise ToolError(
-                f"Fetch failed for {fetch_url}: {detail}.{fallback_detail}"
+            raise ToolError(f"Fetch failed for {url}: {detail}")
+
+        source_url = {
+            "oauth": _reddit_oauth_url(url),
+            "rss": _reddit_rss_url(url),
+            "old_html": _reddit_old_url(url),
+            "oembed": _reddit_oembed_url(url),
+        }[reddit_source]
+        status = fetched.get("status")
+        ctype = (fetched.get("content_type") or "").lower()
+        payload = {
+            "url": source_url,
+            **_provenance(url, source_url, status, ctype, fetched.get("via")),
+            "format": "json",
+        }
+        _set_content(payload, to_json(compact), hint=False, offset=offset)
+        if reddit_source == "rss":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Returned Reddit's RSS feed; it may contain only an initial "
+                "snapshot of the comments.",
             )
+        elif reddit_source == "old_html":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Reddit OAuth JSON and RSS were unavailable; returned targeted "
+                "old.reddit HTML extraction, which may omit unloaded comments.",
+            )
+        elif reddit_source == "oembed":
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
+                "returning official oEmbed post metadata without comments.",
+            )
+        if debug_enabled():
+            backend_passwords = tuple(
+                urlparse(endpoint).password or ""
+                for endpoint in (
+                    cfg.flaresolverr_url,
+                    cfg.firecrawl_api_url,
+                    cfg.tika_url,
+                    cfg.classifier_api_url,
+                )
+                if endpoint
+            )
+            trace_note = redact_secrets(
+                "Reddit fallback trace: " + "; ".join(reddit_trace) + ".",
+                cfg.reddit_client_secret,
+                cfg.firecrawl_api_key,
+                cfg.classifier_api_key,
+                *backend_passwords,
+            )
+            payload["note"] = _join_note(payload.get("note"), trace_note)
+        return payload
+
+    fetch_url = url
+    fetched: dict | None = None
+    primary_exc: Exception | None = None
+    try:
+        # The acquisition module owns the complete browser-first policy: direct
+        # resource probe, FlareSolverr, quality assessment, optional classifier,
+        # circuit breaker, hedge, and Firecrawl fallback.
+        fetched = await _acquire_page(fetch_url)
+    except Exception as exc:
+        primary_exc = exc
+
+    if primary_exc is not None:
+        backend_passwords = tuple(
+            urlparse(endpoint).password or ""
+            for endpoint in (
+                cfg.flaresolverr_url,
+                cfg.firecrawl_api_url,
+                cfg.tika_url,
+                cfg.classifier_api_url,
+            )
+            if endpoint
+        )
+        detail = redact_secrets(
+            primary_exc,
+            cfg.firecrawl_api_key,
+            cfg.classifier_api_key,
+            *backend_passwords,
+        )
+        detail = detail.strip() or type(primary_exc).__name__
+        raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
+
+    if fetched is None:  # Defensive invariant for type checkers and future edits.
+        raise ToolError(f"Fetch failed for {fetch_url}: no acquisition result")
 
     status = fetched["status"]
     ctype = (fetched.get("content_type") or "").lower()
     via = fetched.get("via")
 
-    # Bot wall we couldn't get past: a challenge was detected in the response
-    # we're holding. `blocked_detected` is set whether that response came
-    # direct or back from FlareSolverr — FlareSolverr returning a page is not
-    # the same as a bypass, since an interactive wall (PerimeterX "Press &
-    # Hold", a CAPTCHA) renders as an ordinary page it can't solve. Returning
-    # the challenge would dress a failure up as data (the very thing the error
-    # convention guards against), so raise instead — telling the model the
-    # page is protected, and the operator what (if anything) is left to try.
-    if fetched.get("blocked_detected"):
-        # FlareSolverr was already attempted inside `_resilient_fetch` for a
-        # detected wall/429. Firecrawl is the final tier before this becomes a
-        # real tool error.
-        recovered, firecrawl_error = await _try_firecrawl(fetch_url)
-        if recovered is not None:
-            fetched = recovered
-            status = fetched["status"]
-            ctype = (fetched.get("content_type") or "").lower()
-            via = fetched.get("via")
-        else:
-            if via == "flaresolverr":
-                detail = (
-                    "the FlareSolverr fallback rendered it in a real browser but "
-                    "the page is still an interactive challenge (e.g. a "
-                    "'Press & Hold' / CAPTCHA) it cannot solve"
-                )
-            elif fetched.get("flaresolverr_error"):
-                detail = (
-                    "the FlareSolverr fallback could not fetch it "
-                    f"({fetched['flaresolverr_error']})"
-                )
-            elif cfg.flaresolverr_url:
-                detail = "the FlareSolverr fallback did not resolve it"
-            else:
-                detail = (
-                    "no FlareSolverr fallback is configured "
-                    "(set WEB_SEARCH_FLARESOLVERR_URL to enable it)"
-                )
-            firecrawl_detail = (
-                f" Firecrawl also failed: {firecrawl_error}."
-                if firecrawl_error
-                else (
-                    " No Firecrawl fallback is configured "
-                    "(set WEB_SEARCH_FIRECRAWL_API_KEY to enable it)."
-                )
-            )
-            wall = "rate limit" if status == 429 else "bot/CAPTCHA wall"
-            raise ToolError(
-                f"{fetch_url} is behind a {wall} (HTTP {status}) and "
-                f"{detail}.{firecrawl_detail} The page content could not be retrieved."
-            )
-
-    # Gone/unavailable URLs used to get the archive fallback. Preserve that
-    # recovery scope while replacing its implementation: finish the ordered
-    # FlareSolverr -> Firecrawl chain, then apply the normal HTTP-error rule.
-    http_fallback_details = []
-    if status in _GONE_STATUSES:
-        flaresolverr_error = None
-        if via != "flaresolverr" and cfg.flaresolverr_url:
-            try:
-                rendered = await _render_with_flaresolverr(fetch_url)
-            except Exception as exc:
-                flaresolverr_error = str(exc)
-                rendered = None
-            if (
-                rendered
-                and rendered.get("text")
-                and not rendered.get("blocked_detected")
-                and (rendered.get("status") is None or rendered["status"] < 400)
-            ):
-                fetched = rendered
-                status = fetched["status"]
-                ctype = (fetched.get("content_type") or "").lower()
-                via = fetched.get("via")
-
-        if status is not None and status >= 400:
-            recovered, firecrawl_error = await _try_firecrawl(fetch_url)
-            if recovered is not None:
-                fetched = recovered
-                status = fetched["status"]
-                ctype = (fetched.get("content_type") or "").lower()
-                via = fetched.get("via")
-            else:
-                if flaresolverr_error:
-                    http_fallback_details.append(
-                        f"FlareSolverr failed: {flaresolverr_error}"
-                    )
-                if firecrawl_error:
-                    http_fallback_details.append(
-                        f"Firecrawl failed: {firecrawl_error}"
-                    )
-                elif not cfg.firecrawl_api_key.strip():
-                    http_fallback_details.append("Firecrawl is not configured")
-
-    # Never return an HTTP error document as page content. Besides violating the
-    # tool's error contract, doing so lets a CDN/proxy error page masquerade as
-    # the requested article, JSON payload, or document.
+    # Direct non-HTML resources do not go through browser recovery. Never return
+    # an HTTP error payload as if it were the requested JSON/document/text file.
     if status is not None and status >= 400:
-        fallback_detail = (
-            f" {'; '.join(http_fallback_details)}."
-            if http_fallback_details
-            else ""
-        )
         raise ToolError(
             f"{fetch_url} returned HTTP {status}; page content was not returned."
-            f"{fallback_detail}"
         )
 
     # Firecrawl's `html` format is cleaned page HTML and may omit the document
@@ -789,25 +1173,36 @@ async def _fetch_one(
     # requested mode. Detected by content-type/extension or — for a document
     # served with a generic/wrong content-type and no telling extension — by a
     # magic-byte sniff of the raw bytes.
-    if _is_tika_document(ctype, fetch_url) or _sniff_document_bytes(fetched.get("bytes")):
-        body = fetched.get("bytes")
-        if not body and fetched.get("text"):
-            body = fetched["text"].encode("utf-8", errors="replace")
-        if not body:
-            raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
-        try:
-            extracted = await asyncio.to_thread(
-                _tika_extract,
-                body,
-                cfg.tika_url,
-                timeout=cfg.tika_timeout_seconds,
-                ocr_strategy=cfg.tika_ocr_strategy,
-                max_output_bytes=cfg.max_download_bytes,
-            )
-        except Exception as exc:
-            tika_password = urlparse(cfg.tika_url).password or ""
-            detail = redact_secrets(exc, tika_password)
-            raise ToolError(f"Document extraction failed for {fetch_url}: {detail}")
+    if (
+        fetched.get("resource_kind") in ("document", "document_text")
+        or _is_tika_document(ctype, fetch_url)
+        or _sniff_document_bytes(fetched.get("bytes"))
+    ):
+        if fetched.get("resource_kind") == "document_text":
+            extracted = fetched.get("text") or ""
+            if not extracted:
+                raise ToolError(
+                    f"Document recovery returned no text (url={fetch_url}, status={status})."
+                )
+        else:
+            body = fetched.get("bytes")
+            if not body and fetched.get("text"):
+                body = fetched["text"].encode("utf-8", errors="replace")
+            if not body:
+                raise ToolError(f"Document returned no content (url={fetch_url}, status={status}).")
+            try:
+                extracted = await asyncio.to_thread(
+                    _tika_extract,
+                    body,
+                    cfg.tika_url,
+                    timeout=cfg.tika_timeout_seconds,
+                    ocr_strategy=cfg.tika_ocr_strategy,
+                    max_output_bytes=cfg.max_download_bytes,
+                )
+            except Exception as exc:
+                tika_password = urlparse(cfg.tika_url).password or ""
+                detail = redact_secrets(exc, tika_password)
+                raise ToolError(f"Document extraction failed for {fetch_url}: {detail}")
         doc_payload = {
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),
@@ -828,11 +1223,11 @@ async def _fetch_one(
 
     text = fetched.get("text") or ""
 
-    # Reddit / JSON responses
-    if reddit_rewritten or "json" in ctype:
+    # JSON responses
+    if "json" in ctype:
         try:
             parsed = json.loads(text)
-            compact = _compact_reddit_json(parsed) if reddit_rewritten else parsed
+            compact = parsed
             json_payload = {
                 "url": fetch_url,
                 **_provenance(url, fetch_url, status, ctype or "application/json", via),
@@ -856,88 +1251,12 @@ async def _fetch_one(
     except Exception as e:
         raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
 
-    # Empty-shell handling. Check this before section/structured parsing, since
-    # a static JS shell can otherwise look like "section not found" or sparse
-    # metadata even though a browser fallback can recover the page body.
-    tried_render = False
-    if (
-        _is_contentless(plain)
-        and via not in ("flaresolverr", "firecrawl")
-        and cfg.flaresolverr_url
-    ):
-        tried_render = True
-        try:
-            rendered = await _render_with_flaresolverr(fetch_url)
-        except Exception:
-            rendered = None
-        if rendered and rendered.get("text") and not rendered.get("blocked_detected"):
-            text = rendered["text"]
-            status = rendered["status"]
-            ctype = (rendered.get("content_type") or ctype).lower()
-            via = rendered.get("via")
-            try:
-                soup_title, plain, text_format = await anyio.to_thread.run_sync(
-                    _render_text_mode, text, fetch_url
-                )
-            except Exception as e:
-                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
-    tried_firecrawl = via == "firecrawl"
-    firecrawl_error = None
-    if (
-        _is_contentless(plain)
-        and via != "firecrawl"
-        and cfg.firecrawl_api_key.strip()
-    ):
-        tried_firecrawl = True
-        rendered, firecrawl_error = await _try_firecrawl(fetch_url)
-        if rendered is not None:
-            text = rendered["text"]
-            status = rendered["status"]
-            ctype = (rendered.get("content_type") or ctype).lower()
-            via = rendered.get("via")
-            firecrawl_title = (
-                rendered.get("title").strip()
-                if isinstance(rendered.get("title"), str)
-                and rendered["title"].strip()
-                else None
-            )
-            try:
-                soup_title, plain, text_format = await anyio.to_thread.run_sync(
-                    _render_text_mode, text, fetch_url
-                )
-                soup_title = firecrawl_title or soup_title
-            except Exception as e:
-                raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
-
+    # Acquisition already rejected empty/block/error renders. Keep a final
+    # extraction-level invariant in case a parser removes all nominally visible
+    # content. Structured mode may legitimately consist only of metadata.
     if _is_contentless(plain) and not (mode == "structured" and not query):
-        tried = [
-            name
-            for name, used in (
-                ("the FlareSolverr browser fallback", tried_render),
-                ("the Firecrawl fallback", tried_firecrawl),
-            )
-            if used
-        ]
-        if tried:
-            firecrawl_detail = (
-                f" Firecrawl failed: {firecrawl_error}." if firecrawl_error else ""
-            )
-            hint = (
-                f"Even {' and '.join(tried)} produced no readable text, so the "
-                "content could not be recovered."
-                f"{firecrawl_detail} Try another source."
-            )
-        else:
-            hint = (
-                "Enable FlareSolverr (WEB_SEARCH_FLARESOLVERR_URL) and configure "
-                "Firecrawl (WEB_SEARCH_FIRECRAWL_API_KEY) to recover JavaScript-"
-                "rendered pages, or fetch the article from another source."
-            )
-        titled = f" (page title: {soup_title!r})" if soup_title else ""
         raise ToolError(
-            f"{fetch_url} returned HTTP {status} but no extractable text content — "
-            f"the page renders its content client-side with JavaScript.{titled} {hint}"
+            f"{fetch_url} produced no extractable text after page acquisition."
         )
 
     if mode == "structured" and not query:

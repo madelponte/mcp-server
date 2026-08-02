@@ -1,13 +1,12 @@
 """
 HTTP fetching infrastructure, shared by the web-search and fetch-page tools.
 
-This is the network layer both tools sit on top of: a resilient fetch that
-SSRF-guards every URL (and redirect hop), detects bot/CAPTCHA walls and retries
-through FlareSolverr, routes binary documents to Apache Tika, and caches the raw
-result so a repeated fetch within a task skips the round-trip. `search_web` uses
-it to enrich results with page metadata; `fetch_page` uses it to read pages. The
-returned dict is the raw fetch (status / content-type / text-or-bytes / via);
-each caller formats it for its own needs.
+This is the provider/transport layer both tools sit on top of. It SSRF-guards
+URLs and redirect hops, streams direct resources with size limits, talks to
+FlareSolverr and Firecrawl, extracts binary documents through Tika, and owns the
+raw page cache. `page_acquire` defines fetch_page's browser-first policy and page
+acceptance; `search_web` keeps a separate direct-only enrichment path. Returned
+dicts are raw artifacts (status / content-type / text-or-bytes / via).
 """
 
 import asyncio
@@ -34,12 +33,6 @@ log = logging.getLogger(__name__)
 # network round-trip. Fetch settings all come from static config, so the URL
 # alone is a sufficient key. See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
-
-# Concurrent calls can ask for the same URL before the first one has populated
-# `_page_cache` (for example, a batch of model actions or overlapping search
-# enrichment and fetch_page reads). Track the in-flight full fetch so followers
-# await the same network/render/Tika precursor work instead of duplicating it.
-_page_inflight: dict[str, asyncio.Task] = {}
 
 # Lean search-result enrichment has its own in-flight map. It deliberately does
 # not use the full fetch path because enrichment skips browser/Firecrawl fallbacks,
@@ -85,11 +78,12 @@ def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
 
 
 # ---------------------------------------------------------------------------
-# Bot-wall / CAPTCHA detection
+# Lean enrichment bot-wall detection
 #
-# Detecting a challenge page is what routes a fetch to FlareSolverr (which
-# renders in a real browser) instead of returning the challenge itself as if it
-# were content. Cloudflare is the common case, but it is not the only one:
+# Search enrichment is intentionally direct-only, but must avoid caching an
+# obvious challenge as reusable page content. fetch_page does not use this
+# marker list for fallback decisions; page_quality applies its generic gate.
+# Cloudflare is the common direct-enrichment case, but it is not the only one:
 # PerimeterX/HUMAN, DataDome, and Akamai Bot Manager all serve a 403 (sometimes a
 # 401, 429, or even a 200) whose body is a JS/CAPTCHA challenge bearing none of
 # the Cloudflare markers — so they must be matched explicitly or the fallback
@@ -150,10 +144,8 @@ def _is_blocked_response(status: int, text: str, headers: dict) -> bool:
     """
     # A 429 ("Too Many Requests") is always a rate-limit/throttle: it never
     # carries the page's real content, and is frequently fingerprint-based bot
-    # detection that a real browser (FlareSolverr) — different TLS/JS fingerprint
-    # — clears, even when a plain client is throttled. Always treat it as a block
-    # so the fallback fires, and so a still-throttled 429 surfaces as an error
-    # rather than its "Too Many Requests" page being returned as data.
+    # detection. Always treat it as blocked so enrichment does not cache a
+    # "Too Many Requests" page as reusable content.
     if status == 429:
         return True
     hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
@@ -538,7 +530,7 @@ async def _assert_url_allowed(url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fetching (with FlareSolverr fallback)
+# Direct-resource probing and browser provider transports
 # ---------------------------------------------------------------------------
 
 class DownloadTooLargeError(RuntimeError):
@@ -635,6 +627,76 @@ async def _httpx_fetch(
     raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
+async def _direct_resource_fetch(
+    url: str, timeout: float, user_agent: str, verify_ssl: bool, max_bytes: int = 0,
+    sniff_bytes: int = 16384,
+) -> tuple[int, dict, bytes, str, bool]:
+    """Probe a URL and download it only when it is not an HTML web page.
+
+    Returns ``(status, headers, body, content_type, is_html)``. For a declared
+    HTML response the stream is closed without consuming its body. Missing or
+    generic content types are read only through a small sniff window before HTML
+    is identified; JSON/XML and binary resources continue in the same request.
+    A document-looking URL is always downloaded directly even if a server labels
+    it HTML, so an error page at a .pdf URL can be rejected without feeding it to
+    a browser or Tika.
+    """
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "application/json;q=0.9,application/pdf;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    client = _fetch_client(verify_ssl)
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
+            location = resp.headers.get("location")
+            if resp.is_redirect and location:
+                current = str(resp.url.join(location))
+                await _assert_url_allowed(current)
+                continue
+            status = resp.status_code
+            response_headers = dict(resp.headers)
+            ctype = resp.headers.get("content-type", "")
+            base = ctype.split(";", 1)[0].strip().lower()
+            document_url = _is_tika_document("", current)
+            if not document_url and (base in {"text/html", "application/xhtml+xml"} or "html" in base):
+                return status, response_headers, b"", ctype, True
+
+            chunks: list[bytes] = []
+            total = 0
+            undecided = not document_url and _generic_binary_ctype(ctype)
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if max_bytes and total > max_bytes:
+                    raise DownloadTooLargeError(
+                        f"Response from {current!r} exceeds the {max_bytes}-byte "
+                        "download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
+                    )
+                chunks.append(chunk)
+                if undecided and total >= min(sniff_bytes, max_bytes or sniff_bytes):
+                    sample = b"".join(chunks)
+                    sniffed = _sniff_textlike_ctype(sample, ctype)
+                    if sniffed == "text/html":
+                        return status, response_headers, b"", sniffed, True
+                    # JSON/XML can now continue in this same response.
+                    if sniffed:
+                        ctype = sniffed
+                    undecided = False
+            body = b"".join(chunks)
+            if undecided:
+                sniffed = _sniff_textlike_ctype(body, ctype)
+                if sniffed == "text/html":
+                    return status, response_headers, b"", sniffed, True
+                if sniffed:
+                    ctype = sniffed
+            return status, response_headers, body, ctype, False
+    raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
+
+
 async def _flaresolverr_fetch(
     url: str,
     flaresolverr_url: str,
@@ -689,176 +751,6 @@ async def _flaresolverr_fetch(
     return status, hdrs, body
 
 
-async def _resilient_fetch(
-    url: str,
-    *,
-    timeout: float,
-    user_agent: str,
-    verify_ssl: bool,
-    flaresolverr_url: str | None,
-    flaresolverr_timeout_ms: int,
-    max_bytes: int = 0,
-) -> dict:
-    """Try direct httpx; on a Cloudflare wall, retry through FlareSolverr if configured."""
-    # SSRF guard the initial URL before EITHER fetch path. FlareSolverr is the
-    # more dangerous one (it renders in real Chrome and runs JS), so the check
-    # must gate it too — hence here, not inside _httpx_fetch.
-    await _assert_url_allowed(url)
-    try:
-        status, headers, body, ctype = await _httpx_fetch(
-            url, timeout=timeout, user_agent=user_agent, verify_ssl=verify_ssl,
-            max_bytes=max_bytes,
-        )
-    except (SSRFError, DownloadTooLargeError):
-        # A redirect hop resolved to a blocked host, or the body blew past the
-        # size cap — refuse outright rather than handing the same URL to
-        # FlareSolverr, which would re-fetch (and re-download) it in-browser.
-        raise
-    except Exception as e:
-        if flaresolverr_url:
-            try:
-                fs_status, fs_headers, fs_html = await _flaresolverr_fetch(
-                    url,
-                    flaresolverr_url=flaresolverr_url,
-                    max_timeout_ms=flaresolverr_timeout_ms,
-                    http_timeout=max(timeout, flaresolverr_timeout_ms / 1000 + 10),
-                    max_bytes=max_bytes,
-                )
-                return {
-                    "url": url,
-                    "status": fs_status,
-                    "content_type": "text/html",
-                    "text": fs_html,
-                    "bytes": None,
-                    "via": "flaresolverr",
-                    # Flag the result if FlareSolverr's page is itself a wall
-                    # (interactive challenge it couldn't solve) rather than the
-                    # recovered content.
-                    "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
-                }
-            except Exception as fe:
-                raise RuntimeError(
-                    f"Both direct and FlareSolverr fetches failed: {e!r} / {fe!r}"
-                )
-        raise
-
-    # Office/OpenDocument content-types contain the substring "xml" (e.g.
-    # application/vnd.openxmlformats-officedocument...), so the loose checks
-    # below would mis-classify them as text and corrupt the bytes via UTF-8
-    # decode. Documents we hand to Tika must stay binary — detected by
-    # content-type/extension OR by a magic-byte sniff, which also catches a
-    # document mislabelled with a text/* or octet-stream content-type.
-    is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
-    sniffed_ctype = (
-        None
-        if is_document or _declared_textlike(ctype)
-        else _sniff_textlike_ctype(body, ctype)
-    )
-    is_textlike = (
-        not is_document
-        and (_declared_textlike(ctype) or sniffed_ctype is not None)
-    )
-    if sniffed_ctype:
-        ctype = sniffed_ctype
-
-    if not is_textlike:
-        return {
-            "url": url,
-            "status": status,
-            "content_type": ctype,
-            "text": None,
-            "bytes": body,
-            "via": "direct",
-            "blocked_detected": False,
-        }
-
-    text = _decode_body(body, ctype)
-
-    blocked = _is_blocked_response(status, text, headers)
-    if blocked and flaresolverr_url:
-        try:
-            fs_status, fs_headers, fs_html = await _flaresolverr_fetch(
-                url,
-                flaresolverr_url=flaresolverr_url,
-                max_timeout_ms=flaresolverr_timeout_ms,
-                http_timeout=max(timeout, flaresolverr_timeout_ms / 1000 + 10),
-                max_bytes=max_bytes,
-            )
-            # FlareSolverr returning a page isn't the same as a bypass: an
-            # interactive wall (PerimeterX "Press & Hold", a CAPTCHA) renders as
-            # an ordinary page it can't solve. Re-run detection on what it
-            # actually got so a still-walled result is flagged (and raised
-            # downstream) instead of returned as content.
-            return {
-                "url": url,
-                "status": fs_status,
-                "content_type": "text/html",
-                "text": fs_html,
-                "bytes": None,
-                "via": "flaresolverr",
-                "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
-            }
-        except Exception as fe:
-            return {
-                "url": url,
-                "status": status,
-                "content_type": ctype,
-                "text": text,
-                "bytes": None,
-                "via": "direct",
-                "blocked_detected": True,
-                "flaresolverr_error": str(fe),
-            }
-
-    return {
-        "url": url,
-        "status": status,
-        "content_type": ctype,
-        "text": text,
-        "bytes": None,
-        "via": "direct",
-        "blocked_detected": blocked,
-    }
-
-
-async def _cached_resilient_fetch(url: str) -> dict:
-    """``_resilient_fetch`` with a process-wide TTL cache keyed by URL.
-
-    Caching the raw fetch (rather than the formatted tool output) means a
-    re-fetch of the same URL — common in agent loops, and shared between
-    fetch_page and search_web enrichment — skips the network round-trip, while
-    each caller still formats the cached result for its own mode/section needs.
-    Only successful fetches are cached; a failure propagates and is not stored.
-    """
-    cached = _page_cache.get(url)
-    if cached is not None:
-        return cached
-
-    task = _page_inflight.get(url)
-    if task is None:
-        task = asyncio.create_task(
-            _resilient_fetch(
-                url,
-                timeout=cfg.http_timeout_seconds,
-                user_agent=cfg.user_agent,
-                verify_ssl=cfg.verify_ssl,
-                flaresolverr_url=cfg.flaresolverr_url or None,
-                flaresolverr_timeout_ms=cfg.flaresolverr_timeout_ms,
-                max_bytes=cfg.max_download_bytes,
-            )
-        )
-        _page_inflight[url] = task
-
-    try:
-        fetched = await asyncio.shield(task)
-    finally:
-        if _page_inflight.get(url) is task:
-            _page_inflight.pop(url, None)
-
-    _cache_page(url, fetched)
-    return fetched
-
-
 async def _direct_enrich_fetch(url: str) -> dict | None:
     """One direct, byte-capped enrichment fetch. Call via `_enrich_fetch`."""
     await _assert_url_allowed(url)
@@ -910,10 +802,9 @@ async def _enrich_fetch(url: str) -> dict | None:
 
     Enrichment wants a hit's title/description/heading outline — all in the
     document head — not its whole body, and it isn't worth a multi-second browser
-    render. So unlike `_cached_resilient_fetch` this:
+    render. Unlike fetch_page's acquisition pipeline this:
 
-    * reuses an already-cached full fetch when one exists (so a later
-      ``fetch_page`` read and this share a download), but
+    * reuses an already-cached accepted artifact when one exists, but
     * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
       fetch through the same SSRF-guarded redirect path — and **skips** the
       FlareSolverr and Firecrawl fallbacks, so one bot-walled result among the top
@@ -927,15 +818,6 @@ async def _enrich_fetch(url: str) -> dict | None:
     cached = _page_cache.get(url)
     if cached is not None:
         return cached
-
-    # If a full fetch_page read for this URL is already in progress, use it
-    # rather than starting a second direct download. That preserves fetch_page's
-    # richer fallback behavior and shares the final raw result.
-    full_task = _page_inflight.get(url)
-    if full_task is not None:
-        fetched = await asyncio.shield(full_task)
-        _cache_page(url, fetched)
-        return fetched
 
     task = _enrich_inflight.get(url)
     if task is None:
@@ -952,17 +834,9 @@ async def _enrich_fetch(url: str) -> dict | None:
 async def _render_with_flaresolverr(url: str) -> dict:
     """Force a FlareSolverr (real-browser, JS-executing) render of `url`.
 
-    Unlike `_resilient_fetch`, this skips the direct httpx attempt and renders
-    straight through FlareSolverr. It's the second attempt a caller makes when a
-    direct fetch *succeeded* but came back with no extractable content — the
-    signature of a client-side-rendered SPA whose body the static fetch can't
-    see. Returns the same raw-fetch dict shape as `_resilient_fetch`.
-
-    The URL is SSRF-guarded first (FlareSolverr runs a real browser, so it must
-    be gated like any other fetch path). On a usable render (text present and not
-    itself a wall) the result replaces any cached direct fetch for this URL, so
-    later fetches and search enrichment reuse the rendered page. Raises if
-    FlareSolverr isn't configured or the render call fails.
+    This is a transport operation only. The URL is SSRF-guarded first; page_acquire
+    applies the shared quality gate and decides whether to accept/cache the HTML
+    or continue to Firecrawl. Raises if FlareSolverr is unavailable or fails.
     """
     flaresolverr_url = cfg.flaresolverr_url or None
     if not flaresolverr_url:
@@ -982,15 +856,15 @@ async def _render_with_flaresolverr(url: str) -> dict:
         "text": fs_html,
         "bytes": None,
         "via": "flaresolverr",
-        "blocked_detected": _is_blocked_response(fs_status, fs_html, fs_headers),
+        "blocked_detected": False,
     }
-    if fs_html and not result["blocked_detected"]:
-        _cache_page(url, result)
+    # Acceptance and caching belong to page_acquire; a transport-level API
+    # success can still be a challenge page.
     return result
 
 
 # ---------------------------------------------------------------------------
-# Firecrawl fallback
+# Firecrawl browser transport
 # ---------------------------------------------------------------------------
 
 async def _firecrawl_fetch(
@@ -1000,18 +874,18 @@ async def _firecrawl_fetch(
     api_key: str,
     timeout_seconds: float,
     max_bytes: int = 0,
+    output_format: str = "html",
 ) -> tuple[int, str, str, str | None]:
-    """Render one URL through Firecrawl's synchronous v2 scrape endpoint.
+    """Scrape one URL through Firecrawl's synchronous v2 endpoint.
 
-    The response is requested as rendered HTML so fetch_page can keep using its
-    existing BeautifulSoup extraction for text, structured metadata, sections,
-    and query filtering. The JSON envelope and returned HTML both obey the same
-    download cap as the direct and FlareSolverr paths.
+    HTML is the normal browser-page format. ``markdown`` is used only to recover
+    a known document whose direct download returned an HTML challenge. The JSON
+    envelope and extracted content both obey the configured download cap.
     """
     timeout_ms = max(1000, min(300000, int(timeout_seconds * 1000)))
     payload = {
         "url": url,
-        "formats": ["html"],
+        "formats": [output_format],
         "onlyMainContent": False,
         "timeout": timeout_ms,
     }
@@ -1055,10 +929,10 @@ async def _firecrawl_fetch(
     data = response_data.get("data")
     if not isinstance(data, dict):
         raise RuntimeError("Firecrawl response did not contain a data object.")
-    html = data.get("html")
-    if not isinstance(html, str) or not html:
-        raise RuntimeError("Firecrawl returned no rendered HTML.")
-    if max_bytes and len(html.encode("utf-8")) > max_bytes:
+    content = data.get(output_format)
+    if not isinstance(content, str) or not content:
+        raise RuntimeError(f"Firecrawl returned no {output_format} content.")
+    if max_bytes and len(content.encode("utf-8")) > max_bytes:
         raise DownloadTooLargeError(
             f"Rendered response from {url!r} exceeds the configured "
             f"{max_bytes}-byte download cap."
@@ -1069,19 +943,22 @@ async def _firecrawl_fetch(
         status = int(metadata.get("statusCode") or 200)
     except (TypeError, ValueError):
         status = 200
-    content_type = str(metadata.get("contentType") or "text/html")
+    content_type = str(
+        metadata.get("contentType")
+        or ("text/markdown" if output_format == "markdown" else "text/html")
+    )
     title = metadata.get("title")
     title = title.strip() if isinstance(title, str) and title.strip() else None
-    browser_error = _chromium_network_error_code(html)
+    browser_error = _chromium_network_error_code(content) if output_format == "html" else None
     if browser_error:
         raise BrowserRenderError(
             f"Firecrawl's browser could not load {url!r} ({browser_error})."
         )
-    return status, content_type, html, title
+    return status, content_type, content, title
 
 
 async def _render_with_firecrawl(url: str) -> dict:
-    """Fetch rendered HTML through Firecrawl after local fallbacks are exhausted."""
+    """Fetch rendered HTML through Firecrawl for page_acquire to assess."""
     api_url = cfg.firecrawl_api_url.strip()
     api_key = cfg.firecrawl_api_key.strip()
     if not api_url or not api_key:
@@ -1105,8 +982,39 @@ async def _render_with_firecrawl(url: str) -> dict:
         "bytes": None,
         "via": "firecrawl",
         "title": title,
-        "blocked_detected": _is_blocked_response(status, html, {}),
+        "blocked_detected": False,
     }
-    if html and status < 400 and not result["blocked_detected"]:
-        _cache_page(url, result)
+    # page_acquire applies the shared quality gate before caching this result.
     return result
+
+
+async def _render_document_with_firecrawl(url: str) -> dict:
+    """Recover text for a directly blocked document through Firecrawl's parser."""
+    api_url = cfg.firecrawl_api_url.strip()
+    api_key = cfg.firecrawl_api_key.strip()
+    if not api_url or not api_key:
+        raise RuntimeError(
+            "Firecrawl is not configured (set WEB_SEARCH_FIRECRAWL_API_KEY)."
+        )
+    await _assert_url_allowed(url)
+    status, _content_type, text, title = await _firecrawl_fetch(
+        url,
+        api_url=api_url,
+        api_key=api_key,
+        timeout_seconds=cfg.firecrawl_timeout_seconds,
+        max_bytes=cfg.max_download_bytes,
+        output_format="markdown",
+    )
+    if status >= 400:
+        raise RuntimeError(f"Firecrawl received HTTP {status} for the document.")
+    return {
+        "url": url,
+        "status": status,
+        "content_type": "text/markdown",
+        "text": text,
+        "bytes": None,
+        "via": "firecrawl",
+        "title": title,
+        "blocked_detected": False,
+        "resource_kind": "document_text",
+    }
