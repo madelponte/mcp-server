@@ -708,14 +708,25 @@ async def _reddit_token() -> str:
         return _reddit_access_token
 
     async with httpx.AsyncClient(verify=cfg.verify_ssl) as client:
-        response = await client.post(
-            _REDDIT_TOKEN_URL,
-            auth=(client_id, client_secret),
-            data={"grant_type": "client_credentials"},
-            headers={"User-Agent": user_agent, "Accept": "application/json"},
-            timeout=cfg.http_timeout_seconds,
-        )
+        try:
+            response = await client.post(
+                _REDDIT_TOKEN_URL,
+                auth=(client_id, client_secret),
+                data={"grant_type": "client_credentials"},
+                headers={"User-Agent": user_agent, "Accept": "application/json"},
+                timeout=cfg.http_timeout_seconds,
+            )
+        except httpx.RequestError as exc:
+            raise RuntimeError(
+                f"Reddit OAuth network error: {exc.__class__.__name__} - {str(exc)[:200]}"
+            ) from exc
     if response.status_code >= 400:
+        # Distinguish auth failures from other server errors
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"Reddit OAuth authentication failed (HTTP {response.status_code}). "
+                "Check that client_id and client_secret are correct and the app is approved."
+            )
         raise RuntimeError(
             f"Reddit OAuth token endpoint returned HTTP {response.status_code}"
         )

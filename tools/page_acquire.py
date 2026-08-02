@@ -203,16 +203,25 @@ async def _firecrawl_document(url: str) -> tuple[dict | None, str | None]:
         return None, "Firecrawl is not configured"
     try:
         fetched = await _render_document_with_firecrawl(url)
-        assessment = await _assess(fetched, url)
-        if not _accepted(assessment):
-            return None, (
-                "Firecrawl document recovery was "
-                f"{assessment.verdict.value} ({assessment.reason})"
-            )
-        _cache_page(url, fetched)
-        return fetched, None
+    except RuntimeError as exc:
+        # Distinguish Firecrawl API errors from HTTP errors
+        exc_str = str(exc)
+        if "Firecrawl returned HTTP" in exc_str:
+            return None, f"Firecrawl document recovery failed: HTTP error ({exc_str})"
+        elif "Firecrawl is not configured" in exc_str or "Firecrawl returned" in exc_str:
+            return None, f"Firecrawl document recovery failed: API error ({exc_str})"
+        else:
+            return None, f"Firecrawl document recovery failed: {exc_str}"
     except Exception as exc:
-        return None, _error_detail(exc)
+        return None, f"Firecrawl document recovery failed: {type(exc).__name__} ({_error_detail(exc)})"
+    assessment = await _assess(fetched, url)
+    if not _accepted(assessment):
+        return None, (
+            "Firecrawl document recovery was "
+            f"{assessment.verdict.value} ({assessment.reason})"
+        )
+    _cache_page(url, fetched)
+    return fetched, None
 
 
 async def _delayed_firecrawl(
