@@ -784,17 +784,31 @@ def _reddit_oauth_requested() -> bool:
     )
 
 
-async def _acquire_reddit(url: str) -> tuple[dict, Any, str]:
+def _reddit_failure_trace(name: str, exc: BaseException) -> str:
+    """Bound one provider failure so a debug note cannot dominate the result."""
+    detail = " ".join((str(exc).strip() or type(exc).__name__).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return f"{name} failed ({detail})"
+
+
+async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
     """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
     errors: list[str] = []
+    trace: list[str] = []
 
     if _reddit_oauth_requested():
         try:
             fetched = await _fetch_reddit_oauth(url)
             parsed = json.loads(fetched.get("text") or "")
-            return fetched, _compact_reddit_json(parsed), "oauth"
+            trace.append("OAuth JSON succeeded")
+            return fetched, _compact_reddit_json(parsed), "oauth", trace
         except Exception as exc:
-            errors.append(f"OAuth JSON: {str(exc).strip() or type(exc).__name__}")
+            failure = _reddit_failure_trace("OAuth JSON", exc)
+            errors.append(failure)
+            trace.append(failure)
+    else:
+        trace.append("OAuth JSON skipped (not configured)")
 
     rss_url = _reddit_rss_url(url)
     try:
@@ -806,9 +820,12 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str]:
         )
         if compact is None:
             raise RuntimeError("feed contained no Reddit entries")
-        return fetched, compact, "rss"
+        trace.append("RSS succeeded")
+        return fetched, compact, "rss", trace
     except Exception as exc:
-        errors.append(f"RSS: {str(exc).strip() or type(exc).__name__}")
+        failure = _reddit_failure_trace("RSS", exc)
+        errors.append(failure)
+        trace.append(failure)
 
     old_url = _reddit_old_url(url)
     try:
@@ -820,9 +837,12 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str]:
         )
         if compact is None:
             raise RuntimeError("page contained no extractable Reddit entries")
-        return fetched, compact, "old_html"
+        trace.append("old.reddit HTML succeeded")
+        return fetched, compact, "old_html", trace
     except Exception as exc:
-        errors.append(f"old.reddit HTML: {str(exc).strip() or type(exc).__name__}")
+        failure = _reddit_failure_trace("old.reddit HTML", exc)
+        errors.append(failure)
+        trace.append(failure)
 
     if _is_reddit_post_url(url):
         oembed_url = _reddit_oembed_url(url)
@@ -830,9 +850,12 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str]:
             fetched = await _acquire_page(oembed_url)
             if fetched.get("status", 0) >= 400:
                 raise RuntimeError(f"HTTP {fetched['status']}")
-            return fetched, json.loads(fetched.get("text") or ""), "oembed"
+            trace.append("oEmbed succeeded")
+            return fetched, json.loads(fetched.get("text") or ""), "oembed", trace
         except Exception as exc:
-            errors.append(f"oEmbed: {str(exc).strip() or type(exc).__name__}")
+            failure = _reddit_failure_trace("oEmbed", exc)
+            errors.append(failure)
+            trace.append(failure)
 
     raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
 
@@ -1012,7 +1035,7 @@ async def _fetch_one(
     reddit_request = _is_reddit_url(url)
     if reddit_request:
         try:
-            fetched, compact, reddit_source = await _acquire_reddit(url)
+            fetched, compact, reddit_source, reddit_trace = await _acquire_reddit(url)
         except Exception as exc:
             backend_passwords = tuple(
                 urlparse(endpoint).password or ""
@@ -1065,6 +1088,25 @@ async def _fetch_one(
                 "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
                 "returning official oEmbed post metadata without comments.",
             )
+        if debug_enabled():
+            backend_passwords = tuple(
+                urlparse(endpoint).password or ""
+                for endpoint in (
+                    cfg.flaresolverr_url,
+                    cfg.firecrawl_api_url,
+                    cfg.tika_url,
+                    cfg.classifier_api_url,
+                )
+                if endpoint
+            )
+            trace_note = redact_secrets(
+                "Reddit fallback trace: " + "; ".join(reddit_trace) + ".",
+                cfg.reddit_client_secret,
+                cfg.firecrawl_api_key,
+                cfg.classifier_api_key,
+                *backend_passwords,
+            )
+            payload["note"] = _join_note(payload.get("note"), trace_note)
         return payload
 
     fetch_url = url

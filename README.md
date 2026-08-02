@@ -284,8 +284,11 @@ raise tool errors instead of being returned as successful sends.
 
 Set `MCP_DEBUG=true` to enable debug mode: tool responses are serialized as
 indented, human-readable JSON (instead of compact JSON) and each tool call emits
-verbose per-call logs to stdout. Useful for troubleshooting; leave it off in
-normal operation so responses stay compact in the model's context window.
+verbose per-call logs to stdout. Reddit `fetch_page` results also append a
+redacted fallback trace to `note`, showing whether OAuth JSON, RSS, old Reddit,
+and oEmbed were skipped, failed, or succeeded. Useful for troubleshooting; leave
+it off in normal operation so responses stay compact in the model's context
+window.
 
 ### Tool-name prefix in cross-references
 

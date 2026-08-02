@@ -361,6 +361,7 @@ def test_reddit_oauth_json_compacted(monkeypatch, tool_fns, patch_httpx):
 
 def test_reddit_without_oauth_uses_rss(monkeypatch, tool_fns):
     calls = []
+    monkeypatch.setattr(fp.server_settings, "debug", False)
     rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
       <author><name>/u/poster</name></author><content type="html">&lt;div class="md"&gt;&lt;p&gt;RSS body&lt;/p&gt;&lt;/div&gt;</content>
       <id>t3_abc</id><link href="https://reddit.com/comments/abc"/><updated>2026-01-01T00:00:00Z</updated><title>RSS title</title>
@@ -377,6 +378,37 @@ def test_reddit_without_oauth_uses_rss(monkeypatch, tool_fns):
     assert calls == ["https://www.reddit.com/r/python/comments/abc/title/.rss"]
     assert json.loads(out["content"])["post"]["title"] == "RSS title"
     assert "RSS feed" in out["note"]
+    assert "fallback trace" not in out["note"]
+
+
+def test_reddit_debug_note_traces_and_redacts_fallbacks(monkeypatch, tool_fns):
+    secret = "super-secret-reddit-value"
+    monkeypatch.setattr(fp.server_settings, "debug", True)
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
+    monkeypatch.setattr(fp.cfg, "reddit_client_secret", secret)
+    monkeypatch.setattr(
+        fp.cfg, "reddit_user_agent", "linux:mcp-server:1.0 (by /u/tester)"
+    )
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <author><name>/u/poster</name></author><content type="html">&lt;div class="md"&gt;&lt;p&gt;RSS body&lt;/p&gt;&lt;/div&gt;</content>
+      <id>t3_abc</id><link href="https://reddit.com/comments/abc"/><updated>2026-01-01T00:00:00Z</updated><title>RSS title</title>
+    </entry></feed>"""
+
+    async def oauth_failure(url):
+        raise RuntimeError(f"credential {secret} was rejected")
+
+    async def acquire(url):
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    monkeypatch.setattr(fp, "_fetch_reddit_oauth", oauth_failure)
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert "Reddit fallback trace:" in out["note"]
+    assert "OAuth JSON failed (credential REDACTED was rejected)" in out["note"]
+    assert "RSS succeeded" in out["note"]
+    assert secret not in out["note"]
 
 
 def test_reddit_rss_failure_uses_old_html(monkeypatch, tool_fns):
