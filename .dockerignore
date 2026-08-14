@@ -31,7 +31,7 @@ requirements-dev.txt
 
 # Docs / CI / compose (not used inside the image)
 README.md
-CLAUDE.md
+AGENTS.md
 .github/
 docker-compose.yml
 Dockerfile

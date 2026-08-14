@@ -8,7 +8,7 @@ listing, or deletion surface.
 
 `smtplib` is a blocking, synchronous library, so the actual send runs in a
 worker thread via `anyio.to_thread.run_sync` to avoid stalling the event loop
-(see the "Sync libraries in async tools" convention in CLAUDE.md).
+(see the "Sync libraries in async tools" convention in AGENTS.md).
 """
 
 import logging
@@ -346,7 +346,7 @@ def register(mcp: FastMCP) -> None:
             )
 
         # Clamp to the configured cap (a context/abuse guard). Over-cap addresses
-        # are dropped and reported rather than sent — see CLAUDE.md caps convention.
+        # are dropped and reported rather than sent — see AGENTS.md caps convention.
         over_limit_dropped: list[dict] = []
         if len(entries) > cfg.max_recipients:
             over_limit_dropped = [
