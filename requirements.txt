@@ -2,7 +2,7 @@
 # fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
 fastmcp>=3.4.7
 starlette>=1.6.0
-uvicorn>=0.52.1
+uvicorn>=0.52.3
 
 # Config / settings
 pydantic>=2.13.4
@@ -29,7 +29,7 @@ regex>=2026.7.19
 
 # Stock Data
 requests>=2.34.2
-yfinance>=1.5.2
+yfinance>=1.6.0
 
 # YouTube Transcript
 youtube-transcript-api>=1.2.4
