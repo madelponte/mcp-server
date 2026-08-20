@@ -1,7 +1,10 @@
 """Tests for auth.py — the bearer-token ASGI middleware."""
 
+import logging
+
 import pytest
 
+import auth
 from auth import BearerAuthMiddleware
 from conftest import run
 
@@ -73,3 +76,50 @@ def test_correct_token_passes():
     run(mw(_http_scope(headers), receive, send))
     assert events[0]["status"] == 200
     assert events[1]["body"] == b"OK"
+
+
+def test_rejected_request_logs_a_warning_with_client_ip(caplog, monkeypatch):
+    """The first rejection is logged even when the monotonic clock's arbitrary
+    starting value is smaller than the throttle interval."""
+    monkeypatch.setattr(auth.time, "monotonic", lambda: 1.0)
+    mw = BearerAuthMiddleware(_dummy_app, TOKEN)
+    events, send, receive = _collect_sends()
+    scope = _http_scope([(b"authorization", b"Bearer wrong")])
+    scope["client"] = ("203.0.113.7", 51234)
+    with caplog.at_level(logging.WARNING, logger="auth"):
+        run(mw(scope, receive, send))
+    assert events[0]["status"] == 401
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert any("203.0.113.7" in m for m in warnings)
+
+
+def test_rejection_logging_is_throttled_and_counts_suppressed(caplog):
+    """A flood of rejections must not flood the log: the first is logged, the
+    rest counted, and the count reported with the next warning."""
+    mw = BearerAuthMiddleware(_dummy_app, TOKEN)
+    scope = _http_scope([(b"authorization", b"Bearer wrong")])
+    scope["client"] = ("203.0.113.7", 51234)
+
+    with caplog.at_level(logging.WARNING, logger="auth"):
+        for _ in range(3):
+            events, send, receive = _collect_sends()
+            run(mw(scope, receive, send))
+            assert events[0]["status"] == 401
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1  # first rejection logged, next two suppressed
+
+    # Rewind the throttle window: the next rejection logs again, with the
+    # suppressed count attached.
+    mw._last_reject_log -= auth._REJECT_LOG_INTERVAL + 1
+    with caplog.at_level(logging.WARNING, logger="auth"):
+        events, send, receive = _collect_sends()
+        run(mw(scope, receive, send))
+    warnings = [
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 2
+    assert "2 more suppressed" in warnings[1]

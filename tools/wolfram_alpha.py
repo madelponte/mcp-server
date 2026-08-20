@@ -51,6 +51,20 @@ def _http_client() -> httpx.AsyncClient:
     return client
 
 
+async def close_clients() -> None:
+    """Close every pooled Wolfram client and drop the pool.
+
+    Called from the server's lifespan shutdown (``server.run_http``); see
+    ``close_clients`` in ``web_fetch`` for the rationale.
+    """
+    for client in list(_http_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:
+            log.exception("Failed to close a shared Wolfram client.")
+    _http_clients.clear()
+
+
 # --------------------------- Response structuring ---------------------------
 #
 # The LLM API returns blank-line-separated blocks, each a "Label:" line followed

@@ -77,6 +77,22 @@ def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
     return client
 
 
+async def close_clients() -> None:
+    """Close every pooled direct-fetch client and drop the pool.
+
+    Called from the server's lifespan shutdown (``server.run_http``) so the
+    keep-alive connections are released on a graceful stop instead of only at
+    process exit. Safe to call when the pool is empty or a client is already
+    closed.
+    """
+    for client in list(_fetch_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:
+            log.exception("Failed to close a shared direct-fetch client.")
+    _fetch_clients.clear()
+
+
 # ---------------------------------------------------------------------------
 # Lean enrichment bot-wall detection
 #

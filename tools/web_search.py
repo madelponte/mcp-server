@@ -47,6 +47,20 @@ def _searxng_client(verify_ssl: bool) -> httpx.AsyncClient:
     return client
 
 
+async def close_clients() -> None:
+    """Close every pooled SearXNG client and drop the pool.
+
+    Called from the server's lifespan shutdown (``server.run_http``); see
+    ``close_clients`` in ``web_fetch`` for the rationale.
+    """
+    for client in list(_searxng_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:
+            log.exception("Failed to close a shared SearXNG client.")
+    _searxng_clients.clear()
+
+
 # The model-facing tool description. Built at registration time so the sibling
 # tool reference (fetch_page) carries the client's tool-name prefix — the same
 # prefix the model sees on that tool (see ServerSettings.tool_prefix). The

@@ -92,3 +92,160 @@ def test_tool_run_invokes_the_function(server):
     tool = run(server.get_tool("query_wolfram_alpha"))
     with pytest.raises(ToolError):
         run(tool.run({"query": ""}))
+
+
+def test_importing_server_has_no_module_level_mcp():
+    """Importing server loads config/tool modules but must not construct and
+    register a throwaway FastMCP instance before ``build_server`` is called."""
+    import server as server_mod
+
+    assert not hasattr(server_mod, "mcp")
+
+
+def test_build_server_still_registers_every_tool():
+    import server as server_mod
+
+    names = {t.name for t in _list_tools(server_mod.build_server())}
+    assert names == EXPECTED_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# Lifespan cleanup (graceful shutdown of the tool modules' httpx client pools)
+# ---------------------------------------------------------------------------
+
+
+def _drive_lifespan(app, messages):
+    """Drive one full lifespan exchange (startup + shutdown) against `app`."""
+
+    async def scenario():
+        queued = iter(messages)
+
+        async def receive():
+            return next(queued)
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await app({"type": "lifespan"}, receive, send)
+        return sent
+
+    return run(scenario())
+
+
+def test_lifespan_cleanup_runs_hooks_before_shutdown_reaches_inner_app():
+    from server import _LifespanCleanup
+
+    order = []
+
+    class Inner:
+        async def __call__(self, scope, receive, send):
+            startup = await receive()
+            assert startup["type"] == "lifespan.startup"
+            await send({"type": "lifespan.startup.complete"})
+            shutdown = await receive()
+            assert shutdown["type"] == "lifespan.shutdown"
+            order.append("inner")
+            await send({"type": "lifespan.shutdown.complete"})
+
+    async def hook():
+        order.append("hook")
+
+    sent = _drive_lifespan(
+        _LifespanCleanup(Inner(), hooks=(hook,)),
+        [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}],
+    )
+    assert order == ["hook", "inner"]
+    assert [m["type"] for m in sent] == [
+        "lifespan.startup.complete",
+        "lifespan.shutdown.complete",
+    ]
+
+
+def test_lifespan_cleanup_passes_non_lifespan_scopes_through():
+    from server import _LifespanCleanup
+
+    seen = []
+
+    async def inner(scope, receive, send):
+        seen.append(scope["type"])
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"OK"})
+
+    async def hook():
+        raise AssertionError("hooks must not run for non-lifespan scopes")
+
+    async def scenario():
+        async def receive():
+            return {"type": "http.request"}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        await _LifespanCleanup(inner, hooks=(hook,))(  # noqa: B027
+            {"type": "http", "headers": []}, receive, send
+        )
+        return sent
+
+    sent = run(scenario())
+    assert seen == ["http"]
+    assert sent[0]["status"] == 200
+
+
+def test_lifespan_cleanup_hook_failure_does_not_block_shutdown():
+    """A broken cleanup hook is logged, not raised: the shutdown message still
+    reaches the inner app so the server terminates cleanly."""
+    from server import _LifespanCleanup
+
+    delivered = []
+
+    async def inner(scope, receive, send):
+        startup = await receive()
+        assert startup["type"] == "lifespan.startup"
+        await send({"type": "lifespan.startup.complete"})
+        shutdown = await receive()
+        delivered.append(shutdown["type"])
+        await send({"type": "lifespan.shutdown.complete"})
+
+    async def bad_hook():
+        raise RuntimeError("boom")
+
+    _drive_lifespan(
+        _LifespanCleanup(inner, hooks=(bad_hook,)),
+        [{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}],
+    )
+    assert delivered == ["lifespan.shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("module_name", "pool_attr"),
+    [
+        ("web_fetch", "_fetch_clients"),
+        ("web_search", "_searxng_clients"),
+        ("geocoding", "_http_clients"),
+        ("wolfram_alpha", "_http_clients"),
+    ],
+)
+def test_close_clients_closes_every_client_and_clears_pool(module_name, pool_attr):
+    """Each client-owning module exposes the close_clients() hook that
+    server.run_http runs on lifespan shutdown."""
+    import importlib
+
+    mod = importlib.import_module(f"tools.{module_name}")
+    pool = getattr(mod, pool_attr)
+
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    fake = FakeClient()
+    pool["test"] = fake
+    run(mod.close_clients())
+    assert fake.closed
+    assert pool == {}

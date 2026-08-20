@@ -14,12 +14,24 @@ Or via Docker / docker-compose (see Dockerfile and docker-compose.yml).
 """
 
 import logging
+from collections.abc import Awaitable, Callable
 
 from fastmcp import FastMCP
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from auth import BearerAuthMiddleware
 from config import server_settings
-from tools import web_search, fetch_page, stock_data, wolfram_alpha, geocoding, email
+from tools import (
+    web_search,
+    fetch_page,
+    stock_data,
+    wolfram_alpha,
+    geocoding,
+    email,
+    web_fetch,
+)
+
+log = logging.getLogger(__name__)
 
 
 def build_server() -> FastMCP:
@@ -60,18 +72,53 @@ def build_server() -> FastMCP:
     return mcp
 
 
-mcp = build_server()
+class _LifespanCleanup:
+    """Pure ASGI wrapper that runs async cleanup hooks on lifespan shutdown.
+
+    The tool modules pool their httpx clients at module scope for keep-alive;
+    without an explicit close those connections are only released when the
+    process exits. This wrapper intercepts the lifespan *shutdown* message,
+    runs each cleanup hook, then forwards the message to the inner app. It
+    wraps ``receive`` rather than driving the protocol itself, so the inner
+    app keeps full control of the lifespan exchange. Non-lifespan scopes
+    (every actual request) pass straight through untouched.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        hooks: tuple[Callable[[], Awaitable[None]], ...],
+    ) -> None:
+        self.app = app
+        self.hooks = hooks
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "lifespan":
+            await self.app(scope, receive, send)
+            return
+
+        async def receiving():
+            message = await receive()
+            if message["type"] == "lifespan.shutdown":
+                for hook in self.hooks:
+                    try:
+                        await hook()
+                    except Exception:
+                        log.exception(
+                            "Lifespan cleanup hook %s failed", hook.__name__
+                        )
+            return message
+
+        await self.app(scope, receiving, send)
 
 
-def run_http(transport: str) -> None:
+def run_http(mcp: FastMCP, transport: str) -> None:
     """Serve an HTTP transport, optionally gated by a bearer token.
 
     Builds FastMCP's Starlette app ourselves (instead of ``mcp.run()``) so we
     can wrap it with ``BearerAuthMiddleware`` before handing it to uvicorn.
     """
     import uvicorn
-
-    log = logging.getLogger(__name__)
 
     # FastMCP v3 unifies app construction under http_app(transport=...); the
     # 1.0 streamable_http_app()/sse_app() helpers are gone. The streamable-http
@@ -80,6 +127,19 @@ def run_http(transport: str) -> None:
         app = mcp.http_app(transport="sse")
     else:  # streamable-http
         app = mcp.http_app(transport="streamable-http")
+
+    # Close the tool modules' shared httpx client pools on graceful shutdown
+    # (uvicorn delivers the lifespan shutdown message before exit). The stdio
+    # transport has no lifespan surface and relies on process exit.
+    app = _LifespanCleanup(
+        app,
+        hooks=(
+            web_fetch.close_clients,
+            web_search.close_clients,
+            geocoding.close_clients,
+            wolfram_alpha.close_clients,
+        ),
+    )
 
     token = server_settings.auth_token
     if token:
@@ -107,7 +167,11 @@ if __name__ == "__main__":
             f"Unsupported MCP_TRANSPORT={transport!r}. "
             "Use 'streamable-http', 'sse', or 'stdio'."
         )
-    log = logging.getLogger(__name__)
+
+    # The FastMCP instance is built here, not at module import time, so scripts
+    # like show_tool.py don't pay for a throwaway build. Configuration singletons
+    # are still loaded when config and the tool modules are imported.
+    mcp = build_server()
     log.info(
         "Starting MCP server (transport=%s, host=%s, port=%s)",
         transport,
@@ -119,4 +183,4 @@ if __name__ == "__main__":
         # No network surface — bearer auth doesn't apply.
         mcp.run(transport="stdio")
     else:
-        run_http(transport)
+        run_http(mcp, transport)
