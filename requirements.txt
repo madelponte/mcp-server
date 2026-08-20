@@ -2,7 +2,7 @@
 # fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
 fastmcp>=3.4.7
 starlette>=1.6.0
-uvicorn>=0.52.3
+uvicorn>=0.52.4
 
 # Config / settings
 pydantic>=2.13.4
@@ -22,7 +22,7 @@ zstandard>=0.25.0
 
 # Agentic Web Search
 beautifulsoup4>=4.15.0
-lxml>=6.1.1
+lxml>=6.1.2
 markdownify>=1.2.3
 # Timeout-capable regex engine for model-supplied fetch_page query patterns.
 regex>=2026.7.19
