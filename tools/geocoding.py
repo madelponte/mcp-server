@@ -63,6 +63,20 @@ def _http_client() -> httpx.AsyncClient:
         _http_clients[key] = client
     return client
 
+
+async def close_clients() -> None:
+    """Close every pooled OSM client and drop the pool.
+
+    Called from the server's lifespan shutdown (``server.run_http``); see
+    ``close_clients`` in ``web_fetch`` for the rationale.
+    """
+    for client in list(_http_clients.values()):
+        try:
+            await client.aclose()
+        except Exception:
+            log.exception("Failed to close a shared OSM client.")
+    _http_clients.clear()
+
 # Error convention: every genuine failure raises ToolError, which FastMCP turns
 # into a result with `isError: true`, so a model can't mistake a failure for a
 # real place. A valid-but-empty result (a search that found nothing) is NOT a
