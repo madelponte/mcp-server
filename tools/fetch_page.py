@@ -75,6 +75,14 @@ def _fetch_page_desc(prefix: str) -> str:
         "URLs you can fetch). A YouTube video URL is detected automatically and "
         "returns the video's transcript. The parameters below are optional "
         "refinements — omit them all to get the whole page.\n\n"
+        "PAGE OUTLINE / SECTION WORKFLOW:\n"
+        "If a " + prefix + "search_web result already has page_headings/page_toc "
+        "from enrich_results, you can use one of those headings with section= to read only "
+        "that part. If the result was not enriched, or the user supplied a URL "
+        "directly, you can call this tool with mode=\"structured\" to get the page's "
+        "headings/toc without fetching the full text; then call it again with "
+        "section=<heading> (and the default text mode) to read only that section. "
+        "Do not fetch the outline first when you already have it.\n\n"
         "OPTIONAL PARAMETERS (leave unset unless you need them):\n"
         "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
         "passages that match, instead of the full page. On a YouTube transcript it "
@@ -82,7 +90,8 @@ def _fetch_page_desc(prefix: str) -> str:
         "• section — a heading's text. Returns only the content under that "
         "heading (in structured mode, only that section's sub-headings/toc).\n"
         '• mode — "text" (the default) returns the page content; "structured" '
-        "returns only metadata (title, description, headings, toc, JSON-LD).\n"
+        "returns the page outline and metadata (title, description, headings, toc, "
+        "JSON-LD).\n"
         "• offset — for CONTINUING a long page only. If a result comes back marked "
         '"truncated", call again with offset set to the "next_offset" value from '
         "that result to read the next chunk. Do NOT set it on a first fetch. It "
@@ -1389,7 +1398,8 @@ def register(mcp: FastMCP) -> None:
 
         :param url: One http/https URL to read.
         :param mode: "text" (default; returns the page content) or "structured"
-            (returns only metadata). Omit for "text".
+            (returns the page outline and metadata, including headings/toc). Omit
+            for "text".
         :param section: Optional. A heading's text to return only that section.
             Omit to get the whole page.
         :param query: Optional. A keyword/phrase or regex; returns only the
