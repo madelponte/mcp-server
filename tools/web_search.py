@@ -12,7 +12,9 @@ Translated from the Open WebUI tool; status/citation event emitters were removed
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
+import time
 from typing import Annotated
 from urllib.parse import urlparse
 
@@ -35,6 +37,41 @@ log = logging.getLogger(__name__)
 # client class is part of the key so tests that monkeypatch httpx.AsyncClient get
 # a fresh mock-backed client.
 _searxng_clients: dict[tuple[int, bool, int], httpx.AsyncClient] = {}
+
+
+# Simultaneous tool calls are useful to the client, but forwarding their SearXNG
+# requests as a burst quickly rate-limits the upstream search engines. Queue the
+# backend requests process-wide, keep each slot until its response finishes, and
+# leave a configurable quiet period before the next queued request starts.
+class _SearXNGRequestQueue:
+    """Serialize SearXNG requests and delay between completed responses."""
+
+    def __init__(self) -> None:
+        self._lock = anyio.Lock()
+        self._next_request_at = 0.0
+
+    @asynccontextmanager
+    async def request_slot(self, delay_seconds: float):
+        """Yield one exclusive backend slot after any required quiet period.
+
+        A zero delay disables queueing for self-hosted instances that can safely
+        accept concurrent searches.
+        """
+        if delay_seconds <= 0:
+            yield
+            return
+
+        async with self._lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
+                await anyio.sleep(wait)
+            try:
+                yield
+            finally:
+                self._next_request_at = time.monotonic() + delay_seconds
+
+
+_searxng_request_queue = _SearXNGRequestQueue()
 
 
 def _searxng_client(verify_ssl: bool) -> httpx.AsyncClient:
@@ -72,10 +109,10 @@ def _search_web_desc(prefix: str) -> str:
         "Results include url/title/snippet + optional page metadata (headings, "
         "description) for top results. Then use " + prefix + "fetch_page to read "
         "full content.\n\n"
-        "Query: short keywords only (not sentences). Search operators are "
-        "supported and sharpen results — use them when they fit: site:domain.com "
-        '(restrict to one site), "exact phrase" (quoted), -word (exclude a term), '
-        "term OR term (alternatives), filetype:pdf (a file type). time_range: "
+        "Query: concise keywords, not sentences. Combine operators when useful: "
+        'site:example.com (domain), "exact phrase", -exclude (omit term), foo OR bar '
+        "(either; uppercase OR), filetype:pdf (format), intitle:word (title), "
+        "inurl:word (URL). time_range: "
         '"day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|'
         '"it"|"social media"|"videos"|"map" '
         "(comma-separate).\n"
@@ -172,6 +209,7 @@ async def _searxng_query(
     verify_ssl: bool,
     user_agent: str,
     page: int = 1,
+    request_delay_seconds: float = 0.0,
 ) -> list[dict]:
     """Run a SearXNG JSON query and return [{url, title, snippet, engine}]."""
     params = {"q": query, "format": "json", "safesearch": str(safe_search)}
@@ -187,7 +225,8 @@ async def _searxng_query(
     url = base_url.rstrip("/") + "/search"
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
     client = _searxng_client(verify_ssl)
-    resp = await client.get(url, params=params, headers=headers, timeout=timeout)
+    async with _searxng_request_queue.request_slot(request_delay_seconds):
+        resp = await client.get(url, params=params, headers=headers, timeout=timeout)
     if resp.status_code == 403:
         raise RuntimeError(
             "SearXNG returned 403. Make sure `search.formats` in its settings.yml "
@@ -268,8 +307,8 @@ def register(mcp: FastMCP) -> None:
         """Search the web. The model-facing guidance lives in the
         @mcp.tool(description=...) above.
 
-        :param query: Keywords (operators supported: site:, "phrase", -exclude,
-            OR, filetype:).
+        :param query: Concise keywords; combine operators: site:, "exact phrase",
+            -exclude, foo OR bar, filetype:, intitle:, inurl:.
         :param time_range: Recency filter.
         :param category: Category (comma-separate).
         :param page: Result page number (1-based; default 1).
@@ -329,6 +368,7 @@ def register(mcp: FastMCP) -> None:
                 verify_ssl=cfg.verify_ssl,
                 user_agent=cfg.user_agent,
                 page=resolved_page,
+                request_delay_seconds=cfg.searxng_request_delay_seconds,
             )
         except Exception as e:
             backend_password = urlparse(cfg.searxng_url).password or ""

@@ -29,6 +29,33 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
+def test_search_web_documents_common_operators(server):
+    tool = _tool_by_name(server, "search_web")
+    examples = (
+        "site:example.com",
+        '"exact phrase"',
+        "-exclude",
+        "foo OR bar",
+        "filetype:pdf",
+        "intitle:word",
+        "inurl:word",
+    )
+    for example in examples:
+        assert example in tool.description
+
+    query_desc = tool.to_mcp_tool().inputSchema["properties"]["query"]["description"]
+    for operator in (
+        "site:",
+        '"exact phrase"',
+        "-exclude",
+        " OR ",
+        "filetype:",
+        "intitle:",
+        "inurl:",
+    ):
+        assert operator in query_desc
+
+
 def _tool_by_name(server, name):
     return next(t for t in _list_tools(server) if t.name == name)
 

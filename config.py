@@ -89,6 +89,13 @@ class WebSearchSettings(BaseSettings):
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
     )
+    searxng_request_delay_seconds: float = Field(
+        1.0, ge=0,
+        description=(
+            "Delay between sequential SearXNG requests, measured from one "
+            "completed response to the next request start. 0 disables queueing."
+        ),
+    )
     # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
     # the model request fewer results / less enrichment per call; anything above
     # these caps is clamped down so an oversized response (or a pile of

@@ -51,6 +51,15 @@ def test_zero_download_cap_is_still_valid(monkeypatch):
     assert WebSearchSettings().max_download_bytes == 0
 
 
+def test_searxng_request_delay_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "0")
+    assert WebSearchSettings().searxng_request_delay_seconds == 0
+
+
 def test_classifier_confidence_must_be_in_unit_interval(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_CLASSIFIER_MIN_CONFIDENCE", "1.5")
     with pytest.raises(ValidationError):
