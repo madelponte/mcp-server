@@ -95,7 +95,7 @@ def test_text_mode_markdown(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
     assert out["format"] == "markdown"
     assert out["title"] == "My Title"
-    assert "# Heading" in out["content"]
+    assert "# Heading {#cite-heading}" in out["content"]
     assert "Body text here." in out["content"]
 
 
@@ -213,8 +213,26 @@ def test_section_extraction(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com", section="Details")))
     assert out["format"] == "section"
     assert out["matched_heading"] == "Details"
+    assert out["anchor"] == "cite-details"
+    assert out["content"].startswith("# Details {#cite-details}")
     assert "the detail paragraph" in out["content"]
     assert "ending" not in out["content"]
+
+
+def test_section_exposes_source_native_citation_url(monkeypatch, tool_fns):
+    html = '<h2 id="methods">Methods</h2><p>Method details.</p><h2>End</h2>'
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/paper", section="Methods"
+            )
+        )
+    )
+    assert out["anchor"] == "methods"
+    assert out["source_fragment"] == "methods"
+    assert out["citation_url"] == "https://example.com/paper#methods"
+    assert out["content"].startswith("# Methods {#methods}")
 
 
 def test_section_not_found_raises_with_available(monkeypatch, tool_fns):
@@ -233,7 +251,73 @@ def test_query_filters_matching_passages(monkeypatch, tool_fns):
     assert out["query"] == "dog"
     assert out["match_count"] >= 1
     assert "dog ran fast" in out["content"]
+    assert out["line_numbering"] == "1-based nonblank lines in searched content"
+    assert out["match_metadata"][0]["match_lines"] == [2]
+    assert out["match_metadata"][0]["match_quality"] == "literal_substring"
     assert "note" not in out
+
+
+def test_query_result_keeps_nearest_heading_anchor(monkeypatch, tool_fns):
+    html = (
+        '<article><h2 id="results">Results</h2>'
+        '<p>Context one.</p><p>Context two.</p><p>The target value is 42.</p>'
+        '</article>'
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/paper",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert "## Results {#results}" in out["content"]
+    assert "The target value is 42" in out["content"]
+    assert out["context_lines"] == 0
+    assert out["match_metadata"][0]["heading"] == {
+        "level": 2,
+        "text": "Results",
+        "anchor": "results",
+        "source_fragment": "results",
+        "citation_url": "https://example.com/paper#results",
+        "line": 1,
+    }
+    assert out["matching_toc"] == [{
+        "label": "Results",
+        "anchor": "results",
+        "citation_url": "https://example.com/paper#results",
+        "match_count": 1,
+        "windows": [1],
+    }]
+
+
+def test_query_controls_max_match_windows(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "max_query_matches", 3)
+    monkeypatch.setattr(fp.cfg, "max_query_context_lines", 4)
+    html = "<article>" + "".join(
+        f"<p>{text}</p>"
+        for text in (
+            "target one", "a", "b", "target two", "c", "d", "target three"
+        )
+    ) + "</article>"
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com",
+                query="target",
+                max_matches=1,
+                context_lines=0,
+            )
+        )
+    )
+    assert out["sections"] == 1
+    assert len(out["match_metadata"]) == 1
+    assert out["match_count"] == 3
+    assert "showing the first 1" in out["note"]
 
 
 def test_query_no_match_raises(monkeypatch, tool_fns):
@@ -265,6 +349,32 @@ def test_document_routed_to_tika(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report.pdf")))
     assert out["format"] == "document_text"
     assert out["content"] == "Extracted PDF text."
+
+
+def test_document_query_matching_toc_uses_line_ranges(monkeypatch, tool_fns):
+    _patch_fetch(
+        monkeypatch,
+        _fetched(content_type="application/pdf", body=b"%PDF-1.4..."),
+    )
+    monkeypatch.setattr(
+        fp, "_tika_extract", lambda data, url, **kw: "intro\nnotes\ntarget result\nend"
+    )
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/report.pdf",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert out["match_metadata"][0]["match_lines"] == [3]
+    assert out["matching_toc"] == [{
+        "label": "Lines 3-3",
+        "match_count": 1,
+        "windows": [1],
+    }]
 
 
 def test_firecrawl_recovered_document_text_skips_tika(monkeypatch, tool_fns):
@@ -555,6 +665,34 @@ def test_youtube_url_returns_transcript(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")))
     assert out["format"] == "youtube_transcript"
     assert "hello world" in out["content"]
+
+
+def test_youtube_query_matching_toc_uses_timestamps(monkeypatch, tool_fns):
+    async def fake_transcript(url, force_timestamps=False):
+        assert force_timestamps is True
+        return (
+            "Transcript for YouTube video abc\n---\n"
+            "[0:10] introduction\n[1:25] target phrase\n[2:00] ending"
+        )
+
+    monkeypatch.setattr(fp, "fetch_transcript", fake_transcript)
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert out["match_metadata"][0]["match_lines"] == [2]
+    assert out["matching_toc"] == [{
+        "label": "Transcript at 1:25",
+        "timestamp": "1:25",
+        "match_count": 1,
+        "windows": [1],
+    }]
 
 
 def test_youtube_transcript_uses_truncation(monkeypatch, tool_fns):

@@ -212,10 +212,30 @@ def test_structured_from_html_combines_fields():
     assert out["url"] == "https://example.com"
     assert out["title"] == "My Page"
     assert out["description"] == "Desc"
-    assert {"level": 1, "text": "Heading"} in out["headings"]
+    assert out["headings"][0] == {
+        "level": 1,
+        "text": "Heading",
+        "anchor": "cite-heading",
+    }
     assert out["jsonld"] == [{"@type": "Article", "headline": "H"}]
     # toc is the heading outline (the real table of contents), not the JSON-LD headline.
     assert out["toc"] == ["Heading"]
+
+
+def test_structured_headings_preserve_source_fragment_and_citation_url():
+    html = '<h2 id="Install-v2">Install</h2><h2>Usage</h2><h2>Usage</h2>'
+    out = _structured_from_html(html, "https://example.com/guide?lang=en#old")
+    assert out["headings"] == [
+        {
+            "level": 2,
+            "text": "Install",
+            "anchor": "Install-v2",
+            "source_fragment": "Install-v2",
+            "citation_url": "https://example.com/guide?lang=en#Install-v2",
+        },
+        {"level": 2, "text": "Usage", "anchor": "cite-usage"},
+        {"level": 2, "text": "Usage", "anchor": "cite-usage-2"},
+    ]
 
 
 def test_structured_from_html_no_jsonld_is_none():
@@ -262,6 +282,9 @@ def test_structured_section_scopes_to_subtree():
     assert out["section"] == "Implementations"
     assert [h["text"] for h in out["headings"]] == ["Implementations", "Reference", "Other"]
     assert out["toc"] == ["Implementations", "Reference", "Other"]
+    assert [h["anchor"] for h in out["headings"]] == [
+        "cite-implementations", "cite-reference", "cite-other"
+    ]
 
 
 def test_structured_section_leaf_section_is_just_itself():
@@ -307,6 +330,11 @@ def test_plain_text_collapses_blank_lines():
     assert "\n\n\n" not in out
 
 
+def test_plain_text_includes_heading_citation_anchor():
+    out = _plain_text_from_html('<main><h2 id="facts">Facts</h2><p>Body.</p></main>')
+    assert "Facts {#facts}" in out
+
+
 def test_plain_text_keeps_image_marker_at_original_location():
     html = (
         '<main><p>Before.</p><img src="chart.png" alt="Quarterly sales chart">'
@@ -327,6 +355,14 @@ def test_markdown_keeps_headings_and_resolves_links():
     out = _markdown_from_html(html, "https://example.com/base/")
     assert "# Title" in out
     assert "https://example.com/page" in out
+    assert "# Title {#cite-title}" in out
+
+
+def test_markdown_preserves_source_heading_id_and_generates_missing_anchor():
+    html = '<main><h1 id="intro">Introduction</h1><h2>Details &amp; Usage</h2></main>'
+    out = _markdown_from_html(html, "https://example.com/guide")
+    assert "# Introduction {#intro}" in out
+    assert "## Details & Usage {#cite-details-usage}" in out
 
 
 def test_markdown_drops_unfollowable_links_keeping_text():
@@ -472,7 +508,18 @@ def test_find_section_exact_match_collects_until_next_equal_heading():
     assert "Second method." in out["text"]
     assert "Sub detail." in out["text"]  # nested h3 is included
     assert "Results paragraph." not in out["text"]  # next h2 stops it
+    assert out["anchor"] == "cite-methods"
+    assert "## Subsection {#cite-subsection}" in out["text"]
     assert out["next_heading"] == "Results"
+    assert out["next_heading_anchor"] == "cite-results"
+
+
+def test_find_section_preserves_source_fragment_citation_url():
+    html = '<h2 id="api">API Reference</h2><p>Methods.</p><h2>Next</h2>'
+    out = _find_section(_soup(html), "API Reference", "https://example.com/docs")
+    assert out["anchor"] == "api"
+    assert out["source_fragment"] == "api"
+    assert out["citation_url"] == "https://example.com/docs#api"
 
 
 def test_find_section_fuzzy_match():

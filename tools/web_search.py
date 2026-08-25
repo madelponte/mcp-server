@@ -107,8 +107,9 @@ def _search_web_desc(prefix: str) -> str:
     return (
         "Search the web. Use for unknown facts, current events, or verification.\n\n"
         "Results include url/title/snippet + optional page metadata (headings, "
-        "description) for top results. Then use " + prefix + "fetch_page to read "
-        "full content.\n\n"
+        "description) for top results. Enriched headings include stable anchors "
+        "and `citation_url` when the source provides a real fragment. Then use "
+        + prefix + "fetch_page to read full content.\n\n"
         "Query: concise keywords, not sentences. Combine operators when useful: "
         'site:example.com (domain), "exact phrase", -exclude (omit term), foo OR bar '
         "(either; uppercase OR), filetype:pdf (format), intitle:word (title), "

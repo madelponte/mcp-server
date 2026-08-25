@@ -7,6 +7,7 @@ import tools.serialize as serialize
 from tools.fetch_page import (
     _join_note,
     _set_content,
+    _resolve_query_control,
     _compile_query,
     _segment_text,
     _extract_matches,
@@ -92,11 +93,29 @@ def test_set_content_with_offset(monkeypatch):
     assert payload["offset"] == 5
 
 
+def test_set_content_offset_reports_nearest_heading_anchor():
+    content = "# Intro {#intro}\n\nfirst\n\n## Details {#cite-details}\n\nsecond"
+    offset = content.index("second")
+    payload = {}
+    _set_content(payload, content, offset=offset)
+    assert payload["content"] == "second"
+    assert payload["continuation_anchor"] == "cite-details"
+
+
 def test_set_content_offset_past_end():
     payload = {}
     _set_content(payload, "0123456789", offset=100)
     assert payload["content"] == ""
     assert "at or past the end" in payload["note"]
+
+
+# --------------------------- query controls ---------------------------
+
+def test_resolve_query_control_uses_default_and_clamps():
+    assert _resolve_query_control(None, default=2, maximum=8, minimum=0) == 2
+    assert _resolve_query_control(100, default=2, maximum=8, minimum=0) == 8
+    assert _resolve_query_control(-5, default=2, maximum=8, minimum=0) == 0
+    assert _resolve_query_control(0, default=10, maximum=10, minimum=1) == 1
 
 
 # --------------------------- _compile_query ---------------------------
@@ -149,7 +168,62 @@ def test_extract_matches_with_context():
     )
     assert total_matches == 1
     assert total_windows == 1
-    assert windows == ["l1\nmatch here\nl3"]
+    assert windows[0]["content"] == "l1\nmatch here\nl3"
+    assert windows[0]["line_start"] == 2
+    assert windows[0]["line_end"] == 4
+    assert windows[0]["match_lines"] == [3]
+    assert windows[0]["match_quality"] == "literal_substring"
+
+
+def test_extract_matches_prepends_nearest_heading_citation_anchor():
+    text = _text(
+        "# First {#first}",
+        "unrelated paragraph",
+        "## Details {#cite-details}",
+        "intro",
+        "target passage",
+    )
+    windows, _, _ = _extract_matches(text, "target", context=0, max_windows=10)
+    assert windows[0]["content"] == "## Details {#cite-details}\ntarget passage"
+    assert windows[0]["heading"] == {
+        "text": "Details",
+        "anchor": "cite-details",
+        "line": 3,
+    }
+
+
+def test_extract_matches_stays_within_preceding_heading_section():
+    text = _text(
+        "## Prior {#prior}",
+        "filler",
+        "target passage",
+        "## Next {#next}",
+    )
+    windows, _, _ = _extract_matches(text, "target", context=1, max_windows=10)
+    assert windows[0]["content"].startswith("## Prior {#prior}\n")
+    assert "## Next {#next}" not in windows[0]["content"]
+
+
+def test_extract_matches_reports_exact_line_and_regex_quality():
+    exact, _, _ = _extract_matches("needle", "needle", context=0, max_windows=1)
+    regex, _, _ = _extract_matches("item 42", r"item \d+", context=0, max_windows=1)
+    assert exact[0]["match_quality"] == "exact_line"
+    assert regex[0]["match_quality"] == "regex_pattern"
+
+
+def test_extract_matches_does_not_merge_across_heading_boundaries():
+    text = _text(
+        "## Alpha {#alpha}",
+        "target alpha",
+        "## Beta {#beta}",
+        "target beta",
+    )
+    windows, _, total_windows = _extract_matches(
+        text, "target", context=2, max_windows=10
+    )
+    assert total_windows == 2
+    assert [window["heading"]["anchor"] for window in windows] == ["alpha", "beta"]
+    assert [window["match_lines"] for window in windows] == [[2], [4]]
 
 
 def test_extract_matches_merges_adjacent():

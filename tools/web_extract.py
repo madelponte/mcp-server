@@ -11,7 +11,8 @@ both tools can import it without coupling.
 
 import json
 import re
-from urllib.parse import urljoin
+import unicodedata
+from urllib.parse import quote, urldefrag, urljoin
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -64,14 +65,78 @@ def _extract_jsonld(soup: BeautifulSoup) -> list:
     return out
 
 
-def _headings_outline(soup: BeautifulSoup, max_items: int = 40) -> list[dict]:
-    """Build a lightweight 'table of contents' from heading tags."""
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_SOURCE_ANCHOR_RE = re.compile(r"^[^\s{}#]+$")
+
+
+def _anchor_slug(value: str) -> str:
+    """Deterministic, readable local anchor for heading text without an id."""
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = re.sub(r"[^\w]+", "-", value, flags=re.UNICODE).strip("-_")
+    return value[:80] or "section"
+
+
+def _heading_anchor_records(soup: BeautifulSoup, base_url: str = "") -> dict[int, dict]:
+    """Map heading tag identity to stable local/source citation metadata.
+
+    A safe source ``id`` is preserved exactly, making ``url#id`` directly
+    citeable. Headings without a source fragment receive a deterministic
+    ``cite-<slug>`` anchor that is stable within repeated extractions. Duplicate
+    local anchors get document-order suffixes.
+    """
+    records: dict[int, dict] = {}
+    used: dict[str, int] = {}
+    source_url = urldefrag(base_url)[0]
+    for heading in soup.find_all(_HEADING_TAGS):
+        text = " ".join(heading.get_text(" ", strip=True).split())
+        if not text:
+            continue
+        raw_fragment = heading.get("id")
+        fragment = str(raw_fragment).strip() if raw_fragment is not None else ""
+        source_anchor = bool(fragment and _SOURCE_ANCHOR_RE.fullmatch(fragment))
+        base_anchor = fragment if source_anchor else f"cite-{_anchor_slug(text)}"
+        count = used.get(base_anchor, 0) + 1
+        used[base_anchor] = count
+        anchor = base_anchor if count == 1 else f"{base_anchor}-{count}"
+        record = {
+            "level": int(heading.name[1]),
+            "text": text,
+            "anchor": anchor,
+        }
+        if fragment:
+            record["source_fragment"] = fragment
+            if source_url:
+                encoded = quote(fragment, safe="!$&'()*+,;=:@/?-._~")
+                record["citation_url"] = f"{source_url}#{encoded}"
+        records[id(heading)] = record
+    return records
+
+
+def _annotate_heading_anchors(soup: BeautifulSoup, root, base_url: str) -> None:
+    """Append visible ``{#anchor}`` citation markers to content headings."""
+    records = _heading_anchor_records(soup, base_url)
+    for heading in root.find_all(_HEADING_TAGS):
+        record = records.get(id(heading))
+        if record is not None:
+            heading.append(f" {{#{record['anchor']}}}")
+
+
+def _headings_outline(
+    soup: BeautifulSoup,
+    max_items: int = 40,
+    base_url: str | None = None,
+) -> list[dict]:
+    """Build a lightweight table of contents, with citation anchors when asked."""
+    records = _heading_anchor_records(soup, base_url or "") if base_url is not None else None
     outline = []
-    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+    for h in soup.find_all(("h1", "h2", "h3", "h4")):
         text = " ".join(h.get_text(" ", strip=True).split())
         if not text:
             continue
-        outline.append({"level": int(h.name[1]), "text": text})
+        item = {"level": int(h.name[1]), "text": text}
+        if records is not None:
+            item.update(records[id(h)])
+        outline.append(item)
         if len(outline) >= max_items:
             break
     return outline
@@ -191,7 +256,7 @@ def _structured_from_html(html: str, url: str, max_images: int = 10) -> dict:
     soup = BeautifulSoup(html, "lxml")
     jsonld = _extract_jsonld(soup)
     title = _page_title(soup)
-    outline = _headings_outline(soup)
+    outline = _headings_outline(soup, base_url=url)
     root = soup.find("article") or soup.find("main") or soup.body or soup
     images = _prominent_image_records(soup, root, url, max_images=max_images)
     out = {
@@ -229,7 +294,8 @@ def _structured_section_from_html(
             for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
         ]
         return None, [a for a in available if a]
-    outline = _section_outline(matched)
+    anchor_records = _heading_anchor_records(soup, url)
+    outline = _section_outline(matched, anchor_records=anchor_records)
     root = soup.find("article") or soup.find("main") or soup.body or soup
     candidates = _section_image_candidates(matched)
     images = _prominent_image_records(
@@ -537,9 +603,14 @@ def _plain_text_from_soup(
     text. Mutates ``soup`` (decompose), so the caller must not reuse it after."""
     root = soup.find("article") or soup.find("main") or soup.body or soup
     _replace_prominent_images(soup, root, base_url, max_images)
+    _annotate_heading_anchors(soup, root, base_url)
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
         t.decompose()
     text = root.get_text("\n", strip=True)
+    # ``get_text`` separates the marker node appended to a heading; fold it back
+    # onto that heading's line so plain-text and markdown modes expose the same
+    # citation syntax.
+    text = re.sub(r"\n(?=\{#[^{}\s]+\}(?:\n|$))", " ", text)
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
@@ -619,6 +690,7 @@ def _markdown_from_soup(
     afterward. Split out so a caller can parse the HTML once and reuse the soup."""
     root = soup.find("article") or soup.find("main") or soup.body or soup
     _replace_prominent_images(soup, root, base_url, max_images)
+    _annotate_heading_anchors(soup, root, base_url)
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg",
                    "nav", "aside", "form", "button"]):
         t.decompose()
@@ -709,11 +781,18 @@ def _locate_heading(soup: BeautifulSoup, section: str):
     return None
 
 
-def _section_outline(matched, max_items: int = 40) -> list[dict]:
-    """Heading outline for one section: the matched heading itself followed by
-    its sub-headings, stopping at the next heading of the same or higher level."""
+def _section_outline(
+    matched,
+    max_items: int = 40,
+    anchor_records: dict[int, dict] | None = None,
+) -> list[dict]:
+    """Heading outline for one section: the matched heading and its children."""
     matched_level = int(matched.name[1])
-    outline = [{"level": matched_level, "text": " ".join(matched.get_text(" ", strip=True).split())}]
+    matched_text = " ".join(matched.get_text(" ", strip=True).split())
+    first = {"level": matched_level, "text": matched_text}
+    if anchor_records is not None:
+        first.update(anchor_records[id(matched)])
+    outline = [first]
     for el in matched.find_all_next():
         if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
             try:
@@ -724,7 +803,10 @@ def _section_outline(matched, max_items: int = 40) -> list[dict]:
                 break
             text = " ".join(el.get_text(" ", strip=True).split())
             if text:
-                outline.append({"level": lvl, "text": text})
+                item = {"level": lvl, "text": text}
+                if anchor_records is not None:
+                    item.update(anchor_records[id(el)])
+                outline.append(item)
                 if len(outline) >= max_items:
                     break
     return outline
@@ -748,6 +830,8 @@ def _find_section(
     if matched is None:
         return None
 
+    anchor_records = _heading_anchor_records(soup, base_url)
+    matched_record = anchor_records[id(matched)]
     root = soup.find("article") or soup.find("main") or soup.body or soup
     _replace_prominent_images(
         soup,
@@ -763,10 +847,11 @@ def _find_section(
     _inline_link_urls(soup, base_url)
 
     matched_level = int(matched.name[1])
-    matched_text = " ".join(matched.get_text(" ", strip=True).split())
+    matched_text = matched_record["text"]
 
     pieces: list[str] = []
     next_heading_text: str | None = None
+    next_heading_anchor: str | None = None
 
     for el in matched.find_all_next():
         if el.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
@@ -774,12 +859,19 @@ def _find_section(
                 lvl = int(el.name[1])
             except ValueError:
                 lvl = 99
+            record = anchor_records.get(id(el))
             if lvl <= matched_level:
-                next_heading_text = " ".join(el.get_text(" ", strip=True).split())
+                next_heading_text = record["text"] if record else " ".join(
+                    el.get_text(" ", strip=True).split()
+                )
+                next_heading_anchor = record["anchor"] if record else None
                 break
-            sub = " ".join(el.get_text(" ", strip=True).split())
+            sub = record["text"] if record else " ".join(
+                el.get_text(" ", strip=True).split()
+            )
             if sub:
-                pieces.append(f"\n## {sub}\n")
+                anchor = f" {{#{record['anchor']}}}" if record else ""
+                pieces.append(f"\n## {sub}{anchor}\n")
             continue
         if el.get(_IMAGE_PLACEHOLDER_ATTR) == "true":
             # A placeholder nested in a paragraph/list item is already included
@@ -802,7 +894,11 @@ def _find_section(
                     lvl = 99
                 if lvl <= matched_level:
                     if next_heading_text is None:
-                        next_heading_text = " ".join(el.get_text(" ", strip=True).split())
+                        record = anchor_records.get(id(el))
+                        next_heading_text = record["text"] if record else " ".join(
+                            el.get_text(" ", strip=True).split()
+                        )
+                        next_heading_anchor = record["anchor"] if record else None
                     break
             txt = el.get_text(" ", strip=True) if hasattr(el, "get_text") else ""
             if txt and txt not in collected:
@@ -813,9 +909,15 @@ def _find_section(
 
     body_text = re.sub(r"\n{3,}", "\n\n", body_text).strip()
 
-    return {
+    result = {
         "matched_heading": matched_text,
+        "anchor": matched_record["anchor"],
         "level": matched_level,
         "text": body_text,
         "next_heading": next_heading_text,
+        "next_heading_anchor": next_heading_anchor,
     }
+    for field in ("source_fragment", "citation_url"):
+        if field in matched_record:
+            result[field] = matched_record[field]
+    return result

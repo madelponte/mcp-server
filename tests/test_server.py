@@ -37,6 +37,28 @@ def test_fetch_page_description_explains_image_placeholders(server):
     assert "direct image" in desc
 
 
+def test_fetch_page_description_explains_citation_anchors(server):
+    desc = _tool_by_name(server, "fetch_page").description
+    assert "{#anchor}" in desc
+    assert "Source heading IDs" in desc
+    assert "generated `cite-*` anchors" in desc
+    assert "citation_url" in desc
+
+    search_desc = _tool_by_name(server, "search_web").description
+    assert "stable anchors" in search_desc
+    assert "citation_url" in search_desc
+
+
+def test_fetch_page_schema_exposes_query_window_controls(server):
+    import tools.fetch_page as fp
+
+    tool = _tool_by_name(server, "fetch_page").to_mcp_tool()
+    props = tool.inputSchema["properties"]
+    assert str(fp.cfg.max_query_matches) in props["max_matches"]["description"]
+    assert str(fp.cfg.max_query_context_lines) in props["context_lines"]["description"]
+    assert "include_match_toc" in props
+
+
 def test_search_web_documents_common_operators(server):
     tool = _tool_by_name(server, "search_web")
     examples = (

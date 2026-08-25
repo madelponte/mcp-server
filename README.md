@@ -41,7 +41,7 @@ only read transcripts from YouTube video results.
 skips enrichment). `page` is a 1-based result page; use `page=2` with the same
 query to get the next batch before reformulating.
 
-`fetch_page(url, mode="text", section=None, query=None, offset=None)` — Fetch the contents
+`fetch_page(url, mode="text", section=None, query=None, max_matches=None, context_lines=None, include_match_toc=false, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
 to read several pages, call the tool once per URL. `mode="text"` returns the
 page as markdown — headings, lists, tables, and hyperlinks (resolved to absolute URLs)
@@ -51,16 +51,25 @@ Prominent images are replaced at their original positions by explicit
 `[Image at this location: ...]` markers populated from page-provided alt text,
 captions, or image metadata; these are textual stand-ins, not visual analysis.
 Standalone image URLs return the same placeholder and any embedded SVG
-description when available. `mode="structured"` returns metadata only (title,
-description, heading outline, JSON-LD, and prominent image descriptions).
+description when available. Extracted headings carry visible `{#anchor}` markers
+so a downstream agent can cite a precise section. Source-native heading IDs are
+usable as URL fragments; generated `cite-*` anchors are stable identifiers only
+within the returned extraction. Structured headings include `citation_url` when
+the source page supplied a real fragment. `mode="structured"` returns metadata
+only (title, description, heading outline, JSON-LD, and prominent image descriptions).
 Document links (PDF, Word, Excel, PowerPoint,
 OpenDocument, RTF, EPUB) are extracted via Apache Tika and always returned as
 text. Passing a `section` (a heading from a `page_headings` outline) returns
 just that section of an HTML page instead of the whole thing. Passing a `query`
-(a keyword, phrase, or regex) returns only the matching passages plus surrounding
-context instead of the full page — useful for pulling one topic from a long
-article, document, or transcript; for YouTube, matched segments keep their
-`[M:SS]` timestamps. Regex evaluation has a hard total time budget; a pattern
+(a keyword, phrase, or regex) returns only bounded extractive match windows.
+`max_matches` controls how many windows are shown and `context_lines` controls
+surrounding nonblank lines; both are clamped to server-configured safe limits.
+Each window reports 1-based line ranges, exact match lines, its surrounding
+heading, and a compact quality label (`exact_line`, `literal_substring`, or
+`regex_pattern`). Set `include_match_toc=true` to return a small TOC containing
+only matching headings, transcript timestamps, or document line ranges. YouTube
+matched segments retain their `[M:SS]` timestamps. Regex evaluation has a hard
+total time budget; a pattern
 that exceeds it raises a tool error instead of returning an incomplete scan. If
 a response is marked `truncated`, pass `offset` with the
 returned `next_offset` to read the next chunk; this works for HTML, documents,

@@ -337,9 +337,15 @@ class WebSearchSettings(BaseSettings):
     query_context_segments: int = Field(
         2, ge=0,
         description=(
-            "When fetch_page is given a `query`, how many surrounding segments "
-            "(paragraphs / transcript lines) of context to include on each side "
-            "of a matching segment."
+            "Default surrounding nonblank lines on each side of a fetch_page "
+            "query match when the model omits context_lines."
+        ),
+    )
+    max_query_context_lines: int = Field(
+        8, ge=0,
+        description=(
+            "Maximum surrounding nonblank lines on each side of a fetch_page "
+            "query match; larger model requests are clamped."
         ),
     )
     # MAXIMUM, not a fixed amount: a context-budget cap on how many distinct

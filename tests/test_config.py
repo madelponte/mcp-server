@@ -69,6 +69,15 @@ def test_image_description_cap_must_be_nonnegative(monkeypatch):
     assert WebSearchSettings().max_image_descriptions == 0
 
 
+def test_query_context_line_cap_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_QUERY_CONTEXT_LINES", "-1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_MAX_QUERY_CONTEXT_LINES", "0")
+    assert WebSearchSettings().max_query_context_lines == 0
+
+
 def test_classifier_confidence_must_be_in_unit_interval(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_CLASSIFIER_MIN_CONFIDENCE", "1.5")
     with pytest.raises(ValidationError):
