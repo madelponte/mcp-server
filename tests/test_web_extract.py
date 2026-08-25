@@ -458,6 +458,18 @@ def test_markdown_resolves_citation_marker_to_source_url():
     assert "#cite_note-2" not in out
 
 
+def test_markdown_preserves_ordinary_fragment_link_without_hijacking_it():
+    html = (
+        '<article><p><a href="#details">Jump to details</a></p>'
+        '<section id="details"><h2>Details</h2>'
+        '<p><a href="https://unrelated.example/first">External</a></p>'
+        '</section></article>'
+    )
+    out = _markdown_from_html(html, "https://docs.example/page")
+    assert "[Jump to details](https://docs.example/page#details)" in out
+    assert "[Jump to details](https://unrelated.example/first)" not in out
+
+
 def test_find_section_inlines_reference_urls():
     html = (
         '<body><h2>Background</h2>'
@@ -512,6 +524,54 @@ def test_find_section_exact_match_collects_until_next_equal_heading():
     assert "## Subsection {#cite-subsection}" in out["text"]
     assert out["next_heading"] == "Results"
     assert out["next_heading_anchor"] == "cite-results"
+
+
+def test_find_section_does_not_duplicate_nested_text_blocks():
+    html = """
+    <h2>Details</h2>
+    <ul><li><p>List paragraph.</p></li></ul>
+    <blockquote><p>Quoted paragraph.</p></blockquote>
+    <pre><code>example()</code></pre>
+    <table><tr><td><p>Table cell.</p></td></tr></table>
+    <h2>Next</h2>
+    """
+    out = _find_section(_soup(html), "Details")
+    for expected in ("List paragraph.", "Quoted paragraph.", "example()", "Table cell."):
+        assert out["text"].count(expected) == 1
+
+
+def test_find_section_uses_heading_permalink_as_source_fragment():
+    html = (
+        '<section id="performance-notes">'
+        '<h2>Performance Notes<a class="headerlink" '
+        'href="#performance-notes" title="Link to this heading">¶</a></h2>'
+        '<p>Details.</p></section><h2>Next</h2>'
+    )
+    out = _find_section(
+        _soup(html), "Performance Notes", "https://docs.example/page"
+    )
+    assert out["matched_heading"] == "Performance Notes"
+    assert out["anchor"] == "performance-notes"
+    assert out["source_fragment"] == "performance-notes"
+    assert out["citation_url"] == "https://docs.example/page#performance-notes"
+
+    rendered = _markdown_from_html(html, "https://docs.example/page")
+    assert "## Performance Notes {#performance-notes}" in rendered
+    assert "¶" not in rendered
+
+
+def test_heading_anchor_link_with_meaningful_text_is_preserved():
+    html = (
+        '<section id="guide"><h2><a class="anchor" href="#guide">Guide</a></h2>'
+        '<p>Body.</p></section>'
+    )
+    out = _find_section(_soup(html), "Guide", "https://docs.example/page")
+    assert out["matched_heading"] == "Guide"
+    assert out["anchor"] == "guide"
+
+    rendered = _markdown_from_html(html, "https://docs.example/page")
+    assert "Guide" in rendered
+    assert "{#guide}" in rendered
 
 
 def test_find_section_preserves_source_fragment_citation_url():

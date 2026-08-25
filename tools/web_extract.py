@@ -12,7 +12,7 @@ both tools can import it without coupling.
 import json
 import re
 import unicodedata
-from urllib.parse import quote, urldefrag, urljoin
+from urllib.parse import quote, unquote, urldefrag, urljoin
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -76,11 +76,73 @@ def _anchor_slug(value: str) -> str:
     return value[:80] or "section"
 
 
+def _is_heading_permalink(link) -> bool:
+    href = str(link.get("href") or "").strip()
+    if not href.startswith("#") or len(href) == 1:
+        return False
+    classes = {str(value).casefold() for value in link.get("class", [])}
+    label = " ".join(
+        str(link.get(field) or "") for field in ("title", "aria-label")
+    ).casefold()
+    return bool(
+        classes.intersection({"headerlink", "anchor", "heading-anchor", "permalink"})
+        or "permalink" in label
+        or "link to this heading" in label
+    )
+
+
+def _is_decorative_heading_permalink(link) -> bool:
+    if not _is_heading_permalink(link):
+        return False
+    classes = {str(value).casefold() for value in link.get("class", [])}
+    text = " ".join(link.get_text(" ", strip=True).split())
+    return bool(
+        classes.intersection({"headerlink", "heading-anchor", "permalink"})
+        or str(link.get("aria-hidden") or "").casefold() == "true"
+        or text in {"", "#", "¶", "§", "🔗"}
+    )
+
+
+def _heading_text(heading) -> str:
+    """Visible heading text without decorative permalink glyphs such as ``¶``."""
+    parts = []
+    for node in heading.find_all(string=True):
+        link = (
+            node.parent
+            if getattr(node.parent, "name", None) == "a"
+            else node.parent.find_parent("a")
+        )
+        if (
+            link is not None
+            and heading in link.parents
+            and _is_decorative_heading_permalink(link)
+        ):
+            continue
+        value = str(node).strip()
+        if value:
+            parts.append(value)
+    return " ".join(" ".join(parts).split())
+
+
+def _source_heading_fragment(heading) -> str:
+    raw_fragment = heading.get("id")
+    if raw_fragment is not None and str(raw_fragment).strip():
+        return str(raw_fragment).strip()
+    for link in heading.find_all("a", href=True):
+        if _is_heading_permalink(link):
+            return unquote(str(link["href"])[1:]).strip()
+    parent = heading.parent
+    if getattr(parent, "name", None) == "section" and parent.get("id"):
+        return str(parent["id"]).strip()
+    return ""
+
+
 def _heading_anchor_records(soup: BeautifulSoup, base_url: str = "") -> dict[int, dict]:
     """Map heading tag identity to stable local/source citation metadata.
 
-    A safe source ``id`` is preserved exactly, making ``url#id`` directly
-    citeable. Headings without a source fragment receive a deterministic
+    A safe source fragment from the heading ID, permalink, or parent section is
+    preserved exactly, making ``url#id`` directly citeable. Headings without one
+    receive a deterministic
     ``cite-<slug>`` anchor that is stable within repeated extractions. Duplicate
     local anchors get document-order suffixes.
     """
@@ -88,11 +150,10 @@ def _heading_anchor_records(soup: BeautifulSoup, base_url: str = "") -> dict[int
     used: dict[str, int] = {}
     source_url = urldefrag(base_url)[0]
     for heading in soup.find_all(_HEADING_TAGS):
-        text = " ".join(heading.get_text(" ", strip=True).split())
+        text = _heading_text(heading)
         if not text:
             continue
-        raw_fragment = heading.get("id")
-        fragment = str(raw_fragment).strip() if raw_fragment is not None else ""
+        fragment = _source_heading_fragment(heading)
         source_anchor = bool(fragment and _SOURCE_ANCHOR_RE.fullmatch(fragment))
         base_anchor = fragment if source_anchor else f"cite-{_anchor_slug(text)}"
         count = used.get(base_anchor, 0) + 1
@@ -118,6 +179,9 @@ def _annotate_heading_anchors(soup: BeautifulSoup, root, base_url: str) -> None:
     for heading in root.find_all(_HEADING_TAGS):
         record = records.get(id(heading))
         if record is not None:
+            for link in heading.find_all("a", href=True):
+                if _is_decorative_heading_permalink(link):
+                    link.decompose()
             heading.append(f" {{#{record['anchor']}}}")
 
 
@@ -130,7 +194,7 @@ def _headings_outline(
     records = _heading_anchor_records(soup, base_url or "") if base_url is not None else None
     outline = []
     for h in soup.find_all(("h1", "h2", "h3", "h4")):
-        text = " ".join(h.get_text(" ", strip=True).split())
+        text = _heading_text(h)
         if not text:
             continue
         item = {"level": int(h.name[1]), "text": text}
@@ -290,7 +354,7 @@ def _structured_section_from_html(
     matched = _locate_heading(soup, section)
     if matched is None:
         available = [
-            " ".join(h.get_text(" ", strip=True).split())
+            _heading_text(h)
             for h in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
         ]
         return None, [a for a in available if a]
@@ -642,12 +706,40 @@ def _external_href(href: str, base_url: str) -> str | None:
     return urljoin(base_url, href)
 
 
+def _is_citation_marker(link) -> bool:
+    """Whether an in-page link has common footnote/reference semantics."""
+    href = str(link.get("href") or "").strip()
+    if not href.startswith("#"):
+        return False
+    fragment = unquote(href[1:]).casefold()
+    if re.match(r"^(?:cite|citation|ref|reference|fn|footnote|note)[_:-]", fragment):
+        return True
+    role = str(link.get("role") or "").casefold()
+    if role in {"doc-noteref", "doc-biblioref"}:
+        return True
+    for tag in (link, *list(link.parents)[:2]):
+        classes = {str(value).casefold() for value in tag.get("class", [])}
+        if classes.intersection(
+            {"citation", "reference", "references", "footnote", "footnote-ref"}
+        ):
+            return True
+    return False
+
+
+def _in_page_url(href: str, base_url: str, id_map: dict) -> str | None:
+    fragment = unquote(href[1:]) if href.startswith("#") else ""
+    source_url = urldefrag(base_url)[0]
+    if not fragment or fragment not in id_map or not source_url:
+        return None
+    return f"{source_url}{href}"
+
+
 def _resolve_citation_href(id_map: dict, href: str, base_url: str) -> str | None:
     """For an in-page citation marker (e.g. [12] → ``#cite_note-12``), return the
     external source URL its footnote points to, so the marker becomes followable.
     None when the target is missing or is a plain explanatory note with no link.
     `id_map` maps element id → element (built once by the caller)."""
-    frag = href[1:] if href.startswith("#") else href
+    frag = unquote(href[1:] if href.startswith("#") else href)
     target = id_map.get(frag) if frag else None
     if target is None:
         return None
@@ -670,7 +762,10 @@ def _inline_link_urls(soup: BeautifulSoup, base_url: str) -> None:
         if href.startswith("#"):
             if id_map is None:
                 id_map = {t["id"]: t for t in soup.find_all(id=True)}
-            url = _resolve_citation_href(id_map, href, base_url)
+            if _is_citation_marker(a):
+                url = _resolve_citation_href(id_map, href, base_url)
+            else:
+                url = _in_page_url(href, base_url, id_map)
         else:
             url = _external_href(href, base_url)
         if not url:
@@ -703,11 +798,15 @@ def _markdown_from_soup(
     for a in root.find_all("a", href=True):
         href = a["href"].strip()
         if href.startswith("#"):
-            # A citation marker → point it at its source so it's followable;
-            # a plain in-page anchor with no source is dropped (text kept).
             if id_map is None:
                 id_map = {t["id"]: t for t in soup.find_all(id=True)}
-            url = _resolve_citation_href(id_map, href, base_url)
+            if _is_citation_marker(a):
+                # Citation marker → point it at the footnote's external source.
+                url = _resolve_citation_href(id_map, href, base_url)
+            else:
+                # Preserve real TOC/permalink anchors as source-page URLs;
+                # never redirect them to an unrelated link inside the section.
+                url = _in_page_url(href, base_url, id_map)
             if url:
                 a["href"] = url
             else:
@@ -772,10 +871,10 @@ def _locate_heading(soup: BeautifulSoup, section: str):
     if not headings:
         return None
     for h in headings:
-        if _norm_heading(h.get_text(" ", strip=True)) == target:
+        if _norm_heading(_heading_text(h)) == target:
             return h
     for h in headings:
-        ht = _norm_heading(h.get_text(" ", strip=True))
+        ht = _norm_heading(_heading_text(h))
         if (target in ht or ht in target) and ht and len(ht) >= 3:
             return h
     return None
@@ -788,7 +887,7 @@ def _section_outline(
 ) -> list[dict]:
     """Heading outline for one section: the matched heading and its children."""
     matched_level = int(matched.name[1])
-    matched_text = " ".join(matched.get_text(" ", strip=True).split())
+    matched_text = _heading_text(matched)
     first = {"level": matched_level, "text": matched_text}
     if anchor_records is not None:
         first.update(anchor_records[id(matched)])
@@ -801,7 +900,7 @@ def _section_outline(
                 continue
             if lvl <= matched_level:
                 break
-            text = " ".join(el.get_text(" ", strip=True).split())
+            text = _heading_text(el)
             if text:
                 item = {"level": lvl, "text": text}
                 if anchor_records is not None:
@@ -850,6 +949,18 @@ def _find_section(
     matched_text = matched_record["text"]
 
     pieces: list[str] = []
+    text_block_tags = [
+        "p",
+        "li",
+        "pre",
+        "code",
+        "blockquote",
+        "td",
+        "th",
+        "dd",
+        "dt",
+        "figcaption",
+    ]
     next_heading_text: str | None = None
     next_heading_anchor: str | None = None
 
@@ -861,14 +972,10 @@ def _find_section(
                 lvl = 99
             record = anchor_records.get(id(el))
             if lvl <= matched_level:
-                next_heading_text = record["text"] if record else " ".join(
-                    el.get_text(" ", strip=True).split()
-                )
+                next_heading_text = record["text"] if record else _heading_text(el)
                 next_heading_anchor = record["anchor"] if record else None
                 break
-            sub = record["text"] if record else " ".join(
-                el.get_text(" ", strip=True).split()
-            )
+            sub = record["text"] if record else _heading_text(el)
             if sub:
                 anchor = f" {{#{record['anchor']}}}" if record else ""
                 pieces.append(f"\n## {sub}{anchor}\n")
@@ -879,7 +986,12 @@ def _find_section(
             if el.find_parent(["p", "li", "blockquote", "td", "th", "dd", "dt"]) is None:
                 pieces.append(el.get_text(" ", strip=True))
             continue
-        if el.name in ("p", "li", "pre", "code", "blockquote", "td", "th", "dd", "dt", "figcaption"):
+        if el.name in text_block_tags:
+            # Flatten only the outermost selected block. Common markup such as
+            # ``<li><p>…</p></li>`` and ``<pre><code>…</code></pre>`` would
+            # otherwise emit the same text once for every nested block.
+            if el.find_parent(text_block_tags) is not None:
+                continue
             txt = el.get_text(" ", strip=True)
             if txt:
                 pieces.append(txt)
@@ -895,9 +1007,7 @@ def _find_section(
                 if lvl <= matched_level:
                     if next_heading_text is None:
                         record = anchor_records.get(id(el))
-                        next_heading_text = record["text"] if record else " ".join(
-                            el.get_text(" ", strip=True).split()
-                        )
+                        next_heading_text = record["text"] if record else _heading_text(el)
                         next_heading_anchor = record["anchor"] if record else None
                     break
             txt = el.get_text(" ", strip=True) if hasattr(el, "get_text") else ""
