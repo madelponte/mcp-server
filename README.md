@@ -46,9 +46,14 @@ of a single page (or a URL returned by `search_web`). Reads one URL per call —
 to read several pages, call the tool once per URL. `mode="text"` returns the
 page as markdown — headings, lists, tables, and hyperlinks (resolved to absolute URLs)
 are preserved, so the model sees the page's structure and can fetch a link it
-found in the content (set `WEB_SEARCH_MARKDOWN=false` for bare plain text);
-`mode="structured"` returns metadata only (title, description,
-heading outline, JSON-LD). Document links (PDF, Word, Excel, PowerPoint,
+found in the content (set `WEB_SEARCH_MARKDOWN=false` for bare plain text).
+Prominent images are replaced at their original positions by explicit
+`[Image at this location: ...]` markers populated from page-provided alt text,
+captions, or image metadata; these are textual stand-ins, not visual analysis.
+Standalone image URLs return the same placeholder and any embedded SVG
+description when available. `mode="structured"` returns metadata only (title,
+description, heading outline, JSON-LD, and prominent image descriptions).
+Document links (PDF, Word, Excel, PowerPoint,
 OpenDocument, RTF, EPUB) are extracted via Apache Tika and always returned as
 text. Passing a `section` (a heading from a `page_headings` outline) returns
 just that section of an HTML page instead of the whole thing. Passing a `query`

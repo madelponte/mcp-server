@@ -99,6 +99,19 @@ def test_text_mode_markdown(monkeypatch, tool_fns):
     assert "Body text here." in out["content"]
 
 
+def test_text_mode_marks_prominent_image_in_place(monkeypatch, tool_fns):
+    html = (
+        '<article><p>Before image.</p><img src="/chart.png" '
+        'alt="Revenue rose each quarter"><p>After image.</p></article>'
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report")))
+    marker = "[Image at this location: Revenue rose each quarter]"
+    assert marker in out["content"]
+    assert out["content"].index("Before image.") < out["content"].index(marker)
+    assert out["content"].index(marker) < out["content"].index("After image.")
+
+
 def test_firecrawl_metadata_title_overrides_body_widget_title(monkeypatch, tool_fns):
     fetched = _fetched(
         text=(
@@ -128,6 +141,18 @@ def test_structured_mode(monkeypatch, tool_fns):
     assert out["format"] == "structured"
     assert out["content"]["title"] == "T"
     assert out["content"]["description"] == "D"
+
+
+def test_structured_mode_includes_image_description_and_placeholder_note(monkeypatch, tool_fns):
+    html = '<main><img src="hero.jpg" alt="Snow-covered mountain"></main>'
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com", mode="structured"))
+    )
+    image = out["content"]["images"][0]
+    assert image["replaces_image"] is True
+    assert image["description"] == "Snow-covered mountain"
+    assert "not visual analysis" in out["content"]["image_note"]
 
 
 def test_structured_mode_prefers_firecrawl_metadata_title(monkeypatch, tool_fns):
@@ -473,16 +498,50 @@ def test_contentless_accepted_artifact_still_raises(monkeypatch, tool_fns):
     assert "no extractable text" in str(exc.value)
 
 
+def test_standalone_raster_image_returns_explicit_placeholder(monkeypatch, tool_fns):
+    fetched = _fetched(
+        content_type="image/png", body=b"\x89PNG\r\n\x1a\nbinary", text=None
+    )
+    fetched["resource_kind"] = "image"
+    _patch_fetch(monkeypatch, fetched)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com/photo.png"))
+    )
+    assert out["format"] == "image"
+    assert out["media_type"] == "image/png"
+    assert out["filename"] == "photo.png"
+    assert "[Image at this location:" in out["content"]
+    assert "no alt text, caption, or embedded description" in out["content"]
+    assert "in place of the image" in out["note"]
+    assert "not visual analysis" in out["note"]
+
+
+def test_standalone_svg_returns_embedded_description(monkeypatch, tool_fns):
+    svg = "<svg><title>Network diagram</title><desc>Three connected nodes</desc></svg>"
+    fetched = _fetched(content_type="image/svg+xml", text=svg, body=None)
+    fetched["resource_kind"] = "image"
+    _patch_fetch(monkeypatch, fetched)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com/network.svg"))
+    )
+    assert out["format"] == "image"
+    assert out["description"] == "Network diagram — Three connected nodes"
+    assert out["description_source"] == "embedded SVG title+description"
+    assert out["content"] == (
+        "[Image at this location: Network diagram — Three connected nodes]"
+    )
+
+
 def test_unsupported_binary_media_raises_actionable_error(monkeypatch, tool_fns):
     _patch_fetch(
         monkeypatch,
-        _fetched(content_type="image/png", body=b"\x89PNG\r\n\x1a\nbinary", text=None),
+        _fetched(content_type="audio/mpeg", body=b"ID3binary", text=None),
     )
     with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/image.png"))
+        run(tool_fns["fetch_page"](url="https://example.com/audio.mp3"))
     msg = str(exc.value)
     assert "cannot extract that media type" in msg
-    assert "image/png" in msg
+    assert "audio/mpeg" in msg
     assert "direct download" in msg
 
 

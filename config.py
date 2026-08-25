@@ -319,6 +319,13 @@ class WebSearchSettings(BaseSettings):
         ),
     )
     max_page_chars: int = Field(15000, ge=1, description="Max characters of page content before truncation.")
+    max_image_descriptions: int = Field(
+        10, ge=0,
+        description=(
+            "Maximum prominent image placeholders returned from one HTML page "
+            "(0 disables image descriptions)."
+        ),
+    )
     max_enrich_headings: int = Field(25, ge=1, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, ge=1, description="Max characters of each result snippet.")
 

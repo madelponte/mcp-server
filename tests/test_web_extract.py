@@ -14,6 +14,7 @@ from tools.web_extract import (
     _page_description,
     _structured_from_html,
     _structured_section_from_html,
+    _standalone_image_description,
     _plain_text_from_html,
     _markdown_from_html,
     _norm_heading,
@@ -221,6 +222,22 @@ def test_structured_from_html_no_jsonld_is_none():
     out = _structured_from_html("<title>T</title>", "https://e.com")
     assert out["jsonld"] is None
     assert out["toc"] is None
+    assert "images" not in out
+
+
+def test_structured_from_html_reports_prominent_image_as_replacement():
+    html = (
+        '<article><figure><img src="/hero.jpg" alt="Sunset over water">'
+        '<figcaption>Golden hour at the bay</figcaption></figure></article>'
+    )
+    out = _structured_from_html(html, "https://example.com/story")
+    assert out["images"] == [{
+        "replaces_image": True,
+        "description": "Sunset over water — Caption: Golden hour at the bay",
+        "description_source": "alt+caption",
+        "url": "https://example.com/hero.jpg",
+    }]
+    assert "not visual analysis" in out["image_note"]
 
 
 # ----------------------- structured_section_from_html -----------------------
@@ -258,6 +275,16 @@ def test_structured_section_not_found_returns_available():
     assert "History" in available and "Implementations" in available
 
 
+def test_structured_section_reports_only_images_in_that_section():
+    html = (
+        '<h2>First</h2><img src="first.jpg" alt="First image">'
+        '<h2>Second</h2><img src="second.jpg" alt="Second image">'
+        '<h2>Third</h2>'
+    )
+    out, _ = _structured_section_from_html(html, "https://example.com", "Second")
+    assert [image["description"] for image in out["images"]] == ["Second image"]
+
+
 # --------------------------- plain text ---------------------------
 
 def test_plain_text_strips_scripts_and_styles():
@@ -280,6 +307,16 @@ def test_plain_text_collapses_blank_lines():
     assert "\n\n\n" not in out
 
 
+def test_plain_text_keeps_image_marker_at_original_location():
+    html = (
+        '<main><p>Before.</p><img src="chart.png" alt="Quarterly sales chart">'
+        '<p>After.</p></main>'
+    )
+    out = _plain_text_from_html(html, "https://example.com/report")
+    assert out.index("Before.") < out.index("[Image at this location:") < out.index("After.")
+    assert "Quarterly sales chart" in out
+
+
 # --------------------------- markdown ---------------------------
 
 def test_markdown_keeps_headings_and_resolves_links():
@@ -299,15 +336,68 @@ def test_markdown_drops_unfollowable_links_keeping_text():
     assert "#frag" not in out
 
 
-def test_markdown_strips_nav_and_images():
+def test_markdown_strips_nav_and_replaces_content_image():
     html = (
-        '<body><nav>NavMenu</nav><article><p>Content</p>'
-        '<img src="x.png" alt="img"></article></body>'
+        '<body><nav>NavMenu<img src="logo.png" alt="Site logo"></nav>'
+        '<article><p>Content</p><img src="x.png" alt="Article diagram"></article></body>'
     )
     out = _markdown_from_html(html, "https://example.com")
     assert "Content" in out
     assert "NavMenu" not in out
+    assert "Site logo" not in out
+    assert "[Image at this location: Article diagram]" in out
     assert "x.png" not in out
+
+
+def test_markdown_folds_figure_caption_into_image_marker_without_duplication():
+    html = (
+        '<article><p>Before.</p><figure><img src="hero.jpg" alt="A lighthouse">'
+        '<figcaption>Storm waves surround the lighthouse</figcaption></figure>'
+        '<p>After.</p></article>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    marker = (
+        "[Image at this location: A lighthouse — Caption: Storm waves surround "
+        "the lighthouse]"
+    )
+    assert marker in out
+    assert out.count("Storm waves surround the lighthouse") == 1
+    assert out.index("Before.") < out.index(marker) < out.index("After.")
+
+
+def test_markdown_uses_open_graph_image_alt_when_img_alt_is_missing():
+    html = (
+        '<head><meta property="og:image" content="https://cdn.example/hero.jpg">'
+        '<meta property="og:image:alt" content="Mars rover beside a crater"></head>'
+        '<body><main><img src="https://cdn.example/hero.jpg"></main></body>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    assert "[Image at this location: Mars rover beside a crater]" in out
+
+
+def test_markdown_skips_small_icon_even_with_alt_text():
+    html = (
+        '<main><img class="icon" src="settings.png" alt="Settings" '
+        'width="32" height="32"><p>Article text.</p></main>'
+    )
+    out = _markdown_from_html(html, "https://example.com")
+    assert "Article text." in out
+    assert "[Image" not in out
+
+
+def test_markdown_caps_image_placeholders():
+    html = "<article>" + "".join(
+        f'<img src="{i}.jpg" alt="Image {i}">' for i in range(3)
+    ) + "</article>"
+    out = _markdown_from_html(html, "https://example.com", max_images=2)
+    assert out.count("[Image at this location:") == 2
+
+
+def test_standalone_svg_uses_embedded_title_and_description():
+    svg = "<svg><title>Transit map</title><desc>Routes through downtown</desc></svg>"
+    description, source = _standalone_image_description(svg, None)
+    assert description == "Transit map — Routes through downtown"
+    assert source == "embedded SVG title+description"
 
 
 # --------------------------- followable references ---------------------------

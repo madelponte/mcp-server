@@ -186,13 +186,15 @@ def _page_description(
     return None
 
 
-def _structured_from_html(html: str, url: str) -> dict:
+def _structured_from_html(html: str, url: str, max_images: int = 10) -> dict:
     """Return a structured representation of the whole page."""
     soup = BeautifulSoup(html, "lxml")
     jsonld = _extract_jsonld(soup)
     title = _page_title(soup)
     outline = _headings_outline(soup)
-    return {
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    images = _prominent_image_records(soup, root, url, max_images=max_images)
+    out = {
         "url": url,
         "title": title,
         "description": _page_description(soup, jsonld, title),
@@ -200,10 +202,14 @@ def _structured_from_html(html: str, url: str) -> dict:
         "jsonld": jsonld if jsonld else None,
         "toc": _table_of_contents(outline, jsonld),
     }
+    if images:
+        out["images"] = [item[2] for item in images]
+        out["image_note"] = _IMAGE_NOTE
+    return out
 
 
 def _structured_section_from_html(
-    html: str, url: str, section: str
+    html: str, url: str, section: str, max_images: int = 10
 ) -> tuple[dict | None, list[str]]:
     """Structured metadata scoped to a single heading's subtree.
 
@@ -224,7 +230,12 @@ def _structured_section_from_html(
         ]
         return None, [a for a in available if a]
     outline = _section_outline(matched)
-    return {
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    candidates = _section_image_candidates(matched)
+    images = _prominent_image_records(
+        soup, root, url, max_images=max_images, candidates=candidates
+    )
+    out = {
         "url": url,
         "title": title,
         "section": outline[0]["text"],
@@ -232,26 +243,313 @@ def _structured_section_from_html(
         "headings": outline,
         "jsonld": jsonld if jsonld else None,
         "toc": [h["text"] for h in outline] or None,
-    }, []
+    }
+    if images:
+        out["images"] = [item[2] for item in images]
+        out["image_note"] = _IMAGE_NOTE
+    return out, []
+
+
+# ---------------------------------------------------------------------------
+# Prominent image descriptions
+# ---------------------------------------------------------------------------
+
+_IMAGE_DESCRIPTION_LIMIT = 300
+_IMAGE_PLACEHOLDER_ATTR = "data-mcp-image-placeholder"
+_IMAGE_NOTE = (
+    "Each description replaces a prominent image at its page location and comes "
+    "from page-provided alt text, captions, or metadata, not visual analysis."
+)
+_IMAGE_NOISE_RE = re.compile(
+    r"(?:^|[-_\s])(icon|logo|avatar|emoji|sprite|badge|tracking|pixel|spacer)(?:$|[-_\s])",
+    re.I,
+)
+_IMAGE_PROMINENT_RE = re.compile(
+    r"(?:^|[-_\s])(hero|featured|lead|cover|main[-_]?image|article[-_]?image|wp[-_]?post[-_]?image)(?:$|[-_\s])",
+    re.I,
+)
+
+
+def _clean_image_description(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split()).strip()
+    if not text:
+        return None
+    return text[:_IMAGE_DESCRIPTION_LIMIT].rstrip()
+
+
+def _standalone_image_description(
+    text: str | None, body: bytes | None
+) -> tuple[str | None, str | None]:
+    """Read an SVG's embedded title/description without inspecting its pixels."""
+    source = text
+    if source is None and body:
+        source = body.decode("utf-8", errors="replace")
+    if not source or "<svg" not in source[:2000].lower():
+        return None, None
+    soup = BeautifulSoup(source, "xml")
+    title_tag = soup.find("title")
+    desc_tag = soup.find("desc")
+    title = _clean_image_description(
+        title_tag.get_text(" ", strip=True) if title_tag else None
+    )
+    description = _clean_image_description(
+        desc_tag.get_text(" ", strip=True) if desc_tag else None
+    )
+    if title and description and title.casefold() != description.casefold():
+        return f"{title} — {description}", "embedded SVG title+description"
+    if description:
+        return description, "embedded SVG description"
+    if title:
+        return title, "embedded SVG title"
+    return None, None
+
+
+def _image_src(img, base_url: str) -> str | None:
+    raw = (
+        img.get("src")
+        or img.get("data-src")
+        or img.get("data-lazy-src")
+        or ""
+    ).strip()
+    if not raw:
+        srcset = (img.get("srcset") or img.get("data-srcset") or "").strip()
+        raw = srcset.split(",", 1)[0].strip().split(" ", 1)[0] if srcset else ""
+    if not raw or raw.startswith(("data:", "blob:", "javascript:")):
+        return None
+    resolved = urljoin(base_url, raw)
+    return resolved[:500] if resolved.startswith(("http://", "https://")) else None
+
+
+def _metadata_image_descriptions(
+    soup: BeautifulSoup, base_url: str
+) -> tuple[dict[str, str], set[str]]:
+    """Map OpenGraph/Twitter/JSON-LD image URLs to their supplied descriptions."""
+    descriptions: dict[str, str] = {}
+    prominent_urls: set[str] = set()
+    current: dict[str, str] = {}
+
+    for meta in soup.find_all("meta"):
+        key = (meta.get("property") or meta.get("name") or "").strip().lower()
+        raw = meta.get("content")
+        raw = " ".join(raw.split()).strip() if isinstance(raw, str) else ""
+        if not raw:
+            continue
+        value = _clean_image_description(raw)
+        if key in ("og:image", "og:image:url", "og:image:secure_url"):
+            current["og"] = urljoin(base_url, raw)
+            prominent_urls.add(current["og"])
+        elif key == "og:image:alt" and current.get("og"):
+            descriptions[current["og"]] = value
+        elif key in ("twitter:image", "twitter:image:src"):
+            current["twitter"] = urljoin(base_url, raw)
+            prominent_urls.add(current["twitter"])
+        elif key == "twitter:image:alt" and current.get("twitter"):
+            descriptions[current["twitter"]] = value
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            kind = obj.get("@type")
+            kinds = kind if isinstance(kind, list) else [kind]
+            if "ImageObject" in kinds:
+                raw_url = obj.get("contentUrl") or obj.get("url")
+                if isinstance(raw_url, str) and raw_url.strip():
+                    image_url = urljoin(base_url, raw_url.strip())
+                    prominent_urls.add(image_url)
+                    desc = None
+                    for field in ("caption", "description", "name"):
+                        desc = _clean_image_description(obj.get(field))
+                        if desc:
+                            break
+                    if desc:
+                        descriptions[image_url] = desc
+            for child in obj.values():
+                walk(child)
+        elif isinstance(obj, list):
+            for child in obj:
+                walk(child)
+
+    walk(_extract_jsonld(soup))
+    return descriptions, prominent_urls
+
+
+def _image_dimension(value) -> int | None:
+    match = re.match(r"\s*(\d+)", str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def _section_image_candidates(matched) -> list:
+    matched_level = int(matched.name[1])
+    images = []
+    for element in matched.find_all_next():
+        if element.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            try:
+                if int(element.name[1]) <= matched_level:
+                    break
+            except ValueError:
+                pass
+        if element.name == "img":
+            images.append(element)
+    return images
+
+
+def _prominent_image_records(
+    soup: BeautifulSoup,
+    root,
+    base_url: str,
+    *,
+    max_images: int = 10,
+    candidates: list | None = None,
+) -> list[tuple]:
+    """Return ``(img, consumed_caption, public_record, marker)`` tuples."""
+    if max_images <= 0:
+        return []
+    metadata, metadata_urls = _metadata_image_descriptions(soup, base_url)
+    images = list(candidates) if candidates is not None else list(root.find_all("img"))
+    records = []
+    consumed_figures: set[int] = set()
+
+    for img in images:
+        if img.find_parent(["nav", "aside", "form", "button"]):
+            continue
+        chrome = img.find_parent(["header", "footer"])
+        if chrome is not None and img.find_parent(["article", "main"]) is None:
+            continue
+        image_url = _image_src(img, base_url)
+        figure = img.find_parent("figure")
+        figure_key = id(figure) if figure is not None else None
+        caption_tag = figure.find("figcaption") if figure is not None else None
+        caption = (
+            _clean_image_description(caption_tag.get_text(" ", strip=True))
+            if caption_tag is not None and figure_key not in consumed_figures
+            else None
+        )
+        alt = _clean_image_description(img.get("alt"))
+        short = (
+            _clean_image_description(img.get("aria-label"))
+            or _clean_image_description(img.get("title"))
+            or (metadata.get(image_url) if image_url else None)
+        )
+        descriptions = []
+        sources = []
+        for value, source in ((alt, "alt"), (caption, "caption"), (short, "metadata")):
+            if value and value.casefold() not in {item.casefold() for item in descriptions}:
+                descriptions.append(value)
+                sources.append(source)
+        description = descriptions[0] if descriptions else None
+        if description and len(descriptions) > 1:
+            label = "Caption" if sources[1] == "caption" else "Description"
+            description += f" — {label}: {descriptions[1]}"
+        description = _clean_image_description(description)
+
+        parent = img.parent if getattr(img.parent, "attrs", None) is not None else None
+        attrs = " ".join(
+            str(value)
+            for value in (
+                img.get("id", ""),
+                " ".join(img.get("class") or []),
+                img.get("role", ""),
+                parent.get("id", "") if parent else "",
+                " ".join(parent.get("class") or []) if parent else "",
+            )
+        )
+        hero = bool(_IMAGE_PROMINENT_RE.search(attrs)) or img.get("fetchpriority") == "high"
+        metadata_image = bool(image_url and image_url in metadata_urls)
+        width = _image_dimension(img.get("width"))
+        height = _image_dimension(img.get("height"))
+        known_small = bool(
+            (width is not None and height is not None and width <= 96 and height <= 96)
+            or (width is not None and height is None and width <= 96)
+            or (height is not None and width is None and height <= 96)
+        )
+        large = bool(
+            (width is not None and width >= 480)
+            or (height is not None and height >= 300)
+            or (
+                width is not None
+                and height is not None
+                and width >= 300
+                and height >= 180
+            )
+        )
+        in_content = img.find_parent(["article", "main"]) is not None
+        noisy = bool(_IMAGE_NOISE_RE.search(attrs)) or img.get("aria-hidden") == "true"
+        if (known_small or noisy) and not (figure is not None or hero or metadata_image):
+            continue
+        if not (
+            figure is not None
+            or hero
+            or metadata_image
+            or large
+            or in_content
+            or bool(description)
+        ):
+            continue
+
+        marker = (
+            f"[Image at this location: {description}]"
+            if description
+            else "[Image at this location: no textual description was provided.]"
+        )
+        public = {"replaces_image": True}
+        if description:
+            public["description"] = description
+            public["description_source"] = "+".join(sources[:2])
+        if image_url:
+            public["url"] = image_url
+        records.append((img, caption_tag if caption else None, public, marker))
+        if caption and figure_key is not None:
+            consumed_figures.add(figure_key)
+        if len(records) >= max_images:
+            break
+    return records
+
+
+def _replace_prominent_images(
+    soup: BeautifulSoup,
+    root,
+    base_url: str,
+    max_images: int,
+    candidates: list | None = None,
+) -> list[dict]:
+    records = _prominent_image_records(
+        soup, root, base_url, max_images=max_images, candidates=candidates
+    )
+    for img, caption_tag, _public, marker in records:
+        placeholder = soup.new_tag("span")
+        placeholder[_IMAGE_PLACEHOLDER_ATTR] = "true"
+        placeholder.string = marker
+        img.replace_with(placeholder)
+        if caption_tag is not None and caption_tag.parent is not None:
+            caption_tag.decompose()
+    return [record[2] for record in records]
 
 
 # ---------------------------------------------------------------------------
 # Readable-text rendering
 # ---------------------------------------------------------------------------
 
-def _plain_text_from_soup(soup: BeautifulSoup) -> str:
+def _plain_text_from_soup(
+    soup: BeautifulSoup, base_url: str = "", max_images: int = 10
+) -> str:
     """Strip scripts/styles/nav from an already-parsed soup and return readable
     text. Mutates ``soup`` (decompose), so the caller must not reuse it after."""
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    _replace_prominent_images(soup, root, base_url, max_images)
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
         t.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
     text = root.get_text("\n", strip=True)
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-def _plain_text_from_html(html: str) -> str:
-    """Strip scripts/styles/nav and return readable text."""
-    return _plain_text_from_soup(BeautifulSoup(html, "lxml"))
+def _plain_text_from_html(
+    html: str, base_url: str = "", max_images: int = 10
+) -> str:
+    """Strip scripts/styles/nav and return readable text with image markers."""
+    return _plain_text_from_soup(
+        BeautifulSoup(html, "lxml"), base_url, max_images
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +609,16 @@ def _inline_link_urls(soup: BeautifulSoup, base_url: str) -> None:
         a.append(f"{text} ({url})" if text else url)
 
 
-def _markdown_from_soup(soup: BeautifulSoup, base_url: str) -> str:
+def _markdown_from_soup(
+    soup: BeautifulSoup, base_url: str, max_images: int = 10
+) -> str:
     """Convert an already-parsed soup to markdown (see ``_markdown_from_html``).
 
     Mutates ``soup`` (decompose/unwrap), so the caller must extract anything else
     it needs (e.g. the title) before calling this and must not reuse the soup
     afterward. Split out so a caller can parse the HTML once and reuse the soup."""
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    _replace_prominent_images(soup, root, base_url, max_images)
     for t in soup(["script", "style", "noscript", "template", "iframe", "svg",
                    "nav", "aside", "form", "button"]):
         t.decompose()
@@ -325,8 +627,6 @@ def _markdown_from_soup(soup: BeautifulSoup, base_url: str) -> str:
     for t in soup(["header", "footer"]):
         if t.find_parent(["article", "main"]) is None:
             t.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
-
     id_map = None
     for a in root.find_all("a", href=True):
         href = a["href"].strip()
@@ -355,17 +655,22 @@ def _markdown_from_soup(soup: BeautifulSoup, base_url: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", md).strip()
 
 
-def _markdown_from_html(html: str, base_url: str) -> str:
+def _markdown_from_html(
+    html: str, base_url: str, max_images: int = 10
+) -> str:
     """Convert page HTML to markdown, keeping the structure plain text loses.
 
     Headings, lists, tables, and hyperlinks survive the conversion, so the model
     sees the page the way a reader does — and can follow a link it found in the
     content with another fetch_page call. Link hrefs are resolved against
-    `base_url` to absolute URLs for exactly that reason. Non-content elements
-    (scripts, nav, site header/footer chrome, forms) and images are dropped;
-    `escape_*` are off because the output feeds a model, not a markdown renderer.
+    `base_url` to absolute URLs for exactly that reason. Prominent images become
+    explicit in-place text markers using page-provided alt/caption/metadata;
+    decorative images and non-content elements are dropped. `escape_*` is off
+    because the output feeds a model, not a markdown renderer.
     """
-    return _markdown_from_soup(BeautifulSoup(html, "lxml"), base_url)
+    return _markdown_from_soup(
+        BeautifulSoup(html, "lxml"), base_url, max_images
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +730,12 @@ def _section_outline(matched, max_items: int = 40) -> list[dict]:
     return outline
 
 
-def _find_section(soup: BeautifulSoup, section: str, base_url: str = "") -> dict | None:
+def _find_section(
+    soup: BeautifulSoup,
+    section: str,
+    base_url: str = "",
+    max_images: int = 10,
+) -> dict | None:
     """Locate a heading matching `section` and return text up to the next equal/higher heading.
 
     `base_url` lets reference/citation links inside the section be resolved to
@@ -434,12 +744,20 @@ def _find_section(soup: BeautifulSoup, section: str, base_url: str = "") -> dict
     if not section:
         return None
 
-    for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
-        t.decompose()
-
     matched = _locate_heading(soup, section)
     if matched is None:
         return None
+
+    root = soup.find("article") or soup.find("main") or soup.body or soup
+    _replace_prominent_images(
+        soup,
+        root,
+        base_url,
+        max_images,
+        candidates=_section_image_candidates(matched),
+    )
+    for t in soup(["script", "style", "noscript", "template", "iframe", "svg"]):
+        t.decompose()
 
     # Make links in the section followable before the text is flattened.
     _inline_link_urls(soup, base_url)
@@ -462,6 +780,12 @@ def _find_section(soup: BeautifulSoup, section: str, base_url: str = "") -> dict
             sub = " ".join(el.get_text(" ", strip=True).split())
             if sub:
                 pieces.append(f"\n## {sub}\n")
+            continue
+        if el.get(_IMAGE_PLACEHOLDER_ATTR) == "true":
+            # A placeholder nested in a paragraph/list item is already included
+            # when that parent is flattened; a standalone figure marker is not.
+            if el.find_parent(["p", "li", "blockquote", "td", "th", "dd", "dt"]) is None:
+                pieces.append(el.get_text(" ", strip=True))
             continue
         if el.name in ("p", "li", "pre", "code", "blockquote", "td", "th", "dd", "dt", "figcaption"):
             txt = el.get_text(" ", strip=True)

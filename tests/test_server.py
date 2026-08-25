@@ -29,6 +29,14 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
+def test_fetch_page_description_explains_image_placeholders(server):
+    desc = _tool_by_name(server, "fetch_page").description
+    assert "[Image at this location: ...]" in desc
+    assert "where the image appeared" in desc
+    assert "not visual analysis" in desc
+    assert "direct image" in desc
+
+
 def test_search_web_documents_common_operators(server):
     tool = _tool_by_name(server, "search_web")
     examples = (

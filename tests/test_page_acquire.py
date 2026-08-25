@@ -55,6 +55,22 @@ def test_json_stays_on_direct_path(monkeypatch):
     assert out["text"] == '{"ok":true}'
 
 
+def test_image_stays_on_direct_path_and_is_identified(monkeypatch):
+    png = b"\x89PNG\r\n\x1a\nimage"
+
+    async def direct(*args, **kwargs):
+        return 200, {}, png, "image/png", False
+
+    monkeypatch.setattr(pa, "_direct_resource_fetch", direct)
+    monkeypatch.setattr(
+        pa, "_render_with_flaresolverr", lambda url: pytest.fail("browser used")
+    )
+    out = run(pa.acquire_page("https://example.com/photo.png"))
+    assert out["resource_kind"] == "image"
+    assert out["bytes"] == png
+    assert out["text"] is None
+
+
 def test_blocked_document_can_use_firecrawl_document_parser(monkeypatch):
     async def direct(*args, **kwargs):
         return 403, {}, b"<html><body>Challenge</body></html>", "text/html", False

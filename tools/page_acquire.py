@@ -23,6 +23,7 @@ from .web_fetch import (
     _cache_page,
     _decode_body,
     _direct_resource_fetch,
+    _is_image_resource,
     _is_tika_document,
     _page_cache,
     _render_document_with_firecrawl,
@@ -109,7 +110,7 @@ def _error_detail(exc: BaseException) -> str:
 
 def _known_direct_url(url: str) -> bool:
     """Whether the URL itself identifies a resource that should skip browsers."""
-    if _is_tika_document("", url):
+    if _is_tika_document("", url) or _is_image_resource("", url):
         return True
     path = (urlparse(url).path or "").lower()
     return path.endswith((".json", ".xml", ".rss", ".atom", ".txt", ".csv"))
@@ -313,22 +314,40 @@ def _direct_result(url: str, status: int, body: bytes, ctype: str) -> dict:
     magic_document = _sniff_document_bytes(body)
     declared_html = "html" in ctype.lower()
     url_document = _is_tika_document("", url)
+    is_image = (
+        not magic_document
+        and not declared_html
+        and _is_image_resource(ctype, url, body)
+    )
     # A document-looking URL can return a branded HTML denial with HTTP 200.
     # Do not pass that HTML to Tika merely because the path ends in .pdf.
     is_document = magic_document or (_is_tika_document(ctype, url) and not declared_html)
     resource_kind = (
         "document"
         if is_document
+        else "image"
+        if is_image
         else "html_at_document_url"
         if url_document and declared_html
         else "direct"
     )
+    image_is_svg = is_image and (
+        "svg" in ctype.lower()
+        or (urlparse(url).path or "").lower().endswith(".svg")
+        or b"<svg" in body[:512].lower()
+    )
     textlike = (
         not is_document
         and (
-            ctype.lower().startswith("text/")
-            or "json" in ctype.lower()
-            or "xml" in ctype.lower()
+            image_is_svg
+            or (
+                not is_image
+                and (
+                    ctype.lower().startswith("text/")
+                    or "json" in ctype.lower()
+                    or "xml" in ctype.lower()
+                )
+            )
         )
     )
     return {

@@ -2,8 +2,10 @@
 Page-fetching MCP tool.
 
 Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
-structured metadata summary) or, when handed a YouTube video URL, that video's
-transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
+structured metadata summary), represents prominent images with explicit textual
+stand-ins, or, when handed a YouTube video URL, returns that video's transcript.
+Direct image URLs return metadata/embedded descriptions rather than raw bytes.
+PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
 uses authenticated OAuth JSON when configured, then tries RSS, old.reddit HTML,
 and finally oEmbed metadata for individual posts.
@@ -25,7 +27,7 @@ import re
 import time
 from functools import partial
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import anyio
 import httpx
@@ -40,6 +42,7 @@ from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     DownloadTooLargeError,
     _decode_body,
+    _is_image_resource,
     _is_tika_document,
     _sniff_document_bytes,
     _tika_extract,
@@ -51,6 +54,7 @@ from .web_extract import (
     _page_title,
     _plain_text_from_soup,
     _structured_from_html,
+    _standalone_image_description,
     _structured_section_from_html,
     _trim_flagged,
 )
@@ -72,8 +76,12 @@ def _fetch_page_desc(prefix: str) -> str:
         "Read one web page, document, or YouTube video transcript.\n\n"
         "BASIC USE — this is all most calls need: pass one URL to get that page as "
         "markdown (headings, lists, tables, and links are kept, links as absolute "
-        "URLs you can fetch). A YouTube video URL is detected automatically and "
-        "returns the video's transcript. The parameters below are optional "
+        "URLs you can fetch). Prominent images become inline `[Image at this "
+        "location: ...]` markers where the image appeared, using page-provided "
+        "alt text, captions, or metadata. A direct image "
+        "URL returns the same explicit placeholder plus any embedded description. "
+        "A YouTube video URL is detected automatically and returns the video's "
+        "transcript. The parameters below are optional "
         "refinements — omit them all to get the whole page.\n\n"
         "PAGE OUTLINE / SECTION WORKFLOW:\n"
         "If a " + prefix + "search_web result already has page_headings/page_toc "
@@ -91,7 +99,7 @@ def _fetch_page_desc(prefix: str) -> str:
         "heading (in structured mode, only that section's sub-headings/toc).\n"
         '• mode — "text" (the default) returns the page content; "structured" '
         "returns the page outline and metadata (title, description, headings, toc, "
-        "JSON-LD).\n"
+        "JSON-LD, prominent image descriptions).\n"
         "• offset — for CONTINUING a long page only. If a result comes back marked "
         '"truncated", call again with offset set to the "next_offset" value from '
         "that result to read the next chunk. Do NOT set it on a first fetch. It "
@@ -102,7 +110,7 @@ def _fetch_page_desc(prefix: str) -> str:
         "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
         "truncated?,offset?,next_offset?,content_length?,note?} (format: "
         "\"youtube_transcript\"|"
-        '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
+        '"markdown"|"text"|"structured"|"section"|"document_text"|"image"|"json").'
     )
 
 
@@ -934,8 +942,12 @@ def _render_text_mode(html: str, base_url: str) -> tuple[str | None, str, str]:
     soup = BeautifulSoup(html, "lxml")
     title = _page_title(soup)
     if cfg.markdown:
-        return title, _markdown_from_soup(soup, base_url), "markdown"
-    return title, _plain_text_from_soup(soup), "text"
+        return title, _markdown_from_soup(
+            soup, base_url, cfg.max_image_descriptions
+        ), "markdown"
+    return title, _plain_text_from_soup(
+        soup, base_url, cfg.max_image_descriptions
+    ), "text"
 
 
 def _parse_section(html: str, section: str, base_url: str = "") -> tuple[str | None, dict | None, list[str]]:
@@ -949,7 +961,9 @@ def _parse_section(html: str, section: str, base_url: str = "") -> tuple[str | N
     """
     soup = BeautifulSoup(html, "lxml")
     title = _page_title(soup)
-    section_data = _find_section(soup, section, base_url)
+    section_data = _find_section(
+        soup, section, base_url, cfg.max_image_descriptions
+    )
     if section_data is not None:
         return title, section_data, []
     available = [
@@ -973,6 +987,31 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
+def _standalone_image_marker(
+    url: str, ctype: str, text: str | None, body: bytes | None
+) -> tuple[str, dict]:
+    """Build explicit text standing in for a directly fetched image."""
+    description, source = _standalone_image_description(text, body)
+    filename = unquote((urlparse(url).path or "").rsplit("/", 1)[-1]).strip()
+    filename = filename[:200] if filename else None
+    media_type = (ctype or "").split(";", 1)[0].strip().lower() or "image"
+
+    fields: dict = {"media_type": media_type}
+    if filename:
+        fields["filename"] = filename
+    if description:
+        fields["description"] = description
+        fields["description_source"] = source
+        marker = f"[Image at this location: {description}]"
+    else:
+        identity = f' file "{filename}"' if filename else ""
+        marker = (
+            f"[Image at this location: standalone image{identity} ({media_type}); "
+            "no alt text, caption, or embedded description was available.]"
+        )
+    return marker, fields
+
+
 def _unsupported_media_error(
     fetch_url: str, status: int | None, ctype: str, size: int | None
 ) -> ToolError:
@@ -986,7 +1025,8 @@ def _unsupported_media_error(
     return ToolError(
         f"{fetch_url} was fetched successfully ({', '.join(details)}), but this "
         "tool cannot extract that media type. fetch_page can read HTML/text/JSON, "
-        "YouTube transcripts, and document files such as PDF, Word, Excel, "
+        "standalone image metadata, YouTube transcripts, and document files such "
+        "as PDF, Word, Excel, "
         "PowerPoint, OpenDocument, RTF, and EPUB via Tika. Use a browser/direct "
         "download for this file, or fetch a text/HTML/document version of the "
         "same content."
@@ -1236,6 +1276,44 @@ async def _fetch_one(
             _set_content(doc_payload, extracted, offset=offset)
         return doc_payload
 
+    # A direct image has no surrounding HTML from which to obtain alt text or a
+    # caption. Return an explicit text placeholder instead of treating the bytes
+    # as unsupported media; SVG title/description metadata is surfaced when it
+    # exists, while raster images clearly report that no textual description was
+    # available. This is metadata extraction, not pixel-level visual analysis.
+    if (
+        fetched.get("resource_kind") == "image"
+        or _is_image_resource(ctype, fetch_url, fetched.get("bytes"))
+    ):
+        if section:
+            raise ToolError(
+                "A standalone image has no heading sections; omit `section`."
+            )
+        marker, image_fields = _standalone_image_marker(
+            fetch_url, ctype, fetched.get("text"), fetched.get("bytes")
+        )
+        image_payload = {
+            "url": fetch_url,
+            **_provenance(url, fetch_url, status, ctype, via),
+            "format": "image",
+            **image_fields,
+            "note": (
+                "The content marker is returned in place of the image. Any "
+                "description comes from embedded metadata, not visual analysis."
+            ),
+        }
+        if query:
+            qres = await _query_payload(marker, query, fetch_url, kind="image metadata")
+            marker = qres.pop("content")
+            extra_note = qres.pop("note", None)
+            image_payload.update(qres)
+            if extra_note:
+                image_payload["note"] = _join_note(
+                    image_payload.get("note"), extra_note
+                )
+        _set_content(image_payload, marker, hint=False, offset=offset)
+        return image_payload
+
     if fetched.get("bytes") is not None and fetched.get("text") is None:
         raise _unsupported_media_error(
             fetch_url, status, ctype, len(fetched.get("bytes") or b"")
@@ -1285,7 +1363,11 @@ async def _fetch_one(
         if section:
             try:
                 structured, available = await anyio.to_thread.run_sync(
-                    _structured_section_from_html, text, fetch_url, section
+                    _structured_section_from_html,
+                    text,
+                    fetch_url,
+                    section,
+                    cfg.max_image_descriptions,
                 )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
@@ -1301,7 +1383,10 @@ async def _fetch_one(
         else:
             try:
                 structured = await anyio.to_thread.run_sync(
-                    _structured_from_html, text, fetch_url
+                    _structured_from_html,
+                    text,
+                    fetch_url,
+                    cfg.max_image_descriptions,
                 )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
