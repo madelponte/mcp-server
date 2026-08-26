@@ -470,6 +470,20 @@ def test_markdown_resolves_citation_marker_to_source_url():
     assert "#cite_note-2" not in out
 
 
+def test_citation_resolution_skips_internal_author_link_for_external_source():
+    html = (
+        '<article><p>Claim<sup class="reference">'
+        '<a href="#cite_note-1">[1]</a></sup>.</p>'
+        '<ol><li id="cite_note-1">'
+        '<a href="/wiki/Author">Author</a> '
+        '<a class="external" href="https://doi.org/10.1000/example">Paper</a>'
+        '</li></ol></article>'
+    )
+    out = _markdown_from_html(html, "https://en.wikipedia.org/wiki/Example")
+    assert "[[1]](https://doi.org/10.1000/example)" in out
+    assert "[[1]](https://en.wikipedia.org/wiki/Author)" not in out
+
+
 def test_markdown_preserves_ordinary_fragment_link_without_hijacking_it():
     html = (
         '<article><p><a href="#details">Jump to details</a></p>'

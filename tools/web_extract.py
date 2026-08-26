@@ -12,7 +12,7 @@ both tools can import it without coupling.
 import json
 import re
 import unicodedata
-from urllib.parse import quote, unquote, urldefrag, urljoin
+from urllib.parse import quote, unquote, urldefrag, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 from markdownify import MarkdownConverter
@@ -750,9 +750,20 @@ def _resolve_citation_href(id_map: dict, href: str, base_url: str) -> str | None
     target = id_map.get(frag) if frag else None
     if target is None:
         return None
+    base_host = urlsplit(base_url).netloc.casefold()
     for ext in target.find_all("a", href=True):
         url = _external_href(ext["href"], base_url)
-        if url:
+        if not url:
+            continue
+        classes = {str(value).casefold() for value in ext.get("class", [])}
+        rels = {str(value).casefold() for value in ext.get("rel", [])}
+        link_host = urlsplit(url).netloc.casefold()
+        explicitly_external = bool(
+            "external" in classes
+            or "mw:extlink" in rels
+            or (link_host and base_host and link_host != base_host)
+        )
+        if explicitly_external:
             return url
     return None
 
