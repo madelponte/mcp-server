@@ -310,7 +310,8 @@ def test_reddit_representation_urls():
     assert oauth.startswith("https://oauth.reddit.com/")
     assert "raw_json=1" in oauth
     assert "limit=500" in oauth
-    assert _reddit_rss_url(url).endswith("/title/.rss?context=3")
+    assert _reddit_rss_url(url).endswith("/title/.rss")
+    assert "context=" not in _reddit_rss_url(url)
     assert _reddit_old_url(url).startswith("https://old.reddit.com/")
 
 
@@ -339,6 +340,7 @@ def test_reddit_oembed_url_uses_post_url_not_json_endpoint():
     assert "/oembed?" in out
     assert "title.json" not in out
     assert "www.reddit.com" in out
+    assert "context%3D3" not in out
 
 
 # --------------------------- _compact_reddit_json ---------------------------

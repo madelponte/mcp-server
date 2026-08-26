@@ -69,6 +69,15 @@ def test_reddit_request_delay_must_be_nonnegative(monkeypatch):
     assert WebSearchSettings().reddit_request_delay_seconds == 0
 
 
+def test_reddit_rate_limit_retry_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS", "0")
+    assert WebSearchSettings().reddit_rate_limit_retry_seconds == 0
+
+
 def test_image_description_cap_must_be_nonnegative(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_MAX_IMAGE_DESCRIPTIONS", "-1")
     with pytest.raises(ValidationError):

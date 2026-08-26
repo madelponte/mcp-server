@@ -24,6 +24,7 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "reddit_client_secret", "")
     monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
     monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 0)
+    monkeypatch.setattr(fp.cfg, "reddit_rate_limit_retry_seconds", 0)
     monkeypatch.setattr(fp, "_reddit_access_token", None)
     monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
     monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
@@ -591,6 +592,35 @@ def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
     assert "/oembed?" in calls[2]
     assert json.loads(out["content"])["title"] == "Fallback title"
     assert "without comments" in out["note"]
+
+
+def test_reddit_rss_retries_once_after_rate_limit(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "reddit_rate_limit_retry_seconds", 3)
+    calls = []
+    sleeps = []
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <id>t3_abc</id><title>RSS title</title>
+    </entry></feed>"""
+
+    async def acquire(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return _fetched(status=429, text="Too Many Requests")
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(fp.anyio, "sleep", sleep)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert len(calls) == 2
+    assert sleeps == [3]
+    assert json.loads(out["content"])["post"]["title"] == "RSS title"
+    assert "HTTP 429" in out["note"]
+    assert "automatic retry succeeded" in out["note"]
 
 
 def test_reddit_oembed_reports_rate_limit_without_debug(monkeypatch, tool_fns):

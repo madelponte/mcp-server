@@ -288,6 +288,14 @@ class WebSearchSettings(BaseSettings):
             "0 disables queueing."
         ),
     )
+    reddit_rate_limit_retry_seconds: float = Field(
+        3.0,
+        ge=0,
+        description=(
+            "Wait this many seconds and retry Reddit RSS once after HTTP 429; "
+            "0 disables the retry."
+        ),
+    )
     ssrf_allowlist: str = Field(
         "",
         description=(

@@ -647,11 +647,19 @@ def _reddit_oauth_url(url: str) -> str:
 
 
 def _reddit_rss_url(url: str) -> str:
-    """Build a Reddit Atom feed URL for a post or listing."""
+    """Build a Reddit Atom feed URL for a post or listing.
+
+    Post query parameters such as ``context``, ``sort``, and share-tracking
+    tokens do not change the Atom snapshot. Dropping them gives every variant of
+    one post the same cache key and prevents duplicate anonymous Reddit requests.
+    Listing/search parameters remain significant and are preserved.
+    """
     parsed = urlparse(url)
+    is_post = _is_reddit_post_url(url)
     path = _reddit_clean_path(url).rstrip("/")
-    path += "/.rss" if _is_reddit_post_url(url) else ".rss"
-    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", parsed.query, ""))
+    path += "/.rss" if is_post else ".rss"
+    query = "" if is_post else parsed.query
+    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", query, ""))
 
 
 def _reddit_old_url(url: str) -> str:
@@ -666,9 +674,9 @@ def _reddit_oembed_url(url: str) -> str:
     """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
     p = urlparse(url)
     path = _reddit_clean_path(url)
-    post_url = urlunparse(
-        (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
-    )
+    # oEmbed identifies the submission from its path. Omitting context/sort/share
+    # parameters canonicalizes the fallback cache key just like the post RSS URL.
+    post_url = urlunparse((p.scheme or "https", "www.reddit.com", path, "", "", ""))
     return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
 
 
@@ -1055,6 +1063,16 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
     rss_url = _reddit_rss_url(url)
     try:
         fetched = await _acquire_page(rss_url)
+        if (
+            fetched.get("status") == 429
+            and cfg.reddit_rate_limit_retry_seconds > 0
+        ):
+            trace.append(
+                "RSS returned HTTP 429; retrying after "
+                f"{cfg.reddit_rate_limit_retry_seconds:g}s"
+            )
+            await anyio.sleep(cfg.reddit_rate_limit_retry_seconds)
+            fetched = await _acquire_page(rss_url)
         if fetched.get("status", 0) >= 400:
             raise RuntimeError(f"HTTP {fetched['status']}")
         compact = await anyio.to_thread.run_sync(
@@ -1401,11 +1419,20 @@ async def _fetch_one(
                 "returning official oEmbed post metadata without comments.",
             )
         if any("HTTP 429" in step for step in reddit_trace):
-            payload["note"] = _join_note(
-                payload.get("note"),
-                "Reddit rate-limited at least one representation (HTTP 429). "
-                "Retry later or configure Reddit OAuth for reliable post/comment access.",
-            )
+            if reddit_source == "rss" and any(
+                "retrying after" in step for step in reddit_trace
+            ):
+                rate_limit_note = (
+                    "Reddit rate-limited the initial RSS request (HTTP 429); "
+                    "the automatic retry succeeded. Configure Reddit OAuth for "
+                    "more reliable post/comment access."
+                )
+            else:
+                rate_limit_note = (
+                    "Reddit rate-limited at least one representation (HTTP 429). "
+                    "Retry later or configure Reddit OAuth for reliable post/comment access."
+                )
+            payload["note"] = _join_note(payload.get("note"), rate_limit_note)
         if debug_enabled():
             backend_passwords = tuple(
                 urlparse(endpoint).password or ""
