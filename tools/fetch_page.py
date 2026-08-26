@@ -564,6 +564,36 @@ _reddit_access_token_expires_at = 0.0
 _reddit_access_token_credentials: tuple[str, str] | None = None
 
 
+class _RedditRequestQueue:
+    """Serialize Reddit acquisitions and leave a quiet period between them.
+
+    Reddit's anonymous RSS/HTML endpoints throttle bursts aggressively on hosted
+    IPs. One slot covers the complete fallback chain so concurrent tool calls do
+    not each fan out into RSS, old.reddit, and oEmbed requests at the same time.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._next_request_at = 0.0
+
+    async def acquire(self, url: str) -> tuple[dict, Any, str, list[str]]:
+        delay = cfg.reddit_request_delay_seconds
+        if delay <= 0:
+            return await _acquire_reddit_unqueued(url)
+
+        async with self._lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
+                await anyio.sleep(wait)
+            try:
+                return await _acquire_reddit_unqueued(url)
+            finally:
+                self._next_request_at = time.monotonic() + delay
+
+
+_reddit_request_queue = _RedditRequestQueue()
+
+
 def _is_reddit_url(url: str) -> bool:
     """Whether a URL targets reddit.com or one of its real subdomains."""
     try:
@@ -1004,7 +1034,7 @@ def _reddit_failure_trace(name: str, exc: BaseException) -> str:
     return f"{name} failed ({detail})"
 
 
-async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
+async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]:
     """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
     errors: list[str] = []
     trace: list[str] = []
@@ -1070,6 +1100,11 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
             trace.append(failure)
 
     raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
+
+
+async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
+    """Acquire Reddit content through the process-wide anti-burst queue."""
+    return await _reddit_request_queue.acquire(url)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1399,12 @@ async def _fetch_one(
                 payload.get("note"),
                 "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
                 "returning official oEmbed post metadata without comments.",
+            )
+        if any("HTTP 429" in step for step in reddit_trace):
+            payload["note"] = _join_note(
+                payload.get("note"),
+                "Reddit rate-limited at least one representation (HTTP 429). "
+                "Retry later or configure Reddit OAuth for reliable post/comment access.",
             )
         if debug_enabled():
             backend_passwords = tuple(

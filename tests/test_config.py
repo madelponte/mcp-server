@@ -60,6 +60,15 @@ def test_searxng_request_delay_must_be_nonnegative(monkeypatch):
     assert WebSearchSettings().searxng_request_delay_seconds == 0
 
 
+def test_reddit_request_delay_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS", "0")
+    assert WebSearchSettings().reddit_request_delay_seconds == 0
+
+
 def test_image_description_cap_must_be_nonnegative(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_MAX_IMAGE_DESCRIPTIONS", "-1")
     with pytest.raises(ValidationError):

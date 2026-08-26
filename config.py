@@ -279,6 +279,15 @@ class WebSearchSettings(BaseSettings):
             "'linux:mcp-server:1.0 (by /u/your_username)'."
         ),
     )
+    reddit_request_delay_seconds: float = Field(
+        1.0,
+        ge=0,
+        description=(
+            "Minimum quiet period between Reddit fetch_page acquisitions. "
+            "Requests are serialized to reduce anonymous RSS/HTML throttling; "
+            "0 disables queueing."
+        ),
+    )
     ssrf_allowlist: str = Field(
         "",
         description=(

@@ -23,6 +23,7 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "reddit_client_id", "")
     monkeypatch.setattr(fp.cfg, "reddit_client_secret", "")
     monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
+    monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 0)
     monkeypatch.setattr(fp, "_reddit_access_token", None)
     monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
     monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
@@ -590,6 +591,27 @@ def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
     assert "/oembed?" in calls[2]
     assert json.loads(out["content"])["title"] == "Fallback title"
     assert "without comments" in out["note"]
+
+
+def test_reddit_oembed_reports_rate_limit_without_debug(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.server_settings, "debug", False)
+
+    async def acquire(url):
+        if url.endswith("/.rss"):
+            return _fetched(status=429, text="Too Many Requests")
+        if "/oembed?" in url:
+            return _fetched(
+                text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
+                content_type="application/json",
+            )
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert "HTTP 429" in out["note"]
+    assert "configure Reddit OAuth" in out["note"]
 
 
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
