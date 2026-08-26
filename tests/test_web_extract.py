@@ -401,6 +401,18 @@ def test_markdown_folds_figure_caption_into_image_marker_without_duplication():
     assert out.index("Before.") < out.index(marker) < out.index("After.")
 
 
+def test_markdown_skips_image_detached_with_consumed_figure_caption():
+    html = (
+        '<article><figure><img src="hero.jpg" alt="Main image">'
+        '<figcaption>Caption text <img src="badge.jpg" alt="Badge"></figcaption>'
+        '</figure><p>After.</p></article>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    assert "[Image at this location: Main image — Caption: Caption text]" in out
+    assert "Badge" not in out
+    assert "After." in out
+
+
 def test_markdown_uses_open_graph_image_alt_when_img_alt_is_missing():
     html = (
         '<head><meta property="og:image" content="https://cdn.example/hero.jpg">'

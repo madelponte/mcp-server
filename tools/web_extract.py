@@ -646,14 +646,21 @@ def _replace_prominent_images(
     records = _prominent_image_records(
         soup, root, base_url, max_images=max_images, candidates=candidates
     )
-    for img, caption_tag, _public, marker in records:
+    replaced = []
+    for img, caption_tag, public, marker in records:
+        # Replacing an earlier figure image can remove its caption, including
+        # any nested image that was also selected as a candidate. BeautifulSoup
+        # raises if ``replace_with`` is called on that now-detached image.
+        if img.parent is None:
+            continue
         placeholder = soup.new_tag("span")
         placeholder[_IMAGE_PLACEHOLDER_ATTR] = "true"
         placeholder.string = marker
         img.replace_with(placeholder)
+        replaced.append(public)
         if caption_tag is not None and caption_tag.parent is not None:
             caption_tag.decompose()
-    return [record[2] for record in records]
+    return replaced
 
 
 # ---------------------------------------------------------------------------
