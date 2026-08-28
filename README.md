@@ -28,18 +28,44 @@ overwhelm a model's context window. Omitting a value uses the cap.
 ### Agentic Web Search
 
 `search_web(query, time_range=None, category=None, num_results=None, enrich_results=None, page=None)`
-— Search the web via SearXNG and return a ranked list of results. Each result
-carries a url, title, snippet, optional published date, and (for the top
+— Search the web via SearXNG, falling back to Firecrawl when SearXNG fails (or
+using Firecrawl directly when SearXNG is disabled), and return a ranked list of
+results. The top-level `provider` field reports which backend answered. Each
+result carries a url, title, snippet, optional published date, and (for the top
 results) page metadata: a description plus a heading/JSON-LD table-of-contents
 outline, so the model can decide which links are worth fetching in full.
 `time_range` accepts `day`/`week`/`month`/`year`/`all`; `category` accepts
 SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
-`videos`, `map`, comma-separated to combine). Video searches use
-SearXNG's YouTube engine and discard non-YouTube URLs, because `fetch_page` can
-only read transcripts from YouTube video results.
+`videos`, `map`, comma-separated to combine). Video searches use SearXNG's
+YouTube engine or a Firecrawl `site:youtube.com` web search and discard
+non-YouTube URLs, because `fetch_page` can only read transcripts from YouTube
+video results.
 `enrich_results` controls how many top results get full page metadata (`0`
 skips enrichment). `page` is a 1-based result page; use `page=2` with the same
-query to get the next batch before reformulating.
+query to get the next batch before reformulating. Firecrawl's v2 search API has
+no page-number parameter, so `page > 1` requires SearXNG; the fallback returns a
+tool error instead of silently repeating page 1.
+
+Firecrawl maps the tool's established categories onto its v2 search systems as
+follows, following the current
+[Firecrawl Search API](https://docs.firecrawl.dev/api-reference/endpoint/search).
+Combined categories use the union of sources and filters. The fallback does not
+request page scraping, so it returns Firecrawl's default URL/title/description
+search records before this server applies its existing optional enrichment.
+
+| Tool category | Firecrawl mapping |
+| --- | --- |
+| `general` | `sources: ["web"]` |
+| `news` | `sources: ["news"]` |
+| `science` | `sources: ["web"]`, `categories: ["research"]` |
+| `it`, `social media`, `map` | `sources: ["web"]` |
+| `videos` | `sources: ["web"]` plus `site:youtube.com` |
+
+The Firecrawl Map endpoint is a site-URL discovery API, not a geographic search
+backend, so the tool's `map` category intentionally stays on web search.
+Firecrawl has no documented equivalents for SearXNG's language or safe-search
+parameters. Recency maps to Firecrawl's `tbs` values (`qdr:d`, `qdr:w`,
+`qdr:m`, and `qdr:y`).
 
 `fetch_page(url, mode="text", section=None, query=None, max_matches=None, context_lines=None, include_match_toc=false, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
@@ -230,8 +256,9 @@ for the full list with defaults. Key things to set:
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
-- `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default. Concurrent `search_web` calls are queued and sent sequentially; `WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS` sets the quiet period between completed responses and the next request (default `1`, `0` disables queueing).
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
+- `WEB_SEARCH_SEARXNG_ENABLED` / `WEB_SEARCH_SEARXNG_URL` — SearXNG is the primary search provider and the bundled service is enabled by default. Set `WEB_SEARCH_SEARXNG_ENABLED=false` and restart the server to stop all requests while an upstream limit resets; configured Firecrawl search then becomes the only provider. Concurrent SearXNG calls are queued and sent sequentially; `WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS` sets the quiet period between completed responses and the next request (default `1`, `0` disables queueing).
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional shared credential; enables Firecrawl search fallback and the existing fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
+- `WEB_SEARCH_FIRECRAWL_SEARCH_API_URL` — Firecrawl v2 search endpoint. Blank disables only search fallback, leaving Firecrawl scraping available to `fetch_page`.
 - `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
 - `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
 - `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
@@ -364,9 +391,11 @@ services (and the `depends_on` block) from `docker-compose.yml`. The stock,
 Wolfram, geocoding, and email tools have no local-service dependencies, though
 they may need API keys, SMTP credentials, or internet access.
 
-> **SearXNG note:** JSON output must be enabled for `search_web` to work — the
+> **SearXNG note:** JSON output must be enabled for SearXNG search to work — the
 > bundled [searxng/settings.yml](https://github.com/madelponte/mcp-server/blob/main/searxng/settings.yml)
-> does this. Set a real `SEARXNG_SECRET` in your `.env`.
+> does this. Set a real `SEARXNG_SECRET` in your `.env`. To pause SearXNG without
+> editing Compose, set `WEB_SEARCH_SEARXNG_ENABLED=false` and configure a
+> Firecrawl API key.
 
 ## Run with Docker (server only)
 

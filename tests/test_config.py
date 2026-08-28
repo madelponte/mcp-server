@@ -60,6 +60,11 @@ def test_searxng_request_delay_must_be_nonnegative(monkeypatch):
     assert WebSearchSettings().searxng_request_delay_seconds == 0
 
 
+def test_searxng_can_be_disabled_for_firecrawl_only_search(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_ENABLED", "false")
+    assert WebSearchSettings().searxng_enabled is False
+
+
 def test_reddit_request_delay_must_be_nonnegative(monkeypatch):
     monkeypatch.setenv("WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS", "-0.1")
     with pytest.raises(ValidationError):

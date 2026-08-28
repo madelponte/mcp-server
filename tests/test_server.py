@@ -84,6 +84,8 @@ def test_search_web_documents_common_operators(server):
         "inurl:",
     ):
         assert operator in query_desc
+    assert "Firecrawl" in tool.description
+    assert "provider" in tool.description
 
 
 def _tool_by_name(server, name):

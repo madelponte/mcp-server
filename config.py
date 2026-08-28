@@ -85,6 +85,14 @@ class WebSearchSettings(BaseSettings):
         env_prefix="WEB_SEARCH_", env_file=ENV_FILE, extra="ignore"
     )
 
+    searxng_enabled: bool = Field(
+        True,
+        description=(
+            "Use SearXNG as the primary search_web provider. Disable this "
+            "temporarily to let an upstream rate limit reset; Firecrawl search "
+            "is used instead when configured."
+        ),
+    )
     searxng_url: str = Field(
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
@@ -143,20 +151,27 @@ class WebSearchSettings(BaseSettings):
         "https://api.firecrawl.dev/v2/scrape",
         description="Firecrawl v2 scrape endpoint used as the last-resort page fallback.",
     )
+    firecrawl_search_api_url: str = Field(
+        "https://api.firecrawl.dev/v2/search",
+        description=(
+            "Firecrawl v2 search endpoint used when SearXNG fails or is disabled. "
+            "Blank disables Firecrawl search without disabling Firecrawl scraping."
+        ),
+    )
     firecrawl_api_key: str = Field(
         "",
         description=(
-            "Firecrawl API key. When set, fetch_page uses Firecrawl after the "
-            "FlareSolverr render is blocked, unusable, or unresolved, and to "
-            "recover text from a known document blocked by an HTML challenge. "
-            "Blank disables the Firecrawl fallback."
+            "Firecrawl API key. When set, search_web can fall back to Firecrawl "
+            "search and fetch_page uses Firecrawl after the FlareSolverr render "
+            "is blocked, unusable, or unresolved, including for known documents "
+            "blocked by an HTML challenge. Blank disables both fallbacks."
         ),
     )
     firecrawl_timeout_seconds: float = Field(
         60.0, gt=0,
         description=(
-            "Timeout for a Firecrawl scrape, in seconds (clamped to Firecrawl's "
-            "supported 1-300 second range)."
+            "Timeout for a Firecrawl search or scrape request, in seconds "
+            "(clamped to Firecrawl's supported 1-300 second range)."
         ),
     )
     firecrawl_hedge_enabled: bool = Field(

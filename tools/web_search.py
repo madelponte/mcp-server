@@ -1,12 +1,13 @@
 """
 Agentic Web Search MCP tool.
 
-Exposes `search_web`, backed by a self-hosted SearXNG instance. Results are
-url/title/snippet, optionally enriched with structured page metadata (title,
-description, heading outline) for the top hits so the model can decide what to
-read. The companion `fetch_page` tool (in `tools/fetch_page.py`) reads the full
-content of a result. The HTTP fetching both tools share lives in
-`tools/web_fetch.py`; the HTML extraction in `tools/web_extract.py`.
+Exposes `search_web`, backed by a self-hosted SearXNG instance with Firecrawl
+search as an optional fallback. Results are url/title/snippet, optionally
+enriched with structured page metadata (title, description, heading outline)
+for the top hits so the model can decide what to read. The companion
+`fetch_page` tool (in `tools/fetch_page.py`) reads the full content of a result.
+The HTTP fetching both tools share lives in `tools/web_fetch.py`; the HTML
+extraction in `tools/web_extract.py`.
 
 Translated from the Open WebUI tool; status/citation event emitters were removed.
 """
@@ -106,6 +107,8 @@ async def close_clients() -> None:
 def _search_web_desc(prefix: str) -> str:
     return (
         "Search the web. Use for unknown facts, current events, or verification.\n\n"
+        "SearXNG is the primary provider; configured servers may fall back to "
+        "Firecrawl. The response identifies the provider used.\n\n"
         "Results include url/title/snippet + optional page metadata (headings, "
         "description) for top results. Enriched headings include stable anchors "
         "and `citation_url` when the source provides a real fragment. Then use "
@@ -120,8 +123,9 @@ def _search_web_desc(prefix: str) -> str:
         "num_results/enrich_results: max counts (see per-arg caps; enrich fetches "
         "metadata). page: result page (1-based, default 1) — set page=2 to get the "
         "next batch of results for the SAME query when the first page wasn't "
-        "useful, instead of reformulating.\n\n"
-        "Returns JSON {query, time_range, category, page, results:[{url,title,"
+        "useful, instead of reformulating. Firecrawl supports page 1 only; "
+        "later pages require SearXNG.\n\n"
+        "Returns JSON {query, provider, time_range, category, page, results:[{url,title,"
         "snippet,published_date?,page_title?,page_description?,page_headings?,"
         "page_toc?}]}"
     )
@@ -139,6 +143,13 @@ _TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
 _YOUTUBE_ENGINE_SELECTOR = "!yt"
 _YOUTUBE_ENGINE_ALIASES = ("!yt", "!youtube")
 _YOUTUBE_HOSTS = ("youtube.com", "youtube-nocookie.com", "youtu.be")
+_FIRECRAWL_TIME_RANGES = {
+    "": "",
+    "day": "qdr:d",
+    "week": "qdr:w",
+    "month": "qdr:m",
+    "year": "qdr:y",
+}
 
 
 def _clamp_count(
@@ -184,6 +195,41 @@ def _youtube_engine_query(query: str) -> str:
     ):
         return query
     return f"{_YOUTUBE_ENGINE_SELECTOR} {query}"
+
+
+def _firecrawl_video_query(query: str) -> str:
+    """Restrict Firecrawl's web source to YouTube with its supported site operator."""
+    stripped = query.strip()
+    if stripped.lower().startswith("site:youtube.com "):
+        return stripped
+    return f"site:youtube.com {stripped}"
+
+
+def _firecrawl_search_filters(categories: str) -> tuple[list[str], list[str]]:
+    """Map SearXNG categories to Firecrawl v2 sources and category filters.
+
+    Firecrawl's ``news`` is a source, while ``research`` is a category filter.
+    Its Map API discovers URLs on one site and is unrelated to SearXNG's
+    geographic ``map`` search category, so map searches use the broad web
+    source. IT and social-media searches are likewise broader than Firecrawl's
+    GitHub-only filter and remain web searches.
+    """
+    requested = [part.strip().lower() for part in categories.split(",") if part.strip()]
+    if not requested:
+        requested = ["general"]
+
+    sources: list[str] = []
+    filters: list[str] = []
+    for category in requested:
+        if category == "news":
+            if "news" not in sources:
+                sources.append("news")
+            continue
+        if "web" not in sources:
+            sources.append("web")
+        if category == "science" and "research" not in filters:
+            filters.append("research")
+    return sources, filters
 
 
 def _is_youtube_result_url(url: str | None) -> bool:
@@ -257,6 +303,102 @@ async def _searxng_query(
         if published:
             item["published_date"] = published
         out.append(item)
+    return out
+
+
+async def _firecrawl_query(
+    api_url: str,
+    api_key: str,
+    query: str,
+    *,
+    num_results: int,
+    categories: str,
+    time_range: str,
+    timeout: float,
+    verify_ssl: bool,
+    page: int = 1,
+) -> list[dict]:
+    """Run a Firecrawl v2 search and normalize its web/news result arrays."""
+    if page > 1:
+        raise RuntimeError(
+            "Firecrawl search does not support result-page pagination; retry "
+            "page=1 or re-enable SearXNG for page > 1."
+        )
+
+    sources, category_filters = _firecrawl_search_filters(categories)
+    payload: dict = {
+        "query": (
+            _firecrawl_video_query(query)
+            if _category_includes_videos(categories)
+            else query
+        ),
+        "limit": num_results,
+        "sources": sources,
+        "timeout": max(1000, min(300000, int(timeout * 1000))),
+    }
+    if category_filters:
+        payload["categories"] = category_filters
+    tbs = _FIRECRAWL_TIME_RANGES.get(time_range, "")
+    if tbs:
+        payload["tbs"] = tbs
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    http_timeout = payload["timeout"] / 1000 + 10
+    async with httpx.AsyncClient(verify=verify_ssl, timeout=http_timeout) as client:
+        resp = await client.post(api_url, json=payload, headers=headers)
+
+    try:
+        response_data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError("Firecrawl search returned invalid JSON.") from exc
+    if not isinstance(response_data, dict):
+        raise RuntimeError("Firecrawl search returned a JSON value that is not an object.")
+    if resp.status_code < 200 or resp.status_code >= 300:
+        message = str(response_data.get("error") or "unknown Firecrawl error")[:500]
+        raise RuntimeError(f"Firecrawl search returned HTTP {resp.status_code}: {message}")
+    if response_data.get("success") is not True:
+        message = str(response_data.get("error") or "search was unsuccessful")[:500]
+        raise RuntimeError(f"Firecrawl search failed: {message}")
+
+    data = response_data.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("Firecrawl search response did not contain a data object.")
+
+    out: list[dict] = []
+    seen_urls: set[str] = set()
+    for source in sources:
+        items = data.get(source) or []
+        if not isinstance(items, list):
+            raise RuntimeError(
+                f"Firecrawl search returned a non-list {source!r} result value."
+            )
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            metadata = raw.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            url = raw.get("url") or metadata.get("url") or metadata.get("sourceURL")
+            if not isinstance(url, str) or not url.strip() or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            title = raw.get("title") or metadata.get("title")
+            snippet = (
+                raw.get("snippet")
+                or raw.get("description")
+                or metadata.get("description")
+                or ""
+            )
+            item = {"url": url, "title": title, "snippet": str(snippet).strip()}
+            published = raw.get("date") or raw.get("publishedDate")
+            if published:
+                item["published_date"] = published
+            out.append(item)
+            if len(out) >= num_results:
+                return out
     return out
 
 
@@ -351,32 +493,78 @@ def register(mcp: FastMCP) -> None:
         # Page is 1-based; anything below 1 (or unset) means the first page.
         resolved_page = page if isinstance(page, int) and page > 1 else 1
 
-        try:
-            search_query = (
-                _youtube_engine_query(query)
-                if _category_includes_videos(resolved_categories)
-                else query
+        resolved_num_results = _clamp_count(
+            num_results, cfg.max_num_results, minimum=1
+        )
+        provider: str | None = None
+        results: list[dict] | None = None
+        provider_errors: list[str] = []
+
+        if cfg.searxng_enabled:
+            try:
+                search_query = (
+                    _youtube_engine_query(query)
+                    if _category_includes_videos(resolved_categories)
+                    else query
+                )
+                results = await _searxng_query(
+                    base_url=cfg.searxng_url,
+                    query=search_query,
+                    num_results=resolved_num_results,
+                    categories=resolved_categories,
+                    language=cfg.searxng_language,
+                    time_range=resolved_time_range,
+                    safe_search=cfg.searxng_safesearch,
+                    timeout=cfg.http_timeout_seconds,
+                    verify_ssl=cfg.verify_ssl,
+                    user_agent=cfg.user_agent,
+                    page=resolved_page,
+                    request_delay_seconds=cfg.searxng_request_delay_seconds,
+                )
+                provider = "searxng"
+            except Exception as exc:
+                provider_errors.append(f"SearXNG failed: {exc}")
+                log.warning(
+                    "SearXNG search failed; checking the Firecrawl fallback: %s",
+                    redact_secrets(exc, urlparse(cfg.searxng_url).password or ""),
+                )
+
+        firecrawl_url = cfg.firecrawl_search_api_url.strip()
+        firecrawl_key = cfg.firecrawl_api_key.strip()
+        if results is None and firecrawl_url and firecrawl_key:
+            try:
+                results = await _firecrawl_query(
+                    api_url=firecrawl_url,
+                    api_key=firecrawl_key,
+                    query=query,
+                    num_results=resolved_num_results,
+                    categories=resolved_categories,
+                    time_range=resolved_time_range,
+                    timeout=cfg.firecrawl_timeout_seconds,
+                    verify_ssl=cfg.verify_ssl,
+                    page=resolved_page,
+                )
+                provider = "firecrawl"
+            except Exception as exc:
+                provider_errors.append(f"Firecrawl failed: {exc}")
+        elif results is None:
+            provider_errors.append(
+                "Firecrawl search is not configured (set "
+                "WEB_SEARCH_FIRECRAWL_API_KEY and "
+                "WEB_SEARCH_FIRECRAWL_SEARCH_API_URL)"
             )
-            results = await _searxng_query(
-                base_url=cfg.searxng_url,
-                query=search_query,
-                num_results=_clamp_count(num_results, cfg.max_num_results, minimum=1),
-                categories=resolved_categories,
-                language=cfg.searxng_language,
-                time_range=resolved_time_range,
-                safe_search=cfg.searxng_safesearch,
-                timeout=cfg.http_timeout_seconds,
-                verify_ssl=cfg.verify_ssl,
-                user_agent=cfg.user_agent,
-                page=resolved_page,
-                request_delay_seconds=cfg.searxng_request_delay_seconds,
-            )
-        except Exception as e:
+
+        if results is None or provider is None:
+            if not cfg.searxng_enabled:
+                provider_errors.insert(0, "SearXNG is disabled")
             backend_password = urlparse(cfg.searxng_url).password or ""
-            detail = redact_secrets(e, backend_password)
-            raise ToolError(f"SearXNG query failed for {query!r}: {detail}")
+            detail = redact_secrets(
+                "; ".join(provider_errors), backend_password, firecrawl_key
+            )
+            raise ToolError(f"Web search failed for {query!r}: {detail}")
 
         applied = {
+            "provider": provider,
             "time_range": resolved_time_range or "all",
             "category": resolved_categories,
             "page": resolved_page,
