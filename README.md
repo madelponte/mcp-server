@@ -20,6 +20,15 @@ network at `http://<host>:8000/mcp`.
 | **Place Search**       | `find_nearby_places`                  |
 | **Email**              | `send_email`                          |
 
+Each tool can be independently omitted from MCP registration with its
+`<TOOL_NAME>_ENABLED` environment variable. For example, set
+`SEARCH_WEB_ENABLED=false` and `FETCH_PAGE_ENABLED=false` to replace those two
+with third-party tools. The available flags are `SEARCH_WEB_ENABLED`,
+`FETCH_PAGE_ENABLED`, `GET_COMPANY_DATA_ENABLED`,
+`QUERY_WOLFRAM_ALPHA_ENABLED`, `FIND_NEARBY_PLACES_ENABLED`, and
+`SEND_EMAIL_ENABLED`. All default to `true`; restart the server after changing
+them.
+
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
 server-configured cap is silently clamped so an oversized response can't
@@ -272,8 +281,10 @@ for the full list with defaults. Key things to set:
   password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,
   recipient cap, and attachment limits are configurable.
 
-Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
-`WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`.
+Provider variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`,
+`STOCK_`, `WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`. Tool availability uses the
+exact MCP tool name followed by `_ENABLED` (for example,
+`SEARCH_WEB_ENABLED=false`).
 
 ### Reddit Data API setup
 

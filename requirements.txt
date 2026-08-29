@@ -5,7 +5,7 @@ starlette>=1.6.0
 uvicorn>=0.52.4
 
 # Config / settings
-pydantic>=2.13.4
+pydantic>=2.13.5
 pydantic-settings>=2.15.0
 
 # Shared HTTP / async
@@ -29,7 +29,7 @@ regex>=2026.7.19
 
 # Stock Data
 requests>=2.34.2
-yfinance>=1.6.0
+yfinance>=1.7.0
 
 # YouTube Transcript
 youtube-transcript-api>=1.2.4

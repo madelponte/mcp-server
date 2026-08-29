@@ -83,9 +83,16 @@ def patch_httpx(monkeypatch):
 
 @pytest.fixture(scope="session")
 def server():
-    """The real MCP server built exactly as production does."""
-    from server import build_server
+    """The real MCP server with every tool enabled for tool-level tests.
 
+    Availability itself is covered in test_server.py. Forcing the flags here
+    keeps the rest of the suite deterministic when a developer's local .env
+    intentionally disables one or more tools.
+    """
+    from server import build_server, tool_settings
+
+    for field_name in type(tool_settings).model_fields:
+        setattr(tool_settings, field_name, True)
     return build_server()
 
 

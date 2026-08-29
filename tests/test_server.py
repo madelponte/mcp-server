@@ -13,6 +13,14 @@ EXPECTED_TOOLS = {
     "find_nearby_places",
     "send_email",
 }
+TOOL_FLAG_ATTRS = {
+    "search_web": "search_web_enabled",
+    "fetch_page": "fetch_page_enabled",
+    "get_company_data": "get_company_data_enabled",
+    "query_wolfram_alpha": "query_wolfram_alpha_enabled",
+    "find_nearby_places": "find_nearby_places_enabled",
+    "send_email": "send_email_enabled",
+}
 
 
 def _list_tools(server):
@@ -22,6 +30,20 @@ def _list_tools(server):
 def test_all_expected_tools_registered(server):
     names = {t.name for t in _list_tools(server)}
     assert names == EXPECTED_TOOLS
+
+
+@pytest.mark.parametrize(("tool_name", "flag_attr"), TOOL_FLAG_ATTRS.items())
+def test_each_tool_can_be_disabled_independently(monkeypatch, tool_name, flag_attr):
+    import server as server_mod
+
+    # Keep this independent of the developer's local .env, where other tools
+    # may also have been disabled for manual testing.
+    for attr in TOOL_FLAG_ATTRS.values():
+        monkeypatch.setattr(server_mod.tool_settings, attr, True)
+    monkeypatch.setattr(server_mod.tool_settings, flag_attr, False)
+
+    names = {t.name for t in _list_tools(server_mod.build_server())}
+    assert names == EXPECTED_TOOLS - {tool_name}
 
 
 def test_every_tool_has_a_description(server):

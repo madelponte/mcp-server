@@ -2,8 +2,9 @@
 Central configuration for the MCP server.
 
 Every Open WebUI "valve" from the original tools is exposed here as an
-environment variable. Each tool has its own settings class with a distinct
-env prefix so the variables can't collide. Values are read from the process
+environment variable. Provider settings use distinct environment prefixes so
+variables can't collide; tool availability flags use each MCP tool's complete
+name (for example, ``SEARCH_WEB_ENABLED``). Values are read from the process
 environment and, when present, the `.env` file that sits next to this module
 (see `.env.example`). Fields carry range constraints (``ge=``/``gt=``/``le=``)
 so a misconfigured cap — e.g. a negative download cap that would abort every
@@ -28,6 +29,39 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+class ToolSettings(BaseSettings):
+    """Startup availability flags for the registered MCP tools.
+
+    These fields deliberately have no additional prefix: each field already
+    contains the complete public tool name, producing environment variables
+    such as ``SEARCH_WEB_ENABLED`` and ``GET_COMPANY_DATA_ENABLED``.
+    Disabled tools are omitted from MCP registration entirely.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="", env_file=ENV_FILE, extra="ignore"
+    )
+
+    search_web_enabled: bool = Field(
+        True, description="Register the search_web tool."
+    )
+    fetch_page_enabled: bool = Field(
+        True, description="Register the fetch_page tool."
+    )
+    get_company_data_enabled: bool = Field(
+        True, description="Register the get_company_data tool."
+    )
+    query_wolfram_alpha_enabled: bool = Field(
+        True, description="Register the query_wolfram_alpha tool."
+    )
+    find_nearby_places_enabled: bool = Field(
+        True, description="Register the find_nearby_places tool."
+    )
+    send_email_enabled: bool = Field(
+        True, description="Register the send_email tool."
+    )
 
 
 class ServerSettings(BaseSettings):
@@ -754,6 +788,7 @@ class EmailSettings(BaseSettings):
 
 
 # Singletons imported by the tool modules and the server entrypoint.
+tool_settings = ToolSettings()
 server_settings = ServerSettings()
 web_search_settings = WebSearchSettings()
 stock_settings = StockSettings()

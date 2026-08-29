@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
-from config import GeocodingSettings, ServerSettings, WebSearchSettings
+from config import GeocodingSettings, ServerSettings, ToolSettings, WebSearchSettings
 
 
 def test_env_file_is_anchored_next_to_config_module():
@@ -24,6 +24,7 @@ def test_env_file_is_anchored_next_to_config_module():
 
 def test_every_settings_class_uses_the_anchored_env_file():
     classes = (
+        config.ToolSettings,
         config.ServerSettings,
         config.WebSearchSettings,
         config.StockSettings,
@@ -34,6 +35,31 @@ def test_every_settings_class_uses_the_anchored_env_file():
     )
     for cls in classes:
         assert cls.model_config["env_file"] == config.ENV_FILE, cls.__name__
+
+
+TOOL_FLAGS = (
+    "SEARCH_WEB_ENABLED",
+    "FETCH_PAGE_ENABLED",
+    "GET_COMPANY_DATA_ENABLED",
+    "QUERY_WOLFRAM_ALPHA_ENABLED",
+    "FIND_NEARBY_PLACES_ENABLED",
+    "SEND_EMAIL_ENABLED",
+)
+
+
+def test_tool_flags_default_to_enabled(monkeypatch):
+    for env_name in TOOL_FLAGS:
+        monkeypatch.delenv(env_name, raising=False)
+
+    settings = ToolSettings(_env_file=None)
+    assert all(getattr(settings, env_name.lower()) for env_name in TOOL_FLAGS)
+
+
+@pytest.mark.parametrize("env_name", TOOL_FLAGS)
+def test_each_tool_flag_can_be_disabled(monkeypatch, env_name):
+    monkeypatch.setenv(env_name, "false")
+    settings = ToolSettings(_env_file=None)
+    assert getattr(settings, env_name.lower()) is False
 
 
 def test_negative_download_cap_fails_fast(monkeypatch):
