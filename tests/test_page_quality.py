@@ -37,6 +37,13 @@ def test_reddit_wait_for_verification_is_blocked():
     assert out.verdict is pq.PageVerdict.BLOCKED
 
 
+def test_image_alt_text_prevents_image_centric_page_from_looking_empty():
+    html = '<main><img src="chart.png" alt="Quarterly revenue growth chart"></main>'
+    out = pq.deterministic_assessment(200, html)
+    assert out.reason != "no_readable_text"
+    assert out.metrics["word_count"] >= 4
+
+
 def test_article_discussing_captchas_is_not_blocked():
     html = "<article><h1>CAPTCHA accessibility</h1>" + "".join(
         f"<p>Paragraph {i} discusses accessible web design and practical alternatives.</p>"

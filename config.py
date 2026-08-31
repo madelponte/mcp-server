@@ -2,8 +2,9 @@
 Central configuration for the MCP server.
 
 Every Open WebUI "valve" from the original tools is exposed here as an
-environment variable. Each tool has its own settings class with a distinct
-env prefix so the variables can't collide. Values are read from the process
+environment variable. Provider settings use distinct environment prefixes so
+variables can't collide; tool availability flags use each MCP tool's complete
+name (for example, ``SEARCH_WEB_ENABLED``). Values are read from the process
 environment and, when present, the `.env` file that sits next to this module
 (see `.env.example`). Fields carry range constraints (``ge=``/``gt=``/``le=``)
 so a misconfigured cap — e.g. a negative download cap that would abort every
@@ -28,6 +29,39 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+class ToolSettings(BaseSettings):
+    """Startup availability flags for the registered MCP tools.
+
+    These fields deliberately have no additional prefix: each field already
+    contains the complete public tool name, producing environment variables
+    such as ``SEARCH_WEB_ENABLED`` and ``GET_COMPANY_DATA_ENABLED``.
+    Disabled tools are omitted from MCP registration entirely.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="", env_file=ENV_FILE, extra="ignore"
+    )
+
+    search_web_enabled: bool = Field(
+        True, description="Register the search_web tool."
+    )
+    fetch_page_enabled: bool = Field(
+        True, description="Register the fetch_page tool."
+    )
+    get_company_data_enabled: bool = Field(
+        True, description="Register the get_company_data tool."
+    )
+    query_wolfram_alpha_enabled: bool = Field(
+        True, description="Register the query_wolfram_alpha tool."
+    )
+    find_nearby_places_enabled: bool = Field(
+        True, description="Register the find_nearby_places tool."
+    )
+    send_email_enabled: bool = Field(
+        True, description="Register the send_email tool."
+    )
 
 
 class ServerSettings(BaseSettings):
@@ -85,9 +119,24 @@ class WebSearchSettings(BaseSettings):
         env_prefix="WEB_SEARCH_", env_file=ENV_FILE, extra="ignore"
     )
 
+    searxng_enabled: bool = Field(
+        True,
+        description=(
+            "Use SearXNG as the primary search_web provider. Disable this "
+            "temporarily to let an upstream rate limit reset; Firecrawl search "
+            "is used instead when configured."
+        ),
+    )
     searxng_url: str = Field(
         "http://searxng:8080",
         description="Base URL of your SearXNG instance (no trailing /search).",
+    )
+    searxng_request_delay_seconds: float = Field(
+        1.0, ge=0,
+        description=(
+            "Delay between sequential SearXNG requests, measured from one "
+            "completed response to the next request start. 0 disables queueing."
+        ),
     )
     # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
     # the model request fewer results / less enrichment per call; anything above
@@ -136,20 +185,27 @@ class WebSearchSettings(BaseSettings):
         "https://api.firecrawl.dev/v2/scrape",
         description="Firecrawl v2 scrape endpoint used as the last-resort page fallback.",
     )
+    firecrawl_search_api_url: str = Field(
+        "https://api.firecrawl.dev/v2/search",
+        description=(
+            "Firecrawl v2 search endpoint used when SearXNG fails or is disabled. "
+            "Blank disables Firecrawl search without disabling Firecrawl scraping."
+        ),
+    )
     firecrawl_api_key: str = Field(
         "",
         description=(
-            "Firecrawl API key. When set, fetch_page uses Firecrawl after the "
-            "FlareSolverr render is blocked, unusable, or unresolved, and to "
-            "recover text from a known document blocked by an HTML challenge. "
-            "Blank disables the Firecrawl fallback."
+            "Firecrawl API key. When set, search_web can fall back to Firecrawl "
+            "search and fetch_page uses Firecrawl after the FlareSolverr render "
+            "is blocked, unusable, or unresolved, including for known documents "
+            "blocked by an HTML challenge. Blank disables both fallbacks."
         ),
     )
     firecrawl_timeout_seconds: float = Field(
         60.0, gt=0,
         description=(
-            "Timeout for a Firecrawl scrape, in seconds (clamped to Firecrawl's "
-            "supported 1-300 second range)."
+            "Timeout for a Firecrawl search or scrape request, in seconds "
+            "(clamped to Firecrawl's supported 1-300 second range)."
         ),
     )
     firecrawl_hedge_enabled: bool = Field(
@@ -272,6 +328,23 @@ class WebSearchSettings(BaseSettings):
             "'linux:mcp-server:1.0 (by /u/your_username)'."
         ),
     )
+    reddit_request_delay_seconds: float = Field(
+        1.0,
+        ge=0,
+        description=(
+            "Minimum quiet period between Reddit fetch_page acquisitions. "
+            "Requests are serialized to reduce anonymous RSS/HTML throttling; "
+            "0 disables queueing."
+        ),
+    )
+    reddit_rate_limit_retry_seconds: float = Field(
+        3.0,
+        ge=0,
+        description=(
+            "Wait this many seconds and retry Reddit RSS once after HTTP 429; "
+            "0 disables the retry."
+        ),
+    )
     ssrf_allowlist: str = Field(
         "",
         description=(
@@ -312,6 +385,13 @@ class WebSearchSettings(BaseSettings):
         ),
     )
     max_page_chars: int = Field(15000, ge=1, description="Max characters of page content before truncation.")
+    max_image_descriptions: int = Field(
+        10, ge=0,
+        description=(
+            "Maximum prominent image placeholders returned from one HTML page "
+            "(0 disables image descriptions)."
+        ),
+    )
     max_enrich_headings: int = Field(25, ge=1, description="Max headings per enriched result.")
     max_snippet_chars: int = Field(400, ge=1, description="Max characters of each result snippet.")
 
@@ -323,9 +403,15 @@ class WebSearchSettings(BaseSettings):
     query_context_segments: int = Field(
         2, ge=0,
         description=(
-            "When fetch_page is given a `query`, how many surrounding segments "
-            "(paragraphs / transcript lines) of context to include on each side "
-            "of a matching segment."
+            "Default surrounding nonblank lines on each side of a fetch_page "
+            "query match when the model omits context_lines."
+        ),
+    )
+    max_query_context_lines: int = Field(
+        8, ge=0,
+        description=(
+            "Maximum surrounding nonblank lines on each side of a fetch_page "
+            "query match; larger model requests are clamped."
         ),
     )
     # MAXIMUM, not a fixed amount: a context-budget cap on how many distinct
@@ -702,6 +788,7 @@ class EmailSettings(BaseSettings):
 
 
 # Singletons imported by the tool modules and the server entrypoint.
+tool_settings = ToolSettings()
 server_settings = ServerSettings()
 web_search_settings = WebSearchSettings()
 stock_settings = StockSettings()

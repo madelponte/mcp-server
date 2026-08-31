@@ -20,7 +20,7 @@ from fastmcp import FastMCP
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from auth import BearerAuthMiddleware
-from config import server_settings
+from config import server_settings, tool_settings
 from tools import (
     web_search,
     fetch_page,
@@ -60,14 +60,33 @@ def build_server() -> FastMCP:
         ),
     )
 
-    # Register every tool group. (YouTube transcripts are handled inside the
-    # fetch_page tool, not as a separate tool — see tools/youtube_transcript.py.)
-    web_search.register(mcp)
-    fetch_page.register(mcp)
-    stock_data.register(mcp)
-    wolfram_alpha.register(mcp)
-    geocoding.register(mcp)
-    email.register(mcp)
+    # Register enabled tools only. Each module currently exposes one MCP tool;
+    # YouTube transcripts remain part of fetch_page rather than a separate tool.
+    registrations = (
+        ("search_web", tool_settings.search_web_enabled, web_search.register),
+        ("fetch_page", tool_settings.fetch_page_enabled, fetch_page.register),
+        (
+            "get_company_data",
+            tool_settings.get_company_data_enabled,
+            stock_data.register,
+        ),
+        (
+            "query_wolfram_alpha",
+            tool_settings.query_wolfram_alpha_enabled,
+            wolfram_alpha.register,
+        ),
+        (
+            "find_nearby_places",
+            tool_settings.find_nearby_places_enabled,
+            geocoding.register,
+        ),
+        ("send_email", tool_settings.send_email_enabled, email.register),
+    )
+    for tool_name, enabled, register in registrations:
+        if enabled:
+            register(mcp)
+        else:
+            log.info("MCP tool %s is DISABLED by configuration.", tool_name)
 
     return mcp
 

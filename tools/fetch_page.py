@@ -2,8 +2,10 @@
 Page-fetching MCP tool.
 
 Exposes `fetch_page`: reads one or more web page URLs (returning markdown or a
-structured metadata summary) or, when handed a YouTube video URL, that video's
-transcript. PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
+structured metadata summary), represents prominent images with explicit textual
+stand-ins, or, when handed a YouTube video URL, returns that video's transcript.
+Direct image URLs return metadata/embedded descriptions rather than raw bytes.
+PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
 uses authenticated OAuth JSON when configured, then tries RSS, old.reddit HTML,
 and finally oEmbed metadata for individual posts.
@@ -19,13 +21,14 @@ extraction in `tools/web_extract.py`; the YouTube transcript logic in
 """
 
 import asyncio
+from bisect import bisect_right
 import json
 import logging
 import re
 import time
 from functools import partial
-from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Annotated, Any
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import anyio
 import httpx
@@ -33,6 +36,7 @@ import regex as safe_regex
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
@@ -40,6 +44,7 @@ from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     DownloadTooLargeError,
     _decode_body,
+    _is_image_resource,
     _is_tika_document,
     _sniff_document_bytes,
     _tika_extract,
@@ -47,10 +52,12 @@ from .web_fetch import (
 from .page_acquire import acquire_page as _acquire_page
 from .web_extract import (
     _find_section,
+    _heading_anchor_records,
     _markdown_from_soup,
     _page_title,
     _plain_text_from_soup,
     _structured_from_html,
+    _standalone_image_description,
     _structured_section_from_html,
     _trim_flagged,
 )
@@ -72,8 +79,16 @@ def _fetch_page_desc(prefix: str) -> str:
         "Read one web page, document, or YouTube video transcript.\n\n"
         "BASIC USE — this is all most calls need: pass one URL to get that page as "
         "markdown (headings, lists, tables, and links are kept, links as absolute "
-        "URLs you can fetch). A YouTube video URL is detected automatically and "
-        "returns the video's transcript. The parameters below are optional "
+        "URLs you can fetch). Prominent images become inline `[Image at this "
+        "location: ...]` markers where the image appeared, using page-provided "
+        "alt text, captions, or metadata (not visual analysis). Headings include "
+        "visible `{#anchor}` markers for precise citations. Source heading IDs can "
+        "be appended to the page URL; generated `cite-*` anchors are stable only "
+        "within the returned extraction. Structured headings include `citation_url` "
+        "when the source provides a real fragment. A direct image URL returns the "
+        "same explicit placeholder plus any embedded description. A YouTube video "
+        "URL is detected automatically and returns the video's "
+        "transcript. The parameters below are optional "
         "refinements — omit them all to get the whole page.\n\n"
         "PAGE OUTLINE / SECTION WORKFLOW:\n"
         "If a " + prefix + "search_web result already has page_headings/page_toc "
@@ -84,25 +99,32 @@ def _fetch_page_desc(prefix: str) -> str:
         "section=<heading> (and the default text mode) to read only that section. "
         "Do not fetch the outline first when you already have it.\n\n"
         "OPTIONAL PARAMETERS (leave unset unless you need them):\n"
-        "• query — a keyword/phrase or regex (case-insensitive). Returns only the "
-        "passages that match, instead of the full page. On a YouTube transcript it "
-        "returns the matching lines tagged with [M:SS] timestamps.\n"
+        "• query — a keyword/phrase or regex (case-insensitive). Returns extractive "
+        "match windows plus line ranges, surrounding heading, and quality "
+        "(`exact_line`, `literal_substring`, or `regex_pattern`). Use "
+        "max_matches/context_lines to control size. Set include_match_toc=true "
+        "for a compact TOC of matching headings, transcript timestamps, or line "
+        "ranges only. YouTube matches retain [M:SS] timestamps.\n"
         "• section — a heading's text. Returns only the content under that "
         "heading (in structured mode, only that section's sub-headings/toc).\n"
         '• mode — "text" (the default) returns the page content; "structured" '
         "returns the page outline and metadata (title, description, headings, toc, "
-        "JSON-LD).\n"
+        "JSON-LD, prominent image descriptions).\n"
         "• offset — for CONTINUING a long page only. If a result comes back marked "
         '"truncated", call again with offset set to the "next_offset" value from '
-        "that result to read the next chunk. Do NOT set it on a first fetch. It "
-        "works for every format, including JSON and long documents.\n\n"
+        "that result to read the next chunk. Do NOT set it on a first fetch. HTML "
+        "continuations echo the nearest `continuation_anchor`. Offset works for "
+        "every format, including JSON and long documents.\n\n"
         "Reads ONE URL per call — to read several pages, call this tool once per "
         "URL. Use it to read an " + prefix + "search_web result in depth, or to "
         "read documents (PDF/Word/Excel/RTF/EPUB).\n\n"
-        "Returns JSON {url,format,provenance?,content,query?,match_count?,sections?,"
-        "truncated?,offset?,next_offset?,content_length?,note?} (format: "
+        "Returns JSON {url,format,provenance?,content,anchor?,citation_url?,query?,"
+        "match_count?,match_metadata?,matching_toc?,sections?,truncated?,offset?,"
+        "continuation_anchor?,next_offset?,"
+        "content_length?,note?} "
+        "(format: "
         "\"youtube_transcript\"|"
-        '"markdown"|"text"|"structured"|"section"|"document_text"|"json").'
+        '"markdown"|"text"|"structured"|"section"|"document_text"|"image"|"json").'
     )
 
 
@@ -126,6 +148,7 @@ _NARROW_HINT = (
     "keyword/phrase or regex — returns only the matching passages) or `section=` "
     "(a heading — returns only that section)."
 )
+_CITATION_ANCHOR_RE = re.compile(r"\{#([^{}\s]+)\}")
 
 
 def _join_note(existing: str | None, extra: str) -> str:
@@ -165,6 +188,9 @@ def _set_content(
     payload["content"] = trimmed
     if start:
         payload["offset"] = start
+        anchors = list(_CITATION_ANCHOR_RE.finditer(content[:start]))
+        if anchors:
+            payload["continuation_anchor"] = anchors[-1].group(1)
     if truncated:
         payload["truncated"] = True
         payload["next_offset"] = start + cfg.max_page_chars
@@ -213,6 +239,22 @@ class QueryMatchTimeoutError(RuntimeError):
     """A model-supplied query exhausted its total regex matching budget."""
 
 
+def _resolve_query_control(
+    requested: int | None,
+    *,
+    default: int,
+    maximum: int,
+    minimum: int,
+) -> int:
+    """Resolve a model-requested query control against its safe configured cap."""
+    value = default if requested is None else requested
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
 def _compile_query(query: str):
     """Compile the model's `query` into a case-insensitive pattern.
 
@@ -241,19 +283,60 @@ def _segment_text(text: str) -> list[str]:
     return [s for s in (ln.strip() for ln in text.split("\n")) if s]
 
 
-def _extract_matches(
-    text: str, query: str, *, context: int, max_windows: int
-) -> tuple[list[str], int, int]:
-    """Find segments matching `query` and return them with surrounding context.
+_HEADING_ANCHOR_LINE_RE = re.compile(
+    r"^(?:#{1,6}\s+)?(.+?)\s+\{#([^{}\s]+)\}\s*$"
+)
+_TRANSCRIPT_TIMESTAMP_RE = re.compile(r"^\[((?:\d+:)?\d{1,2}:\d{2})\]")
+_MATCH_QUALITY_RANK = {"regex_pattern": 0, "literal_substring": 1, "exact_line": 2}
 
-    Returns ``(windows, total_matches, total_windows)``. Each window is the
-    matching segment(s) plus ``context`` segments on either side; windows that
-    overlap or sit adjacent are merged so a run of nearby matches reads as one
-    block. ``windows`` holds at most ``max_windows`` of them (the formatted
-    output), while ``total_windows`` counts how many existed before that cap and
-    ``total_matches`` counts every matching segment. ``windows`` is empty when
-    nothing matched.
-    """
+
+def _heading_from_line(
+    line: str,
+    line_idx: int,
+    heading_lookup: dict[str, dict] | None = None,
+) -> dict | None:
+    match = _HEADING_ANCHOR_LINE_RE.match(line)
+    if not match:
+        return None
+    anchor = match.group(2)
+    heading = {
+        "text": match.group(1).strip(),
+        "anchor": anchor,
+        "line": line_idx + 1,
+    }
+    if heading_lookup and anchor in heading_lookup:
+        heading.update(heading_lookup[anchor])
+        heading["line"] = line_idx + 1
+    return heading
+
+
+def _heading_key(heading: dict | None) -> str | None:
+    if not heading:
+        return None
+    return heading.get("anchor") or heading.get("text")
+
+
+def _match_quality(line: str, query: str) -> str:
+    """Small lexical-quality label; regex-only matches are explicitly identified."""
+    normalized_line = " ".join(line.casefold().split())
+    normalized_query = " ".join(query.casefold().split())
+    if normalized_query and normalized_line == normalized_query:
+        return "exact_line"
+    if query.casefold() in line.casefold():
+        return "literal_substring"
+    return "regex_pattern"
+
+
+def _extract_matches(
+    text: str,
+    query: str,
+    *,
+    context: int,
+    max_windows: int,
+    default_heading: dict | None = None,
+    heading_lookup: dict[str, dict] | None = None,
+) -> tuple[list[dict], int, int]:
+    """Find matching nonblank lines and return bounded, metadata-rich windows."""
     segments = _segment_text(text)
     if not segments:
         return [], 0, 0
@@ -280,29 +363,76 @@ def _extract_matches(
     if not match_idxs:
         return [], 0, 0
 
-    # Expand each match into a [start, end] window, merging into the previous one
-    # when they touch (gap of at most one segment) so adjacent matches don't
-    # produce a string of tiny, overlapping fragments.
-    bounds: list[list[int]] = []
-    for idx in match_idxs:
-        start = max(0, idx - context)
-        end = min(len(segments) - 1, idx + context)
-        if bounds and start <= bounds[-1][1] + 1:
-            bounds[-1][1] = max(bounds[-1][1], end)
-        else:
-            bounds.append([start, end])
+    # Resolve each match's surrounding heading in one pass. Do not merge windows
+    # across heading boundaries: keeping sections separate makes their metadata
+    # and optional matching-only TOC precise.
+    match_set = set(match_idxs)
+    match_headings: dict[int, dict | None] = {}
+    heading_positions = []
+    current_heading = default_heading
+    for idx, segment in enumerate(segments):
+        line_heading = _heading_from_line(segment, idx, heading_lookup)
+        if line_heading:
+            current_heading = line_heading
+            heading_positions.append(idx)
+        if idx in match_set:
+            match_headings[idx] = current_heading
 
-    windows = ["\n".join(segments[s : e + 1]) for s, e in bounds[:max_windows]]
+    bounds: list[dict] = []
+    for idx in match_idxs:
+        heading = match_headings[idx]
+        section_start = heading["line"] - 1 if heading and heading.get("line") else 0
+        next_heading_pos = bisect_right(heading_positions, idx)
+        section_end = (
+            heading_positions[next_heading_pos] - 1
+            if next_heading_pos < len(heading_positions)
+            else len(segments) - 1
+        )
+        start = max(section_start, idx - context)
+        end = min(section_end, idx + context)
+        heading_key = _heading_key(match_headings[idx])
+        if (
+            bounds
+            and start <= bounds[-1]["end"] + 1
+            and heading_key == bounds[-1]["heading_key"]
+        ):
+            bounds[-1]["end"] = max(bounds[-1]["end"], end)
+        else:
+            bounds.append({"start": start, "end": end, "heading_key": heading_key})
+
+    windows = []
+    for bound in bounds[:max_windows]:
+        start = bound["start"]
+        end = bound["end"]
+        window_heading_key = bound["heading_key"]
+        window_match_idxs = []
+        for idx in match_idxs:
+            match_heading_key = _heading_key(match_headings[idx])
+            if start <= idx <= end and match_heading_key == window_heading_key:
+                window_match_idxs.append(idx)
+        first_match = window_match_idxs[0]
+        heading = match_headings[first_match]
+        lines = segments[start : end + 1]
+        if heading and heading.get("line") and heading["line"] - 1 < start:
+            lines.insert(0, segments[heading["line"] - 1])
+        qualities = [_match_quality(segments[idx], query) for idx in window_match_idxs]
+        quality = max(qualities, key=_MATCH_QUALITY_RANK.__getitem__)
+        windows.append(
+            {
+                "content": "\n".join(lines),
+                "line_start": start + 1,
+                "line_end": end + 1,
+                "match_lines": [idx + 1 for idx in window_match_idxs],
+                "heading": heading,
+                "match_quality": quality,
+                "_first_match_text": segments[first_match],
+            }
+        )
     return windows, len(match_idxs), len(bounds)
 
 
 def _format_match_windows(windows: list[str]) -> str:
-    """Join match windows, separating distinct ones with a labeled marker.
-
-    A single window is returned as-is; multiple windows each get a
-    ``───── match i of N ─────`` header so the model can tell the pieces come
-    from different parts of the page.
-    """
+    """Join match windows, labeling separate extractive passages."""
     if len(windows) == 1:
         return windows[0]
     total = len(windows)
@@ -311,26 +441,69 @@ def _format_match_windows(windows: list[str]) -> str:
     )
 
 
-async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
-    """Filter `text` to the segments matching `query`; raise if nothing matches.
+def _matching_toc(windows: list[dict], kind: str) -> list[dict]:
+    """Build a compact TOC containing only sections represented by matches."""
+    entries: dict[tuple, dict] = {}
+    for window_number, window in enumerate(windows, 1):
+        heading = window.get("heading")
+        if heading:
+            key = ("heading", heading.get("anchor") or heading.get("text"))
+            label = heading.get("text") or "Untitled section"
+            extra = {
+                field: heading[field]
+                for field in ("anchor", "citation_url")
+                if heading.get(field)
+            }
+        else:
+            timestamp_match = _TRANSCRIPT_TIMESTAMP_RE.match(
+                window.get("_first_match_text") or ""
+            )
+            if timestamp_match and "transcript" in kind:
+                timestamp = timestamp_match.group(1)
+                key = ("timestamp", timestamp)
+                label = f"Transcript at {timestamp}"
+                extra = {"timestamp": timestamp}
+            else:
+                key = ("lines", window["line_start"], window["line_end"])
+                label = f"Lines {window['line_start']}-{window['line_end']}"
+                extra = {}
+        entry = entries.get(key)
+        if entry is None:
+            entry = {
+                "label": label,
+                **extra,
+                "match_count": 0,
+                "windows": [],
+            }
+            entries[key] = entry
+        entry["match_count"] += len(window["match_lines"])
+        entry["windows"].append(window_number)
+    return list(entries.values())
 
-    Returns fields to merge into a fetch_page result: the formatted ``content``
-    (match windows joined by labeled separators), the total ``match_count``, the
-    number of ``sections`` (windows) shown, and a ``note`` when some windows were
-    dropped to stay within the cap. ``kind`` names what was searched (e.g.
-    "content", "transcript segment") for the not-found error.
 
-    The regex matching runs in a worker thread (sync-in-async convention) so a
-    slow scan can't block the event loop along with every other in-flight call.
-    """
+async def _query_payload(
+    text: str,
+    query: str,
+    url: str,
+    *,
+    kind: str,
+    max_matches: int,
+    context_lines: int,
+    include_match_toc: bool,
+    default_heading: dict | None = None,
+    heading_lookup: dict[str, dict] | None = None,
+) -> dict:
+    """Filter text into bounded match windows plus line/heading metadata."""
     try:
         windows, match_count, total_windows = await anyio.to_thread.run_sync(
             partial(
                 _extract_matches,
                 text,
                 query,
-                context=cfg.query_context_segments,
-                max_windows=cfg.max_query_matches,
+                context=context_lines,
+                max_windows=max_matches,
+                default_heading=default_heading,
+                heading_lookup=heading_lookup,
             )
         )
     except QueryMatchTimeoutError:
@@ -344,16 +517,35 @@ async def _query_payload(text: str, query: str, url: str, *, kind: str) -> dict:
             "Try a simpler keyword or a different spelling, loosen the regex, or "
             "omit `query` to retrieve the full content."
         )
+
+    metadata = []
+    for window_number, window in enumerate(windows, 1):
+        metadata.append(
+            {
+                "window": window_number,
+                "line_start": window["line_start"],
+                "line_end": window["line_end"],
+                "match_lines": window["match_lines"],
+                "heading": window.get("heading"),
+                "match_quality": window["match_quality"],
+            }
+        )
     payload = {
         "query": query,
         "match_count": match_count,
         "sections": len(windows),
-        "content": _format_match_windows(windows),
+        "context_lines": context_lines,
+        "line_numbering": "1-based nonblank lines in searched content",
+        "match_metadata": metadata,
+        "content": _format_match_windows([window["content"] for window in windows]),
     }
+    if include_match_toc:
+        payload["matching_toc"] = _matching_toc(windows, kind)
     if total_windows > len(windows):
         payload["note"] = (
             f"{total_windows} matching sections found; showing the first "
-            f"{len(windows)}. Refine `query` to narrow the results."
+            f"{len(windows)}. Increase `max_matches` within its cap or refine "
+            "`query` to narrow the results."
         )
     return payload
 
@@ -370,6 +562,36 @@ _REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 _reddit_access_token: str | None = None
 _reddit_access_token_expires_at = 0.0
 _reddit_access_token_credentials: tuple[str, str] | None = None
+
+
+class _RedditRequestQueue:
+    """Serialize Reddit acquisitions and leave a quiet period between them.
+
+    Reddit's anonymous RSS/HTML endpoints throttle bursts aggressively on hosted
+    IPs. One slot covers the complete fallback chain so concurrent tool calls do
+    not each fan out into RSS, old.reddit, and oEmbed requests at the same time.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._next_request_at = 0.0
+
+    async def acquire(self, url: str) -> tuple[dict, Any, str, list[str]]:
+        delay = cfg.reddit_request_delay_seconds
+        if delay <= 0:
+            return await _acquire_reddit_unqueued(url)
+
+        async with self._lock:
+            wait = self._next_request_at - time.monotonic()
+            if wait > 0:
+                await anyio.sleep(wait)
+            try:
+                return await _acquire_reddit_unqueued(url)
+            finally:
+                self._next_request_at = time.monotonic() + delay
+
+
+_reddit_request_queue = _RedditRequestQueue()
 
 
 def _is_reddit_url(url: str) -> bool:
@@ -425,11 +647,19 @@ def _reddit_oauth_url(url: str) -> str:
 
 
 def _reddit_rss_url(url: str) -> str:
-    """Build a Reddit Atom feed URL for a post or listing."""
+    """Build a Reddit Atom feed URL for a post or listing.
+
+    Post query parameters such as ``context``, ``sort``, and share-tracking
+    tokens do not change the Atom snapshot. Dropping them gives every variant of
+    one post the same cache key and prevents duplicate anonymous Reddit requests.
+    Listing/search parameters remain significant and are preserved.
+    """
     parsed = urlparse(url)
+    is_post = _is_reddit_post_url(url)
     path = _reddit_clean_path(url).rstrip("/")
-    path += "/.rss" if _is_reddit_post_url(url) else ".rss"
-    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", parsed.query, ""))
+    path += "/.rss" if is_post else ".rss"
+    query = "" if is_post else parsed.query
+    return urlunparse(("https", "www.reddit.com", path or "/.rss", "", query, ""))
 
 
 def _reddit_old_url(url: str) -> str:
@@ -444,9 +674,9 @@ def _reddit_oembed_url(url: str) -> str:
     """Metadata-only fallback when Reddit's post/comments JSON is blocked."""
     p = urlparse(url)
     path = _reddit_clean_path(url)
-    post_url = urlunparse(
-        (p.scheme or "https", "www.reddit.com", path, "", p.query, "")
-    )
+    # oEmbed identifies the submission from its path. Omitting context/sort/share
+    # parameters canonicalizes the fallback cache key just like the post RSS URL.
+    post_url = urlunparse((p.scheme or "https", "www.reddit.com", path, "", "", ""))
     return "https://www.reddit.com/oembed?" + urlencode({"url": post_url})
 
 
@@ -812,7 +1042,7 @@ def _reddit_failure_trace(name: str, exc: BaseException) -> str:
     return f"{name} failed ({detail})"
 
 
-async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
+async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]:
     """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
     errors: list[str] = []
     trace: list[str] = []
@@ -833,6 +1063,16 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
     rss_url = _reddit_rss_url(url)
     try:
         fetched = await _acquire_page(rss_url)
+        if (
+            fetched.get("status") == 429
+            and cfg.reddit_rate_limit_retry_seconds > 0
+        ):
+            trace.append(
+                "RSS returned HTTP 429; retrying after "
+                f"{cfg.reddit_rate_limit_retry_seconds:g}s"
+            )
+            await anyio.sleep(cfg.reddit_rate_limit_retry_seconds)
+            fetched = await _acquire_page(rss_url)
         if fetched.get("status", 0) >= 400:
             raise RuntimeError(f"HTTP {fetched['status']}")
         compact = await anyio.to_thread.run_sync(
@@ -880,6 +1120,11 @@ async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
     raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
 
 
+async def _acquire_reddit(url: str) -> tuple[dict, Any, str, list[str]]:
+    """Acquire Reddit content through the process-wide anti-burst queue."""
+    return await _reddit_request_queue.acquire(url)
+
+
 # ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
@@ -925,17 +1170,33 @@ def _provenance(
 # in-flight tool call. Each parses the HTML exactly once and pulls the title from
 # the same soup, rather than the old title-parse-then-render-parse double pass.
 
-def _render_text_mode(html: str, base_url: str) -> tuple[str | None, str, str]:
-    """Parse page HTML once and return ``(title, body, format)`` for text mode.
+def _render_text_mode(
+    html: str, base_url: str
+) -> tuple[str | None, str, str, dict[str, dict]]:
+    """Return ``(title, body, format, heading_lookup)`` for text mode.
 
     The title is read before the markdown/plain render mutates the soup, so the
     document is parsed a single time. CPU-bound — offload via the caller.
     """
     soup = BeautifulSoup(html, "lxml")
     title = _page_title(soup)
+    heading_lookup = {
+        record["anchor"]: dict(record)
+        for record in _heading_anchor_records(soup, base_url).values()
+    }
     if cfg.markdown:
-        return title, _markdown_from_soup(soup, base_url), "markdown"
-    return title, _plain_text_from_soup(soup), "text"
+        return (
+            title,
+            _markdown_from_soup(soup, base_url, cfg.max_image_descriptions),
+            "markdown",
+            heading_lookup,
+        )
+    return (
+        title,
+        _plain_text_from_soup(soup, base_url, cfg.max_image_descriptions),
+        "text",
+        heading_lookup,
+    )
 
 
 def _parse_section(html: str, section: str, base_url: str = "") -> tuple[str | None, dict | None, list[str]]:
@@ -949,7 +1210,9 @@ def _parse_section(html: str, section: str, base_url: str = "") -> tuple[str | N
     """
     soup = BeautifulSoup(html, "lxml")
     title = _page_title(soup)
-    section_data = _find_section(soup, section, base_url)
+    section_data = _find_section(
+        soup, section, base_url, cfg.max_image_descriptions
+    )
     if section_data is not None:
         return title, section_data, []
     available = [
@@ -973,6 +1236,31 @@ def _is_contentless(body: str) -> bool:
     return not _WORD_RE.search(body)
 
 
+def _standalone_image_marker(
+    url: str, ctype: str, text: str | None, body: bytes | None
+) -> tuple[str, dict]:
+    """Build explicit text standing in for a directly fetched image."""
+    description, source = _standalone_image_description(text, body)
+    filename = unquote((urlparse(url).path or "").rsplit("/", 1)[-1]).strip()
+    filename = filename[:200] if filename else None
+    media_type = (ctype or "").split(";", 1)[0].strip().lower() or "image"
+
+    fields: dict = {"media_type": media_type}
+    if filename:
+        fields["filename"] = filename
+    if description:
+        fields["description"] = description
+        fields["description_source"] = source
+        marker = f"[Image at this location: {description}]"
+    else:
+        identity = f' file "{filename}"' if filename else ""
+        marker = (
+            f"[Image at this location: standalone image{identity} ({media_type}); "
+            "no alt text, caption, or embedded description was available.]"
+        )
+    return marker, fields
+
+
 def _unsupported_media_error(
     fetch_url: str, status: int | None, ctype: str, size: int | None
 ) -> ToolError:
@@ -986,7 +1274,8 @@ def _unsupported_media_error(
     return ToolError(
         f"{fetch_url} was fetched successfully ({', '.join(details)}), but this "
         "tool cannot extract that media type. fetch_page can read HTML/text/JSON, "
-        "YouTube transcripts, and document files such as PDF, Word, Excel, "
+        "standalone image metadata, YouTube transcripts, and document files such "
+        "as PDF, Word, Excel, "
         "PowerPoint, OpenDocument, RTF, and EPUB via Tika. Use a browser/direct "
         "download for this file, or fetch a text/HTML/document version of the "
         "same content."
@@ -999,6 +1288,9 @@ async def _fetch_one(
     section: str | None = None,
     query: str | None = None,
     offset: int = 0,
+    max_matches: int | None = None,
+    context_lines: int | None = None,
+    include_match_toc: bool = False,
 ) -> dict:
     """Fetch a single URL and return its result payload dict.
 
@@ -1013,6 +1305,18 @@ async def _fetch_one(
         raise ToolError(f"Invalid URL: {url}")
 
     query = (query or "").strip() or None
+    resolved_max_matches = _resolve_query_control(
+        max_matches,
+        default=cfg.max_query_matches,
+        maximum=cfg.max_query_matches,
+        minimum=1,
+    )
+    resolved_context_lines = _resolve_query_control(
+        context_lines,
+        default=cfg.query_context_segments,
+        maximum=cfg.max_query_context_lines,
+        minimum=0,
+    )
 
     # A YouTube video URL has no useful scrapeable page content — the actual
     # content is the spoken transcript. Detect it and return the transcript
@@ -1032,7 +1336,13 @@ async def _fetch_one(
             # and filter only the transcript body that follows the "---" rule.
             header, sep, body = transcript.partition("\n---\n")
             qres = await _query_payload(
-                body or transcript, query, url, kind="transcript segment"
+                body or transcript,
+                query,
+                url,
+                kind="transcript segment",
+                max_matches=resolved_max_matches,
+                context_lines=resolved_context_lines,
+                include_match_toc=include_match_toc,
             )
             filtered = f"{header}{sep}{qres.pop('content')}" if sep else qres.pop("content")
             payload.update(qres)
@@ -1108,6 +1418,21 @@ async def _fetch_one(
                 "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
                 "returning official oEmbed post metadata without comments.",
             )
+        if any("HTTP 429" in step for step in reddit_trace):
+            if reddit_source == "rss" and any(
+                "retrying after" in step for step in reddit_trace
+            ):
+                rate_limit_note = (
+                    "Reddit rate-limited the initial RSS request (HTTP 429); "
+                    "the automatic retry succeeded. Configure Reddit OAuth for "
+                    "more reliable post/comment access."
+                )
+            else:
+                rate_limit_note = (
+                    "Reddit rate-limited at least one representation (HTTP 429). "
+                    "Retry later or configure Reddit OAuth for reliable post/comment access."
+                )
+            payload["note"] = _join_note(payload.get("note"), rate_limit_note)
         if debug_enabled():
             backend_passwords = tuple(
                 urlparse(endpoint).password or ""
@@ -1229,12 +1554,66 @@ async def _fetch_one(
             "format": "document_text",
         }
         if query:
-            qres = await _query_payload(extracted, query, fetch_url, kind="content")
+            qres = await _query_payload(
+                extracted,
+                query,
+                fetch_url,
+                kind="document content",
+                max_matches=resolved_max_matches,
+                context_lines=resolved_context_lines,
+                include_match_toc=include_match_toc,
+            )
             doc_payload.update(qres)
             _set_content(doc_payload, qres["content"], offset=offset)
         else:
             _set_content(doc_payload, extracted, offset=offset)
         return doc_payload
+
+    # A direct image has no surrounding HTML from which to obtain alt text or a
+    # caption. Return an explicit text placeholder instead of treating the bytes
+    # as unsupported media; SVG title/description metadata is surfaced when it
+    # exists, while raster images clearly report that no textual description was
+    # available. This is metadata extraction, not pixel-level visual analysis.
+    if (
+        fetched.get("resource_kind") == "image"
+        or _is_image_resource(ctype, fetch_url, fetched.get("bytes"))
+    ):
+        if section:
+            raise ToolError(
+                "A standalone image has no heading sections; omit `section`."
+            )
+        marker, image_fields = _standalone_image_marker(
+            fetch_url, ctype, fetched.get("text"), fetched.get("bytes")
+        )
+        image_payload = {
+            "url": fetch_url,
+            **_provenance(url, fetch_url, status, ctype, via),
+            "format": "image",
+            **image_fields,
+            "note": (
+                "The content marker is returned in place of the image. Any "
+                "description comes from embedded metadata, not visual analysis."
+            ),
+        }
+        if query:
+            qres = await _query_payload(
+                marker,
+                query,
+                fetch_url,
+                kind="image metadata",
+                max_matches=resolved_max_matches,
+                context_lines=resolved_context_lines,
+                include_match_toc=include_match_toc,
+            )
+            marker = qres.pop("content")
+            extra_note = qres.pop("note", None)
+            image_payload.update(qres)
+            if extra_note:
+                image_payload["note"] = _join_note(
+                    image_payload.get("note"), extra_note
+                )
+        _set_content(image_payload, marker, hint=False, offset=offset)
+        return image_payload
 
     if fetched.get("bytes") is not None and fetched.get("text") is None:
         raise _unsupported_media_error(
@@ -1264,7 +1643,7 @@ async def _fetch_one(
     # `query` is a content search, so it overrides "structured" (which would
     # return only metadata); structured mode applies only without a query.
     try:
-        soup_title, plain, text_format = await anyio.to_thread.run_sync(
+        soup_title, plain, text_format, heading_lookup = await anyio.to_thread.run_sync(
             _render_text_mode, text, fetch_url
         )
         soup_title = firecrawl_title or soup_title
@@ -1285,7 +1664,11 @@ async def _fetch_one(
         if section:
             try:
                 structured, available = await anyio.to_thread.run_sync(
-                    _structured_section_from_html, text, fetch_url, section
+                    _structured_section_from_html,
+                    text,
+                    fetch_url,
+                    section,
+                    cfg.max_image_descriptions,
                 )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
@@ -1301,7 +1684,10 @@ async def _fetch_one(
         else:
             try:
                 structured = await anyio.to_thread.run_sync(
-                    _structured_from_html, text, fetch_url
+                    _structured_from_html,
+                    text,
+                    fetch_url,
+                    cfg.max_image_descriptions,
                 )
             except Exception as e:
                 raise ToolError(f"Failed to parse HTML for {fetch_url}: {e}")
@@ -1344,18 +1730,43 @@ async def _fetch_one(
             "format": "section",
             "title": soup_title,
             "matched_heading": section_data["matched_heading"],
+            "anchor": section_data["anchor"],
             "level": section_data["level"],
             "next_heading": section_data["next_heading"],
+            "next_heading_anchor": section_data["next_heading_anchor"],
         }
+        for field in ("source_fragment", "citation_url"):
+            if field in section_data:
+                section_payload[field] = section_data[field]
         # When `query` is also given, search within the matched section.
         if query:
+            default_heading = {
+                "text": section_data["matched_heading"],
+                "anchor": section_data["anchor"],
+            }
+            if section_data.get("citation_url"):
+                default_heading["citation_url"] = section_data["citation_url"]
             qres = await _query_payload(
-                section_data["text"], query, fetch_url, kind="content in that section"
+                section_data["text"],
+                query,
+                fetch_url,
+                kind="content in that section",
+                max_matches=resolved_max_matches,
+                context_lines=resolved_context_lines,
+                include_match_toc=include_match_toc,
+                default_heading=default_heading,
+                heading_lookup=heading_lookup,
             )
             section_payload.update(qres)
-            section_body = f"# {section_data['matched_heading']}\n\n{qres['content']}".strip()
+            section_body = (
+                f"# {section_data['matched_heading']} {{#{section_data['anchor']}}}\n\n"
+                f"{qres['content']}"
+            ).strip()
         else:
-            section_body = f"# {section_data['matched_heading']}\n\n{section_data['text']}".strip()
+            section_body = (
+                f"# {section_data['matched_heading']} {{#{section_data['anchor']}}}\n\n"
+                f"{section_data['text']}"
+            ).strip()
         _set_content(section_payload, section_body, offset=offset)
         return section_payload
 
@@ -1370,7 +1781,16 @@ async def _fetch_one(
     }
 
     if query:
-        qres = await _query_payload(plain, query, fetch_url, kind="content")
+        qres = await _query_payload(
+            plain,
+            query,
+            fetch_url,
+            kind="content",
+            max_matches=resolved_max_matches,
+            context_lines=resolved_context_lines,
+            include_match_toc=include_match_toc,
+            heading_lookup=heading_lookup,
+        )
         content = qres.pop("content")
         if soup_title:
             content = f"{soup_title}\n\n{content}"
@@ -1391,6 +1811,26 @@ def register(mcp: FastMCP) -> None:
         mode: str = "text",
         section: str | None = None,
         query: str | None = None,
+        max_matches: Annotated[
+            int | None,
+            Field(
+                description=(
+                    f"Maximum match windows returned when query is set, up to "
+                    f"{cfg.max_query_matches} (larger is clamped); omit for the max."
+                )
+            ),
+        ] = None,
+        context_lines: Annotated[
+            int | None,
+            Field(
+                description=(
+                    f"Surrounding nonblank lines on each side of each query match, "
+                    f"0-{cfg.max_query_context_lines}; default "
+                    f"{min(cfg.query_context_segments, cfg.max_query_context_lines)}."
+                )
+            ),
+        ] = None,
+        include_match_toc: bool = False,
         offset: int | None = None,
     ) -> str:
         """Fetch one web page / YouTube transcript. The model-facing guidance
@@ -1404,18 +1844,30 @@ def register(mcp: FastMCP) -> None:
             Omit to get the whole page.
         :param query: Optional. A keyword/phrase or regex; returns only the
             matching passages. Omit to get the whole page.
+        :param include_match_toc: With query, include a compact TOC containing
+            only matching headings/timestamps/line ranges.
         :param offset: Optional, for continuing a truncated result only. Set it
             to the "next_offset" value from a previous response to read the next
             chunk. Leave unset on a first fetch.
         """
         log_call(
             log, "fetch_page", url=url, mode=mode, section=section, query=query,
-            offset=offset,
+            max_matches=max_matches, context_lines=context_lines,
+            include_match_toc=include_match_toc, offset=offset,
         )
 
         # One URL per call. Reading several pages is done by calling the tool
         # again rather than batching, which small models handled unreliably.
         # `_fetch_one` validates the URL (scheme/blank) and raises ToolError.
         resolved_offset = offset if isinstance(offset, int) and offset > 0 else 0
-        payload = await _fetch_one(url, mode, section, query, resolved_offset)
+        payload = await _fetch_one(
+            url,
+            mode,
+            section,
+            query,
+            resolved_offset,
+            max_matches=max_matches,
+            context_lines=context_lines,
+            include_match_toc=include_match_toc,
+        )
         return log_result(log, "fetch_page", to_json(payload))

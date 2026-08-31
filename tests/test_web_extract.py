@@ -14,6 +14,7 @@ from tools.web_extract import (
     _page_description,
     _structured_from_html,
     _structured_section_from_html,
+    _standalone_image_description,
     _plain_text_from_html,
     _markdown_from_html,
     _norm_heading,
@@ -211,16 +212,52 @@ def test_structured_from_html_combines_fields():
     assert out["url"] == "https://example.com"
     assert out["title"] == "My Page"
     assert out["description"] == "Desc"
-    assert {"level": 1, "text": "Heading"} in out["headings"]
+    assert out["headings"][0] == {
+        "level": 1,
+        "text": "Heading",
+        "anchor": "cite-heading",
+    }
     assert out["jsonld"] == [{"@type": "Article", "headline": "H"}]
     # toc is the heading outline (the real table of contents), not the JSON-LD headline.
     assert out["toc"] == ["Heading"]
+
+
+def test_structured_headings_preserve_source_fragment_and_citation_url():
+    html = '<h2 id="Install-v2">Install</h2><h2>Usage</h2><h2>Usage</h2>'
+    out = _structured_from_html(html, "https://example.com/guide?lang=en#old")
+    assert out["headings"] == [
+        {
+            "level": 2,
+            "text": "Install",
+            "anchor": "Install-v2",
+            "source_fragment": "Install-v2",
+            "citation_url": "https://example.com/guide?lang=en#Install-v2",
+        },
+        {"level": 2, "text": "Usage", "anchor": "cite-usage"},
+        {"level": 2, "text": "Usage", "anchor": "cite-usage-2"},
+    ]
 
 
 def test_structured_from_html_no_jsonld_is_none():
     out = _structured_from_html("<title>T</title>", "https://e.com")
     assert out["jsonld"] is None
     assert out["toc"] is None
+    assert "images" not in out
+
+
+def test_structured_from_html_reports_prominent_image_as_replacement():
+    html = (
+        '<article><figure><img src="/hero.jpg" alt="Sunset over water">'
+        '<figcaption>Golden hour at the bay</figcaption></figure></article>'
+    )
+    out = _structured_from_html(html, "https://example.com/story")
+    assert out["images"] == [{
+        "replaces_image": True,
+        "description": "Sunset over water — Caption: Golden hour at the bay",
+        "description_source": "alt+caption",
+        "url": "https://example.com/hero.jpg",
+    }]
+    assert "not visual analysis" in out["image_note"]
 
 
 # ----------------------- structured_section_from_html -----------------------
@@ -245,6 +282,9 @@ def test_structured_section_scopes_to_subtree():
     assert out["section"] == "Implementations"
     assert [h["text"] for h in out["headings"]] == ["Implementations", "Reference", "Other"]
     assert out["toc"] == ["Implementations", "Reference", "Other"]
+    assert [h["anchor"] for h in out["headings"]] == [
+        "cite-implementations", "cite-reference", "cite-other"
+    ]
 
 
 def test_structured_section_leaf_section_is_just_itself():
@@ -256,6 +296,16 @@ def test_structured_section_not_found_returns_available():
     out, available = _structured_section_from_html(_SECTIONED_HTML, "u", "Nope")
     assert out is None
     assert "History" in available and "Implementations" in available
+
+
+def test_structured_section_reports_only_images_in_that_section():
+    html = (
+        '<h2>First</h2><img src="first.jpg" alt="First image">'
+        '<h2>Second</h2><img src="second.jpg" alt="Second image">'
+        '<h2>Third</h2>'
+    )
+    out, _ = _structured_section_from_html(html, "https://example.com", "Second")
+    assert [image["description"] for image in out["images"]] == ["Second image"]
 
 
 # --------------------------- plain text ---------------------------
@@ -280,6 +330,21 @@ def test_plain_text_collapses_blank_lines():
     assert "\n\n\n" not in out
 
 
+def test_plain_text_includes_heading_citation_anchor():
+    out = _plain_text_from_html('<main><h2 id="facts">Facts</h2><p>Body.</p></main>')
+    assert "Facts {#facts}" in out
+
+
+def test_plain_text_keeps_image_marker_at_original_location():
+    html = (
+        '<main><p>Before.</p><img src="chart.png" alt="Quarterly sales chart">'
+        '<p>After.</p></main>'
+    )
+    out = _plain_text_from_html(html, "https://example.com/report")
+    assert out.index("Before.") < out.index("[Image at this location:") < out.index("After.")
+    assert "Quarterly sales chart" in out
+
+
 # --------------------------- markdown ---------------------------
 
 def test_markdown_keeps_headings_and_resolves_links():
@@ -290,6 +355,14 @@ def test_markdown_keeps_headings_and_resolves_links():
     out = _markdown_from_html(html, "https://example.com/base/")
     assert "# Title" in out
     assert "https://example.com/page" in out
+    assert "# Title {#cite-title}" in out
+
+
+def test_markdown_preserves_source_heading_id_and_generates_missing_anchor():
+    html = '<main><h1 id="intro">Introduction</h1><h2>Details &amp; Usage</h2></main>'
+    out = _markdown_from_html(html, "https://example.com/guide")
+    assert "# Introduction {#intro}" in out
+    assert "## Details & Usage {#cite-details-usage}" in out
 
 
 def test_markdown_drops_unfollowable_links_keeping_text():
@@ -299,15 +372,80 @@ def test_markdown_drops_unfollowable_links_keeping_text():
     assert "#frag" not in out
 
 
-def test_markdown_strips_nav_and_images():
+def test_markdown_strips_nav_and_replaces_content_image():
     html = (
-        '<body><nav>NavMenu</nav><article><p>Content</p>'
-        '<img src="x.png" alt="img"></article></body>'
+        '<body><nav>NavMenu<img src="logo.png" alt="Site logo"></nav>'
+        '<article><p>Content</p><img src="x.png" alt="Article diagram"></article></body>'
     )
     out = _markdown_from_html(html, "https://example.com")
     assert "Content" in out
     assert "NavMenu" not in out
+    assert "Site logo" not in out
+    assert "[Image at this location: Article diagram]" in out
     assert "x.png" not in out
+
+
+def test_markdown_folds_figure_caption_into_image_marker_without_duplication():
+    html = (
+        '<article><p>Before.</p><figure><img src="hero.jpg" alt="A lighthouse">'
+        '<figcaption>Storm waves surround the lighthouse</figcaption></figure>'
+        '<p>After.</p></article>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    marker = (
+        "[Image at this location: A lighthouse — Caption: Storm waves surround "
+        "the lighthouse]"
+    )
+    assert marker in out
+    assert out.count("Storm waves surround the lighthouse") == 1
+    assert out.index("Before.") < out.index(marker) < out.index("After.")
+
+
+def test_markdown_skips_image_detached_with_consumed_figure_caption():
+    html = (
+        '<article><figure><img src="hero.jpg" alt="Main image">'
+        '<figcaption>Caption text <img src="badge.jpg" alt="Badge"></figcaption>'
+        '</figure><p>After.</p></article>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    assert "[Image at this location: Main image — Caption: Caption text]" in out
+    assert "Badge" not in out
+    assert "After." in out
+
+
+def test_markdown_uses_open_graph_image_alt_when_img_alt_is_missing():
+    html = (
+        '<head><meta property="og:image" content="https://cdn.example/hero.jpg">'
+        '<meta property="og:image:alt" content="Mars rover beside a crater"></head>'
+        '<body><main><img src="https://cdn.example/hero.jpg"></main></body>'
+    )
+    out = _markdown_from_html(html, "https://example.com/story")
+    assert "[Image at this location: Mars rover beside a crater]" in out
+
+
+def test_markdown_skips_small_icon_even_with_alt_text():
+    html = (
+        '<main><img class="icon" src="settings.png" alt="Settings" '
+        'width="32" height="32"><p>Article text.</p></main>'
+    )
+    out = _markdown_from_html(html, "https://example.com")
+    assert "Article text." in out
+    assert "[Image" not in out
+
+
+def test_markdown_caps_image_placeholders():
+    html = "<article>" + "".join(
+        f'<img src="{i}.jpg" alt="Image {i}">' for i in range(3)
+    ) + "</article>"
+    out = _markdown_from_html(html, "https://example.com", max_images=2)
+    assert out.count("[Image at this location:") == 2
+
+
+def test_standalone_svg_uses_embedded_title_and_description():
+    svg = "<svg><title>Transit map</title><desc>Routes through downtown</desc></svg>"
+    description, source = _standalone_image_description(svg, None)
+    assert description == "Transit map — Routes through downtown"
+    assert source == "embedded SVG title+description"
 
 
 # --------------------------- followable references ---------------------------
@@ -330,6 +468,32 @@ def test_markdown_resolves_citation_marker_to_source_url():
     assert "https://src.example/doc" in out
     # A footnote with no external link stays plain text, not a dangling anchor.
     assert "#cite_note-2" not in out
+
+
+def test_citation_resolution_skips_internal_author_link_for_external_source():
+    html = (
+        '<article><p>Claim<sup class="reference">'
+        '<a href="#cite_note-1">[1]</a></sup>.</p>'
+        '<ol><li id="cite_note-1">'
+        '<a href="/wiki/Author">Author</a> '
+        '<a class="external" href="https://doi.org/10.1000/example">Paper</a>'
+        '</li></ol></article>'
+    )
+    out = _markdown_from_html(html, "https://en.wikipedia.org/wiki/Example")
+    assert "[[1]](https://doi.org/10.1000/example)" in out
+    assert "[[1]](https://en.wikipedia.org/wiki/Author)" not in out
+
+
+def test_markdown_preserves_ordinary_fragment_link_without_hijacking_it():
+    html = (
+        '<article><p><a href="#details">Jump to details</a></p>'
+        '<section id="details"><h2>Details</h2>'
+        '<p><a href="https://unrelated.example/first">External</a></p>'
+        '</section></article>'
+    )
+    out = _markdown_from_html(html, "https://docs.example/page")
+    assert "[Jump to details](https://docs.example/page#details)" in out
+    assert "[Jump to details](https://unrelated.example/first)" not in out
 
 
 def test_find_section_inlines_reference_urls():
@@ -382,7 +546,66 @@ def test_find_section_exact_match_collects_until_next_equal_heading():
     assert "Second method." in out["text"]
     assert "Sub detail." in out["text"]  # nested h3 is included
     assert "Results paragraph." not in out["text"]  # next h2 stops it
+    assert out["anchor"] == "cite-methods"
+    assert "## Subsection {#cite-subsection}" in out["text"]
     assert out["next_heading"] == "Results"
+    assert out["next_heading_anchor"] == "cite-results"
+
+
+def test_find_section_does_not_duplicate_nested_text_blocks():
+    html = """
+    <h2>Details</h2>
+    <ul><li><p>List paragraph.</p></li></ul>
+    <blockquote><p>Quoted paragraph.</p></blockquote>
+    <pre><code>example()</code></pre>
+    <table><tr><td><p>Table cell.</p></td></tr></table>
+    <h2>Next</h2>
+    """
+    out = _find_section(_soup(html), "Details")
+    for expected in ("List paragraph.", "Quoted paragraph.", "example()", "Table cell."):
+        assert out["text"].count(expected) == 1
+
+
+def test_find_section_uses_heading_permalink_as_source_fragment():
+    html = (
+        '<section id="performance-notes">'
+        '<h2>Performance Notes<a class="headerlink" '
+        'href="#performance-notes" title="Link to this heading">¶</a></h2>'
+        '<p>Details.</p></section><h2>Next</h2>'
+    )
+    out = _find_section(
+        _soup(html), "Performance Notes", "https://docs.example/page"
+    )
+    assert out["matched_heading"] == "Performance Notes"
+    assert out["anchor"] == "performance-notes"
+    assert out["source_fragment"] == "performance-notes"
+    assert out["citation_url"] == "https://docs.example/page#performance-notes"
+
+    rendered = _markdown_from_html(html, "https://docs.example/page")
+    assert "## Performance Notes {#performance-notes}" in rendered
+    assert "¶" not in rendered
+
+
+def test_heading_anchor_link_with_meaningful_text_is_preserved():
+    html = (
+        '<section id="guide"><h2><a class="anchor" href="#guide">Guide</a></h2>'
+        '<p>Body.</p></section>'
+    )
+    out = _find_section(_soup(html), "Guide", "https://docs.example/page")
+    assert out["matched_heading"] == "Guide"
+    assert out["anchor"] == "guide"
+
+    rendered = _markdown_from_html(html, "https://docs.example/page")
+    assert "Guide" in rendered
+    assert "{#guide}" in rendered
+
+
+def test_find_section_preserves_source_fragment_citation_url():
+    html = '<h2 id="api">API Reference</h2><p>Methods.</p><h2>Next</h2>'
+    out = _find_section(_soup(html), "API Reference", "https://example.com/docs")
+    assert out["anchor"] == "api"
+    assert out["source_fragment"] == "api"
+    assert out["citation_url"] == "https://example.com/docs#api"
 
 
 def test_find_section_fuzzy_match():

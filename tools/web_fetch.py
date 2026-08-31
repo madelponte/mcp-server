@@ -219,6 +219,18 @@ TIKA_DOCUMENT_EXTENSIONS = (
     ".epub",
 )
 
+IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".svg",
+    ".avif",
+    ".ico",
+)
+
 
 def _is_tika_document(ctype: str, url: str) -> bool:
     """True if the response looks like a binary document Tika should extract."""
@@ -229,6 +241,36 @@ def _is_tika_document(ctype: str, url: str) -> bool:
     # (e.g. application/octet-stream) but the extension is telling.
     path = (urlparse(url).path or "").lower()
     return path.endswith(TIKA_DOCUMENT_EXTENSIONS)
+
+
+def _is_image_resource(ctype: str, url: str, body: bytes | None = None) -> bool:
+    """True when headers, URL extension, or magic bytes identify an image."""
+    base = (ctype or "").split(";", 1)[0].strip().lower()
+    if base.startswith("image/"):
+        return True
+    path = (urlparse(url).path or "").lower()
+    if path.endswith(IMAGE_EXTENSIONS) and base in {
+        "",
+        "application/octet-stream",
+        "binary/octet-stream",
+        "application/download",
+        "application/x-download",
+    }:
+        return True
+    if not body:
+        return False
+    head = body[:16]
+    sample = body[:512].lstrip().lower()
+    return (
+        head.startswith(b"\x89PNG\r\n\x1a\n")
+        or head.startswith(b"\xff\xd8\xff")
+        or head.startswith((b"GIF87a", b"GIF89a"))
+        or (head.startswith(b"RIFF") and body[8:12] == b"WEBP")
+        or head.startswith(b"BM")
+        or head.startswith(b"\x00\x00\x01\x00")
+        or sample.startswith(b"<svg")
+        or (sample.startswith(b"<?xml") and b"<svg" in sample)
+    )
 
 
 def _sniff_document_bytes(body: bytes | None) -> bool:

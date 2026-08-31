@@ -11,11 +11,25 @@ from tools.web_search import (
     _category_includes_videos,
     _clamp_count,
     _enrich_result,
+    _firecrawl_query,
+    _firecrawl_search_filters,
+    _firecrawl_video_query,
     _is_youtube_result_url,
+    _SearXNGRequestQueue,
     _searxng_query,
     _youtube_engine_query,
 )
 from conftest import run
+
+
+@pytest.fixture(autouse=True)
+def _pin_search_provider_defaults(monkeypatch):
+    """Keep provider-selection tests independent of the developer's .env."""
+    monkeypatch.setattr(ws.cfg, "searxng_enabled", True)
+    monkeypatch.setattr(
+        ws.cfg, "firecrawl_search_api_url", "https://api.firecrawl.dev/v2/search"
+    )
+    monkeypatch.setattr(ws.cfg, "firecrawl_api_key", "")
 
 
 # --------------------------- _clamp_count ---------------------------
@@ -57,6 +71,31 @@ def test_youtube_engine_query():
     assert _youtube_engine_query("!youtube python talks") == "!youtube python talks"
 
 
+def test_firecrawl_video_query():
+    assert _firecrawl_video_query("python talks") == "site:youtube.com python talks"
+    assert (
+        _firecrawl_video_query("site:youtube.com python talks")
+        == "site:youtube.com python talks"
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "sources", "filters"),
+    [
+        ("general", ["web"], []),
+        ("news", ["news"], []),
+        ("science", ["web"], ["research"]),
+        ("it", ["web"], []),
+        ("social media", ["web"], []),
+        ("videos", ["web"], []),
+        ("map", ["web"], []),
+        ("news, science", ["news", "web"], ["research"]),
+    ],
+)
+def test_firecrawl_search_filter_mapping(category, sources, filters):
+    assert _firecrawl_search_filters(category) == (sources, filters)
+
+
 def test_is_youtube_result_url():
     assert _is_youtube_result_url("https://www.youtube.com/watch?v=abc12345678") is True
     assert _is_youtube_result_url("https://youtu.be/abc12345678") is True
@@ -64,9 +103,98 @@ def test_is_youtube_result_url():
     assert _is_youtube_result_url("https://peer.tube/w/abc") is False
 
 
+# --------------------------- SearXNG request queue ---------------------------
+
+def test_searxng_request_queue_delays_concurrent_calls_after_completion(monkeypatch):
+    """Queued requests leave the configured quiet period after the prior
+    response completes, not merely between request start times."""
+    import anyio as _anyio
+
+    clock = [1000.0]
+    starts = []
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(ws.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(ws.anyio, "sleep", fake_sleep)
+    queue = _SearXNGRequestQueue()
+
+    async def worker():
+        async with queue.request_slot(1.0):
+            starts.append(clock[0])
+            # Simulate time spent awaiting the SearXNG response.
+            clock[0] += 0.25
+
+    async def main():
+        async with _anyio.create_task_group() as tg:
+            for _ in range(3):
+                tg.start_soon(worker)
+
+    run(main())
+
+    assert sleeps == [1.0, 1.0]
+    assert starts == [1000.0, 1001.25, 1002.5]
+
+
+def test_searxng_request_queue_prevents_overlapping_requests():
+    import anyio as _anyio
+
+    queue = _SearXNGRequestQueue()
+    active = 0
+    max_active = 0
+
+    async def worker():
+        nonlocal active, max_active
+        async with queue.request_slot(0.001):
+            active += 1
+            max_active = max(max_active, active)
+            await _anyio.sleep(0.005)
+            active -= 1
+
+    async def main():
+        async with _anyio.create_task_group() as tg:
+            for _ in range(3):
+                tg.start_soon(worker)
+
+    run(main())
+    assert max_active == 1
+
+
+def test_searxng_request_queue_is_disabled_when_delay_is_zero(monkeypatch):
+    slept = []
+    monkeypatch.setattr(ws.anyio, "sleep", lambda seconds: slept.append(seconds))
+    queue = _SearXNGRequestQueue()
+
+    async def main():
+        async with queue.request_slot(0):
+            pass
+
+    run(main())
+    assert slept == []
+
+
 # --------------------------- _searxng_query (async, mocked) ---------------------------
 
-def test_searxng_query_parses_results(patch_httpx):
+def test_searxng_query_parses_results(monkeypatch, patch_httpx):
+    queued_delays = []
+
+    class RecordingQueue:
+        def request_slot(self, delay_seconds):
+            queued_delays.append(delay_seconds)
+
+            class Slot:
+                async def __aenter__(self):
+                    return None
+
+                async def __aexit__(self, *args):
+                    return None
+
+            return Slot()
+
+    monkeypatch.setattr(ws, "_searxng_request_queue", RecordingQueue())
     payload = {"results": [
         {"url": "https://a.com", "title": "A", "content": " snippet a ", "publishedDate": "2023-01-01"},
         {"url": "https://b.com", "title": "B", "content": "snippet b"},
@@ -76,12 +204,42 @@ def test_searxng_query_parses_results(patch_httpx):
         "http://searxng:8080", "test",
         num_results=5, categories="general", language="en",
         time_range="", safe_search=0, timeout=5, verify_ssl=True, user_agent="t",
+        request_delay_seconds=1.5,
     ))
+    assert queued_delays == [1.5]
     assert len(out) == 2
     assert out[0]["url"] == "https://a.com"
     assert out[0]["snippet"] == "snippet a"  # stripped
     assert out[0]["published_date"] == "2023-01-01"
     assert "published_date" not in out[1]
+
+
+@pytest.mark.parametrize(
+    "operator_query",
+    [
+        pytest.param("site:example.com python", id="site"),
+        pytest.param('"exact phrase" python', id="exact-phrase"),
+        pytest.param("python -exclude", id="exclude"),
+        pytest.param("python OR rust", id="or"),
+        pytest.param("python filetype:pdf", id="filetype"),
+        pytest.param("intitle:python guide", id="intitle"),
+        pytest.param("inurl:docs python", id="inurl"),
+    ],
+)
+def test_searxng_query_preserves_common_operators(patch_httpx, operator_query):
+    seen_queries = []
+
+    def handler(request):
+        seen_queries.append(request.url.params["q"])
+        return httpx.Response(200, json={"results": []})
+
+    patch_httpx(handler)
+    run(_searxng_query(
+        "http://searxng:8080", operator_query,
+        num_results=5, categories="general", language="en",
+        time_range="", safe_search=0, timeout=5, verify_ssl=True, user_agent="t",
+    ))
+    assert seen_queries == [operator_query]
 
 
 def test_searxng_query_respects_num_results(patch_httpx):
@@ -143,6 +301,155 @@ def test_searxng_query_reuses_client_within_event_loop(monkeypatch):
 
     run(scenario())
     assert created == 1
+
+
+# --------------------------- _firecrawl_query (async, mocked) ---------------------------
+
+def test_firecrawl_query_maps_news_time_range_and_response(patch_httpx):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers["Authorization"]
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "news": [
+                        {
+                            "url": "https://news.example/story",
+                            "title": "Story",
+                            "snippet": " Latest update ",
+                            "date": "2026-08-28",
+                        }
+                    ]
+                },
+            },
+        )
+
+    patch_httpx(handler)
+    out = run(
+        _firecrawl_query(
+            "https://api.firecrawl.dev/v2/search",
+            "fc-test",
+            "latest update",
+            num_results=3,
+            categories="news",
+            time_range="week",
+            timeout=5,
+            verify_ssl=True,
+        )
+    )
+    assert seen == {
+        "url": "https://api.firecrawl.dev/v2/search",
+        "authorization": "Bearer fc-test",
+        "payload": {
+            "query": "latest update",
+            "limit": 3,
+            "sources": ["news"],
+            "timeout": 5000,
+            "tbs": "qdr:w",
+        },
+    }
+    assert out == [
+        {
+            "url": "https://news.example/story",
+            "title": "Story",
+            "snippet": "Latest update",
+            "published_date": "2026-08-28",
+        }
+    ]
+
+
+def test_firecrawl_query_maps_science_to_research_filter(patch_httpx):
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"success": True, "data": {"web": []}})
+
+    patch_httpx(handler)
+    assert run(
+        _firecrawl_query(
+            "https://api.firecrawl.dev/v2/search",
+            "fc-test",
+            "quantum materials",
+            num_results=5,
+            categories="science",
+            time_range="",
+            timeout=5,
+            verify_ssl=False,
+        )
+    ) == []
+    assert seen["sources"] == ["web"]
+    assert seen["categories"] == ["research"]
+    assert "tbs" not in seen
+
+
+def test_firecrawl_query_video_search_uses_youtube_site_operator(patch_httpx):
+    seen = {}
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"success": True, "data": {"web": []}})
+
+    patch_httpx(handler)
+    run(
+        _firecrawl_query(
+            "https://api.firecrawl.dev/v2/search",
+            "fc-test",
+            "python talks",
+            num_results=5,
+            categories="videos",
+            time_range="",
+            timeout=5,
+            verify_ssl=True,
+        )
+    )
+    assert seen["query"] == "site:youtube.com python talks"
+
+
+def test_firecrawl_query_rejects_nonfirst_page_without_network():
+    with pytest.raises(RuntimeError) as exc:
+        run(
+            _firecrawl_query(
+                "https://api.firecrawl.dev/v2/search",
+                "fc-test",
+                "python",
+                num_results=5,
+                categories="general",
+                time_range="",
+                timeout=5,
+                verify_ssl=True,
+                page=2,
+            )
+        )
+    assert "does not support" in str(exc.value)
+
+
+def test_firecrawl_query_surfaces_api_error(patch_httpx):
+    patch_httpx(
+        lambda request: httpx.Response(
+            429, json={"success": False, "error": "rate limit exceeded"}
+        )
+    )
+    with pytest.raises(RuntimeError) as exc:
+        run(
+            _firecrawl_query(
+                "https://api.firecrawl.dev/v2/search",
+                "fc-test",
+                "python",
+                num_results=5,
+                categories="general",
+                time_range="",
+                timeout=5,
+                verify_ssl=True,
+            )
+        )
+    assert "HTTP 429" in str(exc.value)
+    assert "rate limit exceeded" in str(exc.value)
 
 
 # --------------------------- _enrich_result (async, mocked) ---------------------------
@@ -213,13 +520,18 @@ def test_search_web_invalid_time_range_raises(tool_fns):
 
 
 def test_search_web_happy_path_no_enrich(monkeypatch, tool_fns):
+    seen = {}
+
     async def fake_query(**kwargs):
+        seen.update(kwargs)
         return [{"url": "https://a.com", "title": "A", "snippet": "s"}]
 
     monkeypatch.setattr(ws, "_searxng_query", fake_query)
     fn = tool_fns["search_web"]
     out = json.loads(run(fn(query="test", enrich_results=0)))
     assert out["query"] == "test"
+    assert out["provider"] == "searxng"
+    assert seen["request_delay_seconds"] == ws.cfg.searxng_request_delay_seconds
     assert out["results"][0]["url"] == "https://a.com"
     # No enrichment requested -> no page metadata fields.
     assert "page_title" not in out["results"][0]
@@ -289,7 +601,92 @@ def test_search_web_no_results(monkeypatch, tool_fns):
     monkeypatch.setattr(ws, "_searxng_query", fake_query)
     fn = tool_fns["search_web"]
     out = json.loads(run(fn(query="nothing")))
+    assert out["provider"] == "searxng"
     assert out["results"] == []
+
+
+def test_search_web_falls_back_to_firecrawl(monkeypatch, tool_fns):
+    calls = []
+
+    async def failed_searxng(**kwargs):
+        calls.append("searxng")
+        raise RuntimeError("HTTP 429")
+
+    async def firecrawl(**kwargs):
+        calls.append("firecrawl")
+        assert kwargs["query"] == "test"
+        assert kwargs["categories"] == "news"
+        return [{"url": "https://news.example", "title": "News", "snippet": "s"}]
+
+    monkeypatch.setattr(ws.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(ws, "_searxng_query", failed_searxng)
+    monkeypatch.setattr(ws, "_firecrawl_query", firecrawl)
+    out = json.loads(
+        run(tool_fns["search_web"](query="test", category="news", enrich_results=0))
+    )
+    assert calls == ["searxng", "firecrawl"]
+    assert out["provider"] == "firecrawl"
+    assert out["results"][0]["url"] == "https://news.example"
+
+
+def test_search_web_can_disable_searxng(monkeypatch, tool_fns):
+    async def searxng(**kwargs):
+        pytest.fail("SearXNG must not be called when disabled")
+
+    async def firecrawl(**kwargs):
+        return [{"url": "https://example.com", "title": "A", "snippet": "s"}]
+
+    monkeypatch.setattr(ws.cfg, "searxng_enabled", False)
+    monkeypatch.setattr(ws.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(ws, "_searxng_query", searxng)
+    monkeypatch.setattr(ws, "_firecrawl_query", firecrawl)
+    out = json.loads(
+        run(tool_fns["search_web"](query="test", enrich_results=0))
+    )
+    assert out["provider"] == "firecrawl"
+
+
+def test_search_web_does_not_fallback_for_valid_empty_results(monkeypatch, tool_fns):
+    async def searxng(**kwargs):
+        return []
+
+    async def firecrawl(**kwargs):
+        pytest.fail("A valid empty result is not a provider failure")
+
+    monkeypatch.setattr(ws.cfg, "firecrawl_api_key", "fc-test")
+    monkeypatch.setattr(ws, "_searxng_query", searxng)
+    monkeypatch.setattr(ws, "_firecrawl_query", firecrawl)
+    out = json.loads(run(tool_fns["search_web"](query="nothing")))
+    assert out["provider"] == "searxng"
+    assert out["results"] == []
+
+
+def test_search_web_reports_both_provider_failures_and_redacts_key(
+    monkeypatch, tool_fns
+):
+    async def searxng(**kwargs):
+        raise RuntimeError("HTTP 429")
+
+    async def firecrawl(**kwargs):
+        raise RuntimeError("rejected secret-fc-key")
+
+    monkeypatch.setattr(ws.cfg, "firecrawl_api_key", "secret-fc-key")
+    monkeypatch.setattr(ws, "_searxng_query", searxng)
+    monkeypatch.setattr(ws, "_firecrawl_query", firecrawl)
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["search_web"](query="test"))
+    message = str(exc.value)
+    assert "SearXNG failed" in message
+    assert "Firecrawl failed" in message
+    assert "secret-fc-key" not in message
+
+
+def test_search_web_disabled_searxng_requires_firecrawl(monkeypatch, tool_fns):
+    monkeypatch.setattr(ws.cfg, "searxng_enabled", False)
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["search_web"](query="test"))
+    assert "SearXNG is disabled" in str(exc.value)
+    assert "Firecrawl search is not configured" in str(exc.value)
 
 
 def test_search_web_query_failure_raises_toolerror(monkeypatch, tool_fns):
