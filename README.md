@@ -20,6 +20,15 @@ network at `http://<host>:8000/mcp`.
 | **Place Search**       | `find_nearby_places`                  |
 | **Email**              | `send_email`                          |
 
+Each tool can be independently omitted from MCP registration with its
+`<TOOL_NAME>_ENABLED` environment variable. For example, set
+`SEARCH_WEB_ENABLED=false` and `FETCH_PAGE_ENABLED=false` to replace those two
+with third-party tools. The available flags are `SEARCH_WEB_ENABLED`,
+`FETCH_PAGE_ENABLED`, `GET_COMPANY_DATA_ENABLED`,
+`QUERY_WOLFRAM_ALPHA_ENABLED`, `FIND_NEARBY_PLACES_ENABLED`, and
+`SEND_EMAIL_ENABLED`. All default to `true`; restart the server after changing
+them.
+
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
 server-configured cap is silently clamped so an oversized response can't
@@ -28,34 +37,74 @@ overwhelm a model's context window. Omitting a value uses the cap.
 ### Agentic Web Search
 
 `search_web(query, time_range=None, category=None, num_results=None, enrich_results=None, page=None)`
-— Search the web via SearXNG and return a ranked list of results. Each result
-carries a url, title, snippet, optional published date, and (for the top
+— Search the web via SearXNG, falling back to Firecrawl when SearXNG fails (or
+using Firecrawl directly when SearXNG is disabled), and return a ranked list of
+results. The top-level `provider` field reports which backend answered. Each
+result carries a url, title, snippet, optional published date, and (for the top
 results) page metadata: a description plus a heading/JSON-LD table-of-contents
 outline, so the model can decide which links are worth fetching in full.
 `time_range` accepts `day`/`week`/`month`/`year`/`all`; `category` accepts
 SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
-`videos`, `map`, comma-separated to combine). Video searches use
-SearXNG's YouTube engine and discard non-YouTube URLs, because `fetch_page` can
-only read transcripts from YouTube video results.
+`videos`, `map`, comma-separated to combine). Video searches use SearXNG's
+YouTube engine or a Firecrawl `site:youtube.com` web search and discard
+non-YouTube URLs, because `fetch_page` can only read transcripts from YouTube
+video results.
 `enrich_results` controls how many top results get full page metadata (`0`
 skips enrichment). `page` is a 1-based result page; use `page=2` with the same
-query to get the next batch before reformulating.
+query to get the next batch before reformulating. Firecrawl's v2 search API has
+no page-number parameter, so `page > 1` requires SearXNG; the fallback returns a
+tool error instead of silently repeating page 1.
 
-`fetch_page(url, mode="text", section=None, query=None, offset=None)` — Fetch the contents
+Firecrawl maps the tool's established categories onto its v2 search systems as
+follows, following the current
+[Firecrawl Search API](https://docs.firecrawl.dev/api-reference/endpoint/search).
+Combined categories use the union of sources and filters. The fallback does not
+request page scraping, so it returns Firecrawl's default URL/title/description
+search records before this server applies its existing optional enrichment.
+
+| Tool category | Firecrawl mapping |
+| --- | --- |
+| `general` | `sources: ["web"]` |
+| `news` | `sources: ["news"]` |
+| `science` | `sources: ["web"]`, `categories: ["research"]` |
+| `it`, `social media`, `map` | `sources: ["web"]` |
+| `videos` | `sources: ["web"]` plus `site:youtube.com` |
+
+The Firecrawl Map endpoint is a site-URL discovery API, not a geographic search
+backend, so the tool's `map` category intentionally stays on web search.
+Firecrawl has no documented equivalents for SearXNG's language or safe-search
+parameters. Recency maps to Firecrawl's `tbs` values (`qdr:d`, `qdr:w`,
+`qdr:m`, and `qdr:y`).
+
+`fetch_page(url, mode="text", section=None, query=None, max_matches=None, context_lines=None, include_match_toc=false, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
 to read several pages, call the tool once per URL. `mode="text"` returns the
 page as markdown — headings, lists, tables, and hyperlinks (resolved to absolute URLs)
 are preserved, so the model sees the page's structure and can fetch a link it
-found in the content (set `WEB_SEARCH_MARKDOWN=false` for bare plain text);
-`mode="structured"` returns metadata only (title, description,
-heading outline, JSON-LD). Document links (PDF, Word, Excel, PowerPoint,
+found in the content (set `WEB_SEARCH_MARKDOWN=false` for bare plain text).
+Prominent images are replaced at their original positions by explicit
+`[Image at this location: ...]` markers populated from page-provided alt text,
+captions, or image metadata; these are textual stand-ins, not visual analysis.
+Standalone image URLs return the same placeholder and any embedded SVG
+description when available. Extracted headings carry visible `{#anchor}` markers
+so a downstream agent can cite a precise section. Source-native heading IDs are
+usable as URL fragments; generated `cite-*` anchors are stable identifiers only
+within the returned extraction. Structured headings include `citation_url` when
+the source page supplied a real fragment. `mode="structured"` returns metadata
+only (title, description, heading outline, JSON-LD, and prominent image descriptions).
+Document links (PDF, Word, Excel, PowerPoint,
 OpenDocument, RTF, EPUB) are extracted via Apache Tika and always returned as
 text. Passing a `section` (a heading from a `page_headings` outline) returns
 just that section of an HTML page instead of the whole thing. Passing a `query`
-(a keyword, phrase, or regex) returns only the matching passages plus surrounding
-context instead of the full page — useful for pulling one topic from a long
-article, document, or transcript; for YouTube, matched segments keep their
-`[M:SS]` timestamps. Regex evaluation has a hard total time budget; a pattern
+(a keyword, phrase, or regex) returns only bounded extractive match windows.
+`max_matches` controls how many windows are shown and `context_lines` controls
+surrounding nonblank lines; both are clamped to server-configured safe limits.
+Each window reports 1-based line ranges, exact match lines, its surrounding
+heading, and a compact quality label (`exact_line`, `literal_substring`, or
+`regex_pattern`). Set `include_match_toc=true` to return a small TOC containing
+only matching headings, transcript timestamps, or document line ranges. YouTube
+matched segments retain their `[M:SS]` timestamps. Regex evaluation has a hard
+total time budget; a pattern
 that exceeds it raises a tool error instead of returning an incomplete scan. If
 a response is marked `truncated`, pass `offset` with the
 returned `next_offset` to read the next chunk; this works for HTML, documents,
@@ -216,12 +265,15 @@ for the full list with defaults. Key things to set:
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
-- `WEB_SEARCH_SEARXNG_URL` — points at the bundled SearXNG service by default.
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional; enables Firecrawl when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
+- `WEB_SEARCH_SEARXNG_ENABLED` / `WEB_SEARCH_SEARXNG_URL` — SearXNG is the primary search provider and the bundled service is enabled by default. Set `WEB_SEARCH_SEARXNG_ENABLED=false` and restart the server to stop all requests while an upstream limit resets; configured Firecrawl search then becomes the only provider. Concurrent SearXNG calls are queued and sent sequentially; `WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS` sets the quiet period between completed responses and the next request (default `1`, `0` disables queueing).
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional shared credential; enables Firecrawl search fallback and the existing fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
+- `WEB_SEARCH_FIRECRAWL_SEARCH_API_URL` — Firecrawl v2 search endpoint. Blank disables only search fallback, leaving Firecrawl scraping available to `fetch_page`.
 - `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
 - `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
 - `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
 - `WEB_SEARCH_REDDIT_CLIENT_ID` / `WEB_SEARCH_REDDIT_CLIENT_SECRET` / `WEB_SEARCH_REDDIT_USER_AGENT` — optional Reddit OAuth credentials; strongly recommended for reliable Reddit post/comment fetching. See [Reddit Data API setup](#reddit-data-api-setup).
+- `WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/HTML burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
+- `WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to old Reddit/oEmbed; `0` disables the retry. These throttling mitigations are not a substitute for OAuth on hosted-server IPs.
 - `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 - `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL`, clear `GEO_OVERPASS_FALLBACK_URLS` when queries must stay private, and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
 - `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
@@ -229,8 +281,10 @@ for the full list with defaults. Key things to set:
   password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,
   recipient cap, and attachment limits are configurable.
 
-Variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`, `STOCK_`,
-`WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`.
+Provider variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`,
+`STOCK_`, `WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`. Tool availability uses the
+exact MCP tool name followed by `_ENABLED` (for example,
+`SEARCH_WEB_ENABLED=false`).
 
 ### Reddit Data API setup
 
@@ -348,9 +402,11 @@ services (and the `depends_on` block) from `docker-compose.yml`. The stock,
 Wolfram, geocoding, and email tools have no local-service dependencies, though
 they may need API keys, SMTP credentials, or internet access.
 
-> **SearXNG note:** JSON output must be enabled for `search_web` to work — the
+> **SearXNG note:** JSON output must be enabled for SearXNG search to work — the
 > bundled [searxng/settings.yml](https://github.com/madelponte/mcp-server/blob/main/searxng/settings.yml)
-> does this. Set a real `SEARXNG_SECRET` in your `.env`.
+> does this. Set a real `SEARXNG_SECRET` in your `.env`. To pause SearXNG without
+> editing Compose, set `WEB_SEARCH_SEARXNG_ENABLED=false` and configure a
+> Firecrawl API key.
 
 ## Run with Docker (server only)
 

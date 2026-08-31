@@ -66,6 +66,18 @@ _SOFT_404_LABEL = re.compile(
 
 
 def _visible_sample(soup: BeautifulSoup) -> str:
+    # Image alt/title text is readable page content for a text-only client. Fold
+    # it into the sample before flattening so an image-centric page with useful
+    # accessibility text is not rejected as an empty render.
+    for image in soup.find_all("img"):
+        description = (
+            image.get("alt") or image.get("aria-label") or image.get("title") or ""
+        )
+        description = " ".join(str(description).split())
+        if description:
+            image.replace_with(f"[Image: {description}]")
+        else:
+            image.decompose()
     for tag in soup(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()
     return " ".join(soup.get_text(" ", strip=True).split())

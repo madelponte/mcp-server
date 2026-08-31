@@ -23,6 +23,8 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "reddit_client_id", "")
     monkeypatch.setattr(fp.cfg, "reddit_client_secret", "")
     monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
+    monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 0)
+    monkeypatch.setattr(fp.cfg, "reddit_rate_limit_retry_seconds", 0)
     monkeypatch.setattr(fp, "_reddit_access_token", None)
     monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
     monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
@@ -95,8 +97,21 @@ def test_text_mode_markdown(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))
     assert out["format"] == "markdown"
     assert out["title"] == "My Title"
-    assert "# Heading" in out["content"]
+    assert "# Heading {#cite-heading}" in out["content"]
     assert "Body text here." in out["content"]
+
+
+def test_text_mode_marks_prominent_image_in_place(monkeypatch, tool_fns):
+    html = (
+        '<article><p>Before image.</p><img src="/chart.png" '
+        'alt="Revenue rose each quarter"><p>After image.</p></article>'
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report")))
+    marker = "[Image at this location: Revenue rose each quarter]"
+    assert marker in out["content"]
+    assert out["content"].index("Before image.") < out["content"].index(marker)
+    assert out["content"].index(marker) < out["content"].index("After image.")
 
 
 def test_firecrawl_metadata_title_overrides_body_widget_title(monkeypatch, tool_fns):
@@ -128,6 +143,18 @@ def test_structured_mode(monkeypatch, tool_fns):
     assert out["format"] == "structured"
     assert out["content"]["title"] == "T"
     assert out["content"]["description"] == "D"
+
+
+def test_structured_mode_includes_image_description_and_placeholder_note(monkeypatch, tool_fns):
+    html = '<main><img src="hero.jpg" alt="Snow-covered mountain"></main>'
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com", mode="structured"))
+    )
+    image = out["content"]["images"][0]
+    assert image["replaces_image"] is True
+    assert image["description"] == "Snow-covered mountain"
+    assert "not visual analysis" in out["content"]["image_note"]
 
 
 def test_structured_mode_prefers_firecrawl_metadata_title(monkeypatch, tool_fns):
@@ -188,8 +215,26 @@ def test_section_extraction(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com", section="Details")))
     assert out["format"] == "section"
     assert out["matched_heading"] == "Details"
+    assert out["anchor"] == "cite-details"
+    assert out["content"].startswith("# Details {#cite-details}")
     assert "the detail paragraph" in out["content"]
     assert "ending" not in out["content"]
+
+
+def test_section_exposes_source_native_citation_url(monkeypatch, tool_fns):
+    html = '<h2 id="methods">Methods</h2><p>Method details.</p><h2>End</h2>'
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/paper", section="Methods"
+            )
+        )
+    )
+    assert out["anchor"] == "methods"
+    assert out["source_fragment"] == "methods"
+    assert out["citation_url"] == "https://example.com/paper#methods"
+    assert out["content"].startswith("# Methods {#methods}")
 
 
 def test_section_not_found_raises_with_available(monkeypatch, tool_fns):
@@ -208,7 +253,73 @@ def test_query_filters_matching_passages(monkeypatch, tool_fns):
     assert out["query"] == "dog"
     assert out["match_count"] >= 1
     assert "dog ran fast" in out["content"]
+    assert out["line_numbering"] == "1-based nonblank lines in searched content"
+    assert out["match_metadata"][0]["match_lines"] == [2]
+    assert out["match_metadata"][0]["match_quality"] == "literal_substring"
     assert "note" not in out
+
+
+def test_query_result_keeps_nearest_heading_anchor(monkeypatch, tool_fns):
+    html = (
+        '<article><h2 id="results">Results</h2>'
+        '<p>Context one.</p><p>Context two.</p><p>The target value is 42.</p>'
+        '</article>'
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/paper",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert "## Results {#results}" in out["content"]
+    assert "The target value is 42" in out["content"]
+    assert out["context_lines"] == 0
+    assert out["match_metadata"][0]["heading"] == {
+        "level": 2,
+        "text": "Results",
+        "anchor": "results",
+        "source_fragment": "results",
+        "citation_url": "https://example.com/paper#results",
+        "line": 1,
+    }
+    assert out["matching_toc"] == [{
+        "label": "Results",
+        "anchor": "results",
+        "citation_url": "https://example.com/paper#results",
+        "match_count": 1,
+        "windows": [1],
+    }]
+
+
+def test_query_controls_max_match_windows(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "max_query_matches", 3)
+    monkeypatch.setattr(fp.cfg, "max_query_context_lines", 4)
+    html = "<article>" + "".join(
+        f"<p>{text}</p>"
+        for text in (
+            "target one", "a", "b", "target two", "c", "d", "target three"
+        )
+    ) + "</article>"
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com",
+                query="target",
+                max_matches=1,
+                context_lines=0,
+            )
+        )
+    )
+    assert out["sections"] == 1
+    assert len(out["match_metadata"]) == 1
+    assert out["match_count"] == 3
+    assert "showing the first 1" in out["note"]
 
 
 def test_query_no_match_raises(monkeypatch, tool_fns):
@@ -240,6 +351,32 @@ def test_document_routed_to_tika(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report.pdf")))
     assert out["format"] == "document_text"
     assert out["content"] == "Extracted PDF text."
+
+
+def test_document_query_matching_toc_uses_line_ranges(monkeypatch, tool_fns):
+    _patch_fetch(
+        monkeypatch,
+        _fetched(content_type="application/pdf", body=b"%PDF-1.4..."),
+    )
+    monkeypatch.setattr(
+        fp, "_tika_extract", lambda data, url, **kw: "intro\nnotes\ntarget result\nend"
+    )
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://example.com/report.pdf",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert out["match_metadata"][0]["match_lines"] == [3]
+    assert out["matching_toc"] == [{
+        "label": "Lines 3-3",
+        "match_count": 1,
+        "windows": [1],
+    }]
 
 
 def test_firecrawl_recovered_document_text_skips_tika(monkeypatch, tool_fns):
@@ -457,6 +594,56 @@ def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
     assert "without comments" in out["note"]
 
 
+def test_reddit_rss_retries_once_after_rate_limit(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.cfg, "reddit_rate_limit_retry_seconds", 3)
+    calls = []
+    sleeps = []
+    rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <id>t3_abc</id><title>RSS title</title>
+    </entry></feed>"""
+
+    async def acquire(url):
+        calls.append(url)
+        if len(calls) == 1:
+            return _fetched(status=429, text="Too Many Requests")
+        return _fetched(text=rss, content_type="application/atom+xml")
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(fp.anyio, "sleep", sleep)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert len(calls) == 2
+    assert sleeps == [3]
+    assert json.loads(out["content"])["post"]["title"] == "RSS title"
+    assert "HTTP 429" in out["note"]
+    assert "automatic retry succeeded" in out["note"]
+
+
+def test_reddit_oembed_reports_rate_limit_without_debug(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.server_settings, "debug", False)
+
+    async def acquire(url):
+        if url.endswith("/.rss"):
+            return _fetched(status=429, text="Too Many Requests")
+        if "/oembed?" in url:
+            return _fetched(
+                text=json.dumps({"title": "Fallback title", "provider_name": "reddit"}),
+                content_type="application/json",
+            )
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert "HTTP 429" in out["note"]
+    assert "configure Reddit OAuth" in out["note"]
+
+
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(text='{"key": "value"}', content_type="application/json"))
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/api")))
@@ -473,16 +660,50 @@ def test_contentless_accepted_artifact_still_raises(monkeypatch, tool_fns):
     assert "no extractable text" in str(exc.value)
 
 
+def test_standalone_raster_image_returns_explicit_placeholder(monkeypatch, tool_fns):
+    fetched = _fetched(
+        content_type="image/png", body=b"\x89PNG\r\n\x1a\nbinary", text=None
+    )
+    fetched["resource_kind"] = "image"
+    _patch_fetch(monkeypatch, fetched)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com/photo.png"))
+    )
+    assert out["format"] == "image"
+    assert out["media_type"] == "image/png"
+    assert out["filename"] == "photo.png"
+    assert "[Image at this location:" in out["content"]
+    assert "no alt text, caption, or embedded description" in out["content"]
+    assert "in place of the image" in out["note"]
+    assert "not visual analysis" in out["note"]
+
+
+def test_standalone_svg_returns_embedded_description(monkeypatch, tool_fns):
+    svg = "<svg><title>Network diagram</title><desc>Three connected nodes</desc></svg>"
+    fetched = _fetched(content_type="image/svg+xml", text=svg, body=None)
+    fetched["resource_kind"] = "image"
+    _patch_fetch(monkeypatch, fetched)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com/network.svg"))
+    )
+    assert out["format"] == "image"
+    assert out["description"] == "Network diagram — Three connected nodes"
+    assert out["description_source"] == "embedded SVG title+description"
+    assert out["content"] == (
+        "[Image at this location: Network diagram — Three connected nodes]"
+    )
+
+
 def test_unsupported_binary_media_raises_actionable_error(monkeypatch, tool_fns):
     _patch_fetch(
         monkeypatch,
-        _fetched(content_type="image/png", body=b"\x89PNG\r\n\x1a\nbinary", text=None),
+        _fetched(content_type="audio/mpeg", body=b"ID3binary", text=None),
     )
     with pytest.raises(ToolError) as exc:
-        run(tool_fns["fetch_page"](url="https://example.com/image.png"))
+        run(tool_fns["fetch_page"](url="https://example.com/audio.mp3"))
     msg = str(exc.value)
     assert "cannot extract that media type" in msg
-    assert "image/png" in msg
+    assert "audio/mpeg" in msg
     assert "direct download" in msg
 
 
@@ -496,6 +717,34 @@ def test_youtube_url_returns_transcript(monkeypatch, tool_fns):
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")))
     assert out["format"] == "youtube_transcript"
     assert "hello world" in out["content"]
+
+
+def test_youtube_query_matching_toc_uses_timestamps(monkeypatch, tool_fns):
+    async def fake_transcript(url, force_timestamps=False):
+        assert force_timestamps is True
+        return (
+            "Transcript for YouTube video abc\n---\n"
+            "[0:10] introduction\n[1:25] target phrase\n[2:00] ending"
+        )
+
+    monkeypatch.setattr(fp, "fetch_transcript", fake_transcript)
+    out = json.loads(
+        run(
+            tool_fns["fetch_page"](
+                url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                query="target",
+                context_lines=0,
+                include_match_toc=True,
+            )
+        )
+    )
+    assert out["match_metadata"][0]["match_lines"] == [2]
+    assert out["matching_toc"] == [{
+        "label": "Transcript at 1:25",
+        "timestamp": "1:25",
+        "match_count": 1,
+        "windows": [1],
+    }]
 
 
 def test_youtube_transcript_uses_truncation(monkeypatch, tool_fns):

@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
-from config import GeocodingSettings, ServerSettings, WebSearchSettings
+from config import GeocodingSettings, ServerSettings, ToolSettings, WebSearchSettings
 
 
 def test_env_file_is_anchored_next_to_config_module():
@@ -24,6 +24,7 @@ def test_env_file_is_anchored_next_to_config_module():
 
 def test_every_settings_class_uses_the_anchored_env_file():
     classes = (
+        config.ToolSettings,
         config.ServerSettings,
         config.WebSearchSettings,
         config.StockSettings,
@@ -34,6 +35,31 @@ def test_every_settings_class_uses_the_anchored_env_file():
     )
     for cls in classes:
         assert cls.model_config["env_file"] == config.ENV_FILE, cls.__name__
+
+
+TOOL_FLAGS = (
+    "SEARCH_WEB_ENABLED",
+    "FETCH_PAGE_ENABLED",
+    "GET_COMPANY_DATA_ENABLED",
+    "QUERY_WOLFRAM_ALPHA_ENABLED",
+    "FIND_NEARBY_PLACES_ENABLED",
+    "SEND_EMAIL_ENABLED",
+)
+
+
+def test_tool_flags_default_to_enabled(monkeypatch):
+    for env_name in TOOL_FLAGS:
+        monkeypatch.delenv(env_name, raising=False)
+
+    settings = ToolSettings(_env_file=None)
+    assert all(getattr(settings, env_name.lower()) for env_name in TOOL_FLAGS)
+
+
+@pytest.mark.parametrize("env_name", TOOL_FLAGS)
+def test_each_tool_flag_can_be_disabled(monkeypatch, env_name):
+    monkeypatch.setenv(env_name, "false")
+    settings = ToolSettings(_env_file=None)
+    assert getattr(settings, env_name.lower()) is False
 
 
 def test_negative_download_cap_fails_fast(monkeypatch):
@@ -49,6 +75,56 @@ def test_zero_download_cap_is_still_valid(monkeypatch):
     """0 = unbounded is the documented behavior for the download cap."""
     monkeypatch.setenv("WEB_SEARCH_MAX_DOWNLOAD_BYTES", "0")
     assert WebSearchSettings().max_download_bytes == 0
+
+
+def test_searxng_request_delay_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "0")
+    assert WebSearchSettings().searxng_request_delay_seconds == 0
+
+
+def test_searxng_can_be_disabled_for_firecrawl_only_search(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_SEARXNG_ENABLED", "false")
+    assert WebSearchSettings().searxng_enabled is False
+
+
+def test_reddit_request_delay_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS", "0")
+    assert WebSearchSettings().reddit_request_delay_seconds == 0
+
+
+def test_reddit_rate_limit_retry_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS", "0")
+    assert WebSearchSettings().reddit_rate_limit_retry_seconds == 0
+
+
+def test_image_description_cap_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_IMAGE_DESCRIPTIONS", "-1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_MAX_IMAGE_DESCRIPTIONS", "0")
+    assert WebSearchSettings().max_image_descriptions == 0
+
+
+def test_query_context_line_cap_must_be_nonnegative(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_QUERY_CONTEXT_LINES", "-1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_MAX_QUERY_CONTEXT_LINES", "0")
+    assert WebSearchSettings().max_query_context_lines == 0
 
 
 def test_classifier_confidence_must_be_in_unit_interval(monkeypatch):

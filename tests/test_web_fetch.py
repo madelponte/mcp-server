@@ -12,6 +12,7 @@ from tools.cache import TTLCache
 from tools.web_fetch import (
     _is_blocked_response,
     _chromium_network_error_code,
+    _is_image_resource,
     _is_tika_document,
     _sniff_document_bytes,
     _decode_body,
@@ -147,6 +148,32 @@ def test_is_tika_document_true(ctype, url):
 )
 def test_is_tika_document_false(ctype, url):
     assert _is_tika_document(ctype, url) is False
+
+
+# --------------------------- image resource detection ---------------------------
+
+@pytest.mark.parametrize(
+    ("ctype", "url", "body"),
+    [
+        ("image/png", "https://e.com/download", None),
+        ("application/octet-stream", "https://e.com/photo.jpg", None),
+        ("application/octet-stream", "https://e.com/download", b"\x89PNG\r\n\x1a\nrest"),
+        ("image/svg+xml", "https://e.com/vector", b"<svg></svg>"),
+    ],
+)
+def test_is_image_resource_true(ctype, url, body):
+    assert _is_image_resource(ctype, url, body) is True
+
+
+def test_generic_xml_is_not_mistaken_for_image():
+    body = b'<?xml version="1.0"?><feed><title>News</title></feed>'
+    assert _is_image_resource("application/octet-stream", "https://e.com/feed", body) is False
+
+
+def test_non_image_content_type_wins_over_image_extension_without_magic():
+    assert _is_image_resource(
+        "application/json", "https://e.com/photo.jpg", b'{"error":"not an image"}'
+    ) is False
 
 
 # --------------------------- magic-byte document sniffing ---------------------------
