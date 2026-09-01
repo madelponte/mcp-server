@@ -1,23 +1,24 @@
 """
 Agentic Web Search MCP tool.
 
-Exposes `search_web`, backed by a self-hosted SearXNG instance with Firecrawl
-search as an optional fallback. Results are url/title/snippet, optionally
-enriched with structured page metadata (title, description, heading outline)
-for the top hits so the model can decide what to read. The companion
-`fetch_page` tool (in `tools/fetch_page.py`) reads the full content of a result.
-The HTTP fetching both tools share lives in `tools/web_fetch.py`; the HTML
-extraction in `tools/web_extract.py`.
+Exposes `search_web`, backed by Brave's LLM Context API. Brave returns
+relevance-ranked page excerpts (including text, tables, code, and serialized
+structured data) ready for model consumption. Results can optionally be
+enriched with heading outlines so the model can decide what to read with the
+companion `fetch_page` tool.
 
-Translated from the Open WebUI tool; status/citation event emitters were removed.
+The direct-only enrichment transport lives in `tools/web_fetch.py`; HTML
+metadata extraction lives in `tools/web_extract.py`.
 """
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
+import re
 import time
 from typing import Annotated
-from urllib.parse import urlparse
 
 import anyio
 import httpx
@@ -28,24 +29,19 @@ from pydantic import Field
 from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, redact_secrets
 from .web_fetch import _enrich_fetch, _is_tika_document
-from .web_extract import _structured_from_html, _trim
+from .web_extract import _structured_from_html
 
 log = logging.getLogger(__name__)
 
-# SearXNG is queried repeatedly during agent loops. Keep one async client per
-# event loop / verify setting so calls reuse keep-alive connections without
-# binding a client to the wrong loop in tests or alternate server runners. The
-# client class is part of the key so tests that monkeypatch httpx.AsyncClient get
-# a fresh mock-backed client.
-_searxng_clients: dict[tuple[int, bool, int], httpx.AsyncClient] = {}
+# Keep one Brave client per event loop / TLS setting so repeated agent searches
+# reuse keep-alive connections without binding a client to the wrong loop in
+# tests or alternate server runners. The client class is part of the key so a
+# monkeypatched httpx.AsyncClient gets a fresh mock-backed client.
+_brave_clients: dict[tuple[int, bool, int], httpx.AsyncClient] = {}
 
 
-# Simultaneous tool calls are useful to the client, but forwarding their SearXNG
-# requests as a burst quickly rate-limits the upstream search engines. Queue the
-# backend requests process-wide, keep each slot until its response finishes, and
-# leave a configurable quiet period before the next queued request starts.
-class _SearXNGRequestQueue:
-    """Serialize SearXNG requests and delay between completed responses."""
+class _BraveRequestQueue:
+    """Serialize Brave requests and leave a quiet period after each call."""
 
     def __init__(self) -> None:
         self._lock = anyio.Lock()
@@ -53,10 +49,11 @@ class _SearXNGRequestQueue:
 
     @asynccontextmanager
     async def request_slot(self, delay_seconds: float):
-        """Yield one exclusive backend slot after any required quiet period.
+        """Yield an exclusive request slot after the configured spacing.
 
-        A zero delay disables queueing for self-hosted instances that can safely
-        accept concurrent searches.
+        A zero delay disables serialization for higher-throughput Brave plans.
+        The slot covers retries as well as the initial request, preventing a
+        second concurrent tool call from creating another retrying burst.
         """
         if delay_seconds <= 0:
             yield
@@ -72,84 +69,70 @@ class _SearXNGRequestQueue:
                 self._next_request_at = time.monotonic() + delay_seconds
 
 
-_searxng_request_queue = _SearXNGRequestQueue()
+_brave_request_queue = _BraveRequestQueue()
+
+_TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
+_TIME_RANGE_TO_FRESHNESS = {
+    "day": "pd",
+    "week": "pw",
+    "month": "pm",
+    "year": "py",
+}
+_BRAVE_SAFESEARCH = {"off", "moderate", "strict"}
+_BRAVE_THRESHOLD_MODES = {"strict", "balanced", "lenient", "disabled"}
+_DATE_RANGE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})to(\d{4}-\d{2}-\d{2})$")
 
 
-def _searxng_client(verify_ssl: bool) -> httpx.AsyncClient:
+def _brave_client(verify_ssl: bool) -> httpx.AsyncClient:
     loop_id = id(asyncio.get_running_loop())
     key = (loop_id, verify_ssl, id(httpx.AsyncClient))
-    client = _searxng_clients.get(key)
+    client = _brave_clients.get(key)
     if client is None or client.is_closed:
         client = httpx.AsyncClient(verify=verify_ssl)
-        _searxng_clients[key] = client
+        _brave_clients[key] = client
     return client
 
 
 async def close_clients() -> None:
-    """Close every pooled SearXNG client and drop the pool.
-
-    Called from the server's lifespan shutdown (``server.run_http``); see
-    ``close_clients`` in ``web_fetch`` for the rationale.
-    """
-    for client in list(_searxng_clients.values()):
+    """Close every pooled Brave client and drop the pool on shutdown."""
+    for client in list(_brave_clients.values()):
         try:
             await client.aclose()
         except Exception:
-            log.exception("Failed to close a shared SearXNG client.")
-    _searxng_clients.clear()
+            log.exception("Failed to close a shared Brave Search client.")
+    _brave_clients.clear()
 
 
-# The model-facing tool description. Built at registration time so the sibling
-# tool reference (fetch_page) carries the client's tool-name prefix — the same
-# prefix the model sees on that tool (see ServerSettings.tool_prefix). The
-# return-shape part is a plain string so its JSON braces don't need escaping; the
-# prefix is spliced in with `+` rather than an f-string for the same reason.
 def _search_web_desc(prefix: str) -> str:
+    """Build model-facing guidance with the configured sibling-tool prefix."""
     return (
-        "Search the web. Use for unknown facts, current events, or verification.\n\n"
-        "SearXNG is the primary provider; configured servers may fall back to "
-        "Firecrawl. The response identifies the provider used.\n\n"
-        "Results include url/title/snippet + optional page metadata (headings, "
-        "description) for top results. Enriched headings include stable anchors "
-        "and `citation_url` when the source provides a real fragment. Then use "
-        + prefix + "fetch_page to read full content.\n\n"
-        "Query: concise keywords, not sentences. Combine operators when useful: "
-        'site:example.com (domain), "exact phrase", -exclude (omit term), foo OR bar '
-        "(either; uppercase OR), filetype:pdf (format), intitle:word (title), "
-        "inurl:word (URL). time_range: "
-        '"day"/"week"/"month"/"year"/"all". category: "general"|"news"|"science"|'
-        '"it"|"social media"|"videos"|"map" '
-        "(comma-separate).\n"
-        "num_results/enrich_results: max counts (see per-arg caps; enrich fetches "
-        "metadata). page: result page (1-based, default 1) — set page=2 to get the "
-        "next batch of results for the SAME query when the first page wasn't "
-        "useful, instead of reformulating. Firecrawl supports page 1 only; "
-        "later pages require SearXNG.\n\n"
-        "Returns JSON {query, provider, time_range, category, page, results:[{url,title,"
-        "snippet,published_date?,page_title?,page_description?,page_headings?,"
-        "page_toc?}]}"
+        "Search the web with Brave LLM Context. Use for unknown facts, current "
+        "events, research, or verification. Brave returns relevance-ranked "
+        "excerpts extracted from source pages, including text, tables, code, "
+        "and occasionally JSON-serialized structured data.\n\n"
+        "Each result includes url/title/snippets and optional source metadata. "
+        "Optional enrichment adds page headings, a description, and a compact "
+        "table of contents. Enriched headings include stable anchors and "
+        "`citation_url` when the source provides a real fragment. Then use "
+        + prefix + "fetch_page to read a source in full.\n\n"
+        "Query: 1-400 characters and at most 50 words. Prefer concise keywords. "
+        "Combine Brave operators when useful: site:example.com (domain), "
+        '"exact phrase", -exclude, foo OR bar (uppercase logical operator), '
+        "filetype:pdf, intitle:word, inbody:word, lang:en, or loc:us. Operators "
+        "are experimental and very restrictive combinations may return nothing.\n"
+        "time_range: day/week/month/year/all, or an inclusive custom range "
+        "YYYY-MM-DDtoYYYY-MM-DD. country and search_lang influence result "
+        "localization. safesearch: off/moderate/strict. context_threshold_mode: "
+        "strict/balanced/lenient/disabled; omit it to use Brave's calibrated "
+        "default. max_tokens controls the approximate total excerpt budget.\n\n"
+        "Brave LLM Context does not support result-page pagination or search "
+        "categories. Put constraints in the query instead (for example, "
+        "site:youtube.com for videos).\n\n"
+        "Returns JSON {query,provider,time_range,country,search_lang,safesearch?,"
+        "context_threshold_mode?,max_tokens,results:[{url,title,snippets,"
+        "published_date?,description?,site_name?,page_title?,page_description?,"
+        "page_headings?,page_toc?}]}"
     )
-
-# Error convention: every genuine failure raises ToolError, which FastMCP turns
-# into a result with `isError: true`, so a model can't mistake the failure for
-# search data. A valid-but-empty result (e.g. a search with zero hits) is NOT a
-# failure and is still returned as normal JSON. See the README "Error handling"
-# section.
-
-# SearXNG time_range values the API accepts; "" means no time restriction.
-# We also accept a few friendly synonyms for "no restriction" from the model.
-SEARXNG_TIME_RANGES = {"", "day", "week", "month", "year"}
-_TIME_RANGE_NO_RESTRICTION = {"", "all", "any", "none", "anytime"}
-_YOUTUBE_ENGINE_SELECTOR = "!yt"
-_YOUTUBE_ENGINE_ALIASES = ("!yt", "!youtube")
-_YOUTUBE_HOSTS = ("youtube.com", "youtube-nocookie.com", "youtu.be")
-_FIRECRAWL_TIME_RANGES = {
-    "": "",
-    "day": "qdr:d",
-    "week": "qdr:w",
-    "month": "qdr:m",
-    "year": "qdr:y",
-}
 
 
 def _clamp_count(
@@ -159,15 +142,7 @@ def _clamp_count(
     minimum: int,
     default: int | None = None,
 ) -> int:
-    """Resolve a model-requested count against its configured maximum.
-
-    ``None`` (the model didn't ask) yields ``default`` when one is configured,
-    otherwise ``maximum`` (the old fixed-amount behavior). Either way the result
-    is clamped to ``[minimum, maximum]`` so the model can dial the amount down
-    but never request more than the cap — the guard that keeps an oversized
-    response from overwhelming its context window. ``minimum`` is 1 for the
-    result count and 0 for enrichment (0 meaningfully disables it).
-    """
+    """Resolve a model-requested count against its configured maximum."""
     if requested is None:
         if default is None:
             return maximum
@@ -181,246 +156,371 @@ def _clamp_count(
     return min(requested, maximum)
 
 
-def _category_includes_videos(categories: str) -> bool:
-    """True when a comma-separated SearXNG category list includes videos."""
-    return any(part.strip().lower() == "videos" for part in categories.split(","))
-
-
-def _youtube_engine_query(query: str) -> str:
-    """Restrict a video search to SearXNG's YouTube engine."""
-    lowered = query.strip().lower()
-    if any(
-        lowered == alias or lowered.startswith(f"{alias} ")
-        for alias in _YOUTUBE_ENGINE_ALIASES
-    ):
-        return query
-    return f"{_YOUTUBE_ENGINE_SELECTOR} {query}"
-
-
-def _firecrawl_video_query(query: str) -> str:
-    """Restrict Firecrawl's web source to YouTube with its supported site operator."""
-    stripped = query.strip()
-    if stripped.lower().startswith("site:youtube.com "):
-        return stripped
-    return f"site:youtube.com {stripped}"
-
-
-def _firecrawl_search_filters(categories: str) -> tuple[list[str], list[str]]:
-    """Map SearXNG categories to Firecrawl v2 sources and category filters.
-
-    Firecrawl's ``news`` is a source, while ``research`` is a category filter.
-    Its Map API discovers URLs on one site and is unrelated to SearXNG's
-    geographic ``map`` search category, so map searches use the broad web
-    source. IT and social-media searches are likewise broader than Firecrawl's
-    GitHub-only filter and remain web searches.
-    """
-    requested = [part.strip().lower() for part in categories.split(",") if part.strip()]
-    if not requested:
-        requested = ["general"]
-
-    sources: list[str] = []
-    filters: list[str] = []
-    for category in requested:
-        if category == "news":
-            if "news" not in sources:
-                sources.append("news")
-            continue
-        if "web" not in sources:
-            sources.append("web")
-        if category == "science" and "research" not in filters:
-            filters.append("research")
-    return sources, filters
-
-
-def _is_youtube_result_url(url: str | None) -> bool:
-    if not url:
-        return False
-    try:
-        host = urlparse(url).hostname or ""
-    except ValueError:
-        return False
-    host = host.lower()
-    return any(host == allowed or host.endswith(f".{allowed}") for allowed in _YOUTUBE_HOSTS)
-
-
-async def _searxng_query(
-    base_url: str,
-    query: str,
-    *,
-    num_results: int,
-    categories: str,
-    language: str,
-    time_range: str,
-    safe_search: int,
-    timeout: float,
-    verify_ssl: bool,
-    user_agent: str,
-    page: int = 1,
-    request_delay_seconds: float = 0.0,
-) -> list[dict]:
-    """Run a SearXNG JSON query and return [{url, title, snippet, engine}]."""
-    params = {"q": query, "format": "json", "safesearch": str(safe_search)}
-    if categories:
-        params["categories"] = categories
-    if language:
-        params["language"] = language
-    if time_range:
-        params["time_range"] = time_range
-    if page and page > 1:
-        params["pageno"] = str(page)
-
-    url = base_url.rstrip("/") + "/search"
-    headers = {"User-Agent": user_agent, "Accept": "application/json"}
-    client = _searxng_client(verify_ssl)
-    async with _searxng_request_queue.request_slot(request_delay_seconds):
-        resp = await client.get(url, params=params, headers=headers, timeout=timeout)
-    if resp.status_code == 403:
-        raise RuntimeError(
-            "SearXNG returned 403. Make sure `search.formats` in its settings.yml "
-            "includes `json`."
+def _resolve_time_range(value: str | None, default: str) -> tuple[str, str]:
+    """Return ``(model-facing range, Brave freshness value)``."""
+    raw = default if value is None else value
+    normalized = (raw or "").strip().lower()
+    if normalized in _TIME_RANGE_NO_RESTRICTION:
+        return "all", ""
+    if normalized in _TIME_RANGE_TO_FRESHNESS:
+        return normalized, _TIME_RANGE_TO_FRESHNESS[normalized]
+    if normalized in _TIME_RANGE_TO_FRESHNESS.values():
+        friendly = next(
+            name for name, freshness in _TIME_RANGE_TO_FRESHNESS.items()
+            if freshness == normalized
         )
-    resp.raise_for_status()
-    data = resp.json()
+        return friendly, normalized
+
+    match = _DATE_RANGE_RE.fullmatch(normalized)
+    if match:
+        try:
+            start = date.fromisoformat(match.group(1))
+            end = date.fromisoformat(match.group(2))
+        except ValueError as exc:
+            raise ToolError(f"Invalid time_range {value!r}: invalid calendar date.") from exc
+        if start > end:
+            raise ToolError(
+                f"Invalid time_range {value!r}: start date must not follow end date."
+            )
+        return normalized, normalized
+
+    raise ToolError(
+        f"Invalid time_range {value!r}. Use day, week, month, year, all, or "
+        "YYYY-MM-DDtoYYYY-MM-DD."
+    )
+
+
+def _resolve_country(value: str | None, default: str) -> str:
+    country = (default if value is None else value).strip().upper()
+    if len(country) == 2 and country.isalpha():
+        return country
+    raise ToolError("country must be a two-letter country code such as 'US'.")
+
+
+def _resolve_search_lang(value: str | None, default: str) -> str:
+    language = (default if value is None else value).strip().lower()
+    if len(language) >= 2 and all(part.isalpha() for part in language.split("-")):
+        return language
+    raise ToolError("search_lang must be a language code such as 'en' or 'zh-hans'.")
+
+
+def _resolve_optional_choice(
+    value: str | None,
+    default: str,
+    allowed: set[str],
+    name: str,
+) -> str:
+    resolved = (default if value is None else value).strip().lower()
+    if not resolved or resolved in {"default", "auto", "none"}:
+        return ""
+    if resolved in allowed:
+        return resolved
+    choices = ", ".join(sorted(allowed))
+    raise ToolError(f"Invalid {name} {value!r}. Use one of: {choices}, or omit it.")
+
+
+def _brave_error_message(data: object) -> str:
     if not isinstance(data, dict):
-        raise RuntimeError("SearXNG returned a JSON value that is not an object.")
+        return "unknown Brave Search error"
+    error = data.get("error")
+    if isinstance(error, dict):
+        for key in ("detail", "message", "code"):
+            if error.get(key):
+                return str(error[key])[:500]
+    if error:
+        return str(error)[:500]
+    return "unknown Brave Search error"
 
-    items = data.get("results") or []
-    if not isinstance(items, list):
-        raise RuntimeError("SearXNG returned a non-list `results` value.")
-    out: list[dict] = []
-    for r in items[:num_results]:
-        if not isinstance(r, dict):
+
+_RETRYABLE_BRAVE_STATUSES = {429, 502, 503, 504}
+
+
+def _number_list(value: str | None) -> list[float]:
+    if not value:
+        return []
+    numbers: list[float] = []
+    for part in value.split(","):
+        try:
+            numbers.append(max(0.0, float(part.strip())))
+        except ValueError:
+            return []
+    return numbers
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Return Brave/server-directed retry delay, if supplied.
+
+    Brave documents X-RateLimit-Reset as comma-separated relative seconds for
+    each quota window. When Remaining is available, select a reset belonging to
+    an exhausted window; this avoids mistaking a month-long reset for the usual
+    one-second burst reset. Retry-After supports both delta seconds and HTTP
+    dates. The larger applicable hint wins so neither header is undercut.
+    """
+    hints: list[float] = []
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            hints.append(max(0.0, float(retry_after.strip())))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                hints.append(
+                    max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    resets = _number_list(response.headers.get("X-RateLimit-Reset"))
+    remaining = _number_list(response.headers.get("X-RateLimit-Remaining"))
+    if resets:
+        exhausted_resets = [
+            reset
+            for left, reset in zip(remaining, resets)
+            if left <= 0
+        ]
+        hints.append(min(exhausted_resets or resets))
+
+    return max(hints) if hints else None
+
+
+def _log_brave_rate_limits(response: httpx.Response) -> None:
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    if remaining is None or not log.isEnabledFor(logging.DEBUG):
+        return
+    log.debug(
+        "Brave rate limit remaining=%s limit=%s reset_seconds=%s policy=%s",
+        remaining,
+        response.headers.get("X-RateLimit-Limit", "unknown"),
+        response.headers.get("X-RateLimit-Reset", "unknown"),
+        response.headers.get("X-RateLimit-Policy", "unknown"),
+    )
+
+
+async def _post_brave_with_retry(
+    client: httpx.AsyncClient,
+    api_url: str,
+    *,
+    payload: dict,
+    headers: dict[str, str],
+    timeout: float,
+    max_retries: int,
+    retry_backoff_seconds: float,
+) -> httpx.Response:
+    """POST to Brave with bounded exponential retries for transient failures."""
+    for attempt in range(max_retries + 1):
+        try:
+            response = await client.post(
+                api_url,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
+            )
+        except httpx.TransportError as exc:
+            if attempt >= max_retries:
+                raise
+            wait = retry_backoff_seconds * (2 ** attempt)
+            if wait > timeout:
+                raise
+            log.warning(
+                "Brave request transport failure; retrying in %.3fs (%d/%d): %s",
+                wait,
+                attempt + 1,
+                max_retries,
+                exc,
+            )
+            await anyio.sleep(wait)
             continue
-        item = {
-            "url": r.get("url"),
-            "title": r.get("title"),
-            "snippet": (r.get("content") or "").strip(),
-        }
-        # News/dated sources populate a publish date; general-web engines omit
-        # it. SearXNG exposes it inconsistently as either "publishedDate" or
-        # "pubdate" depending on the engine, so surface whichever is present.
-        published = r.get("publishedDate") or r.get("pubdate")
-        if published:
-            item["published_date"] = published
-        out.append(item)
-    return out
+
+        _log_brave_rate_limits(response)
+        if response.status_code not in _RETRYABLE_BRAVE_STATUSES:
+            return response
+        if attempt >= max_retries:
+            return response
+
+        backoff = retry_backoff_seconds * (2 ** attempt)
+        server_hint = _retry_after_seconds(response)
+        wait = max(backoff, server_hint or 0.0)
+        # A monthly quota reset can be days away. Do not pin one MCP call (and
+        # the process-wide queue) for longer than its per-attempt HTTP timeout.
+        if wait > timeout:
+            log.warning(
+                "Brave returned HTTP %d with retry delay %.3fs, exceeding the "
+                "%.3fs request timeout; not retrying.",
+                response.status_code,
+                wait,
+                timeout,
+            )
+            return response
+        log.warning(
+            "Brave returned HTTP %d; retrying in %.3fs (%d/%d).",
+            response.status_code,
+            wait,
+            attempt + 1,
+            max_retries,
+        )
+        await anyio.sleep(wait)
+
+    raise RuntimeError("Brave retry loop exited unexpectedly.")
 
 
-async def _firecrawl_query(
+def _published_date(source: dict) -> str | None:
+    age = source.get("age")
+    if not isinstance(age, list):
+        return None
+    # The fourth fixed position is the only representation retaining time of
+    # day; older API versions may only provide the YYYY-MM-DD second position.
+    for index in (3, 1, 0):
+        if len(age) > index and isinstance(age[index], str) and age[index].strip():
+            return age[index].strip()
+    return None
+
+
+async def _brave_query(
     api_url: str,
     api_key: str,
     query: str,
     *,
     num_results: int,
-    categories: str,
-    time_range: str,
+    country: str,
+    search_lang: str,
+    freshness: str,
+    safesearch: str,
+    context_threshold_mode: str,
+    max_tokens: int,
+    search_count: int,
+    max_tokens_per_url: int,
     timeout: float,
     verify_ssl: bool,
-    page: int = 1,
+    user_agent: str,
+    request_delay_seconds: float,
+    max_retries: int,
+    retry_backoff_seconds: float,
 ) -> list[dict]:
-    """Run a Firecrawl v2 search and normalize its web/news result arrays."""
-    if page > 1:
-        raise RuntimeError(
-            "Firecrawl search does not support result-page pagination; retry "
-            "page=1 or re-enable SearXNG for page > 1."
-        )
-
-    sources, category_filters = _firecrawl_search_filters(categories)
+    """Call Brave LLM Context and normalize its grounding/source records."""
     payload: dict = {
-        "query": (
-            _firecrawl_video_query(query)
-            if _category_includes_videos(categories)
-            else query
-        ),
-        "limit": num_results,
-        "sources": sources,
-        "timeout": max(1000, min(300000, int(timeout * 1000))),
+        "q": query,
+        "country": country,
+        "search_lang": search_lang,
+        "count": max(num_results, search_count),
+        "maximum_number_of_urls": num_results,
+        "maximum_number_of_tokens": max_tokens,
+        "maximum_number_of_tokens_per_url": min(max_tokens_per_url, max_tokens),
+        "enable_source_metadata": True,
     }
-    if category_filters:
-        payload["categories"] = category_filters
-    tbs = _FIRECRAWL_TIME_RANGES.get(time_range, "")
-    if tbs:
-        payload["tbs"] = tbs
+    if freshness:
+        payload["freshness"] = freshness
+    if safesearch:
+        payload["safesearch"] = safesearch
+    if context_threshold_mode:
+        payload["context_threshold_mode"] = context_threshold_mode
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "X-Subscription-Token": api_key,
         "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
     }
-    http_timeout = payload["timeout"] / 1000 + 10
-    async with httpx.AsyncClient(verify=verify_ssl, timeout=http_timeout) as client:
-        resp = await client.post(api_url, json=payload, headers=headers)
+    client = _brave_client(verify_ssl)
+    async with _brave_request_queue.request_slot(request_delay_seconds):
+        response = await _post_brave_with_retry(
+            client,
+            api_url,
+            payload=payload,
+            headers=headers,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
+
+    if not 200 <= response.status_code < 300:
+        try:
+            error_data = response.json()
+        except ValueError:
+            excerpt = " ".join(response.text.split())[:300] or "empty response body"
+            raise RuntimeError(
+                f"Brave LLM Context returned HTTP {response.status_code} with a "
+                f"non-JSON response: {excerpt}"
+            )
+        raise RuntimeError(
+            f"Brave LLM Context returned HTTP {response.status_code}: "
+            f"{_brave_error_message(error_data)}"
+        )
 
     try:
-        response_data = resp.json()
+        data = response.json()
     except ValueError as exc:
-        raise RuntimeError("Firecrawl search returned invalid JSON.") from exc
-    if not isinstance(response_data, dict):
-        raise RuntimeError("Firecrawl search returned a JSON value that is not an object.")
-    if resp.status_code < 200 or resp.status_code >= 300:
-        message = str(response_data.get("error") or "unknown Firecrawl error")[:500]
-        raise RuntimeError(f"Firecrawl search returned HTTP {resp.status_code}: {message}")
-    if response_data.get("success") is not True:
-        message = str(response_data.get("error") or "search was unsuccessful")[:500]
-        raise RuntimeError(f"Firecrawl search failed: {message}")
-
-    data = response_data.get("data")
+        raise RuntimeError(
+            f"Brave LLM Context returned HTTP {response.status_code} with invalid JSON."
+        ) from exc
     if not isinstance(data, dict):
-        raise RuntimeError("Firecrawl search response did not contain a data object.")
+        raise RuntimeError(
+            f"Brave LLM Context returned HTTP {response.status_code} with a JSON "
+            "value that is not an object."
+        )
 
-    out: list[dict] = []
+    grounding = data.get("grounding")
+    if not isinstance(grounding, dict):
+        raise RuntimeError("Brave LLM Context response did not contain a grounding object.")
+    generic = grounding.get("generic") or []
+    if not isinstance(generic, list):
+        raise RuntimeError("Brave LLM Context returned non-list generic grounding.")
+    sources = data.get("sources") or {}
+    if not isinstance(sources, dict):
+        raise RuntimeError("Brave LLM Context returned a non-object sources value.")
+
+    results: list[dict] = []
     seen_urls: set[str] = set()
-    for source in sources:
-        items = data.get(source) or []
-        if not isinstance(items, list):
-            raise RuntimeError(
-                f"Firecrawl search returned a non-list {source!r} result value."
-            )
-        for raw in items:
-            if not isinstance(raw, dict):
-                continue
-            metadata = raw.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            url = raw.get("url") or metadata.get("url") or metadata.get("sourceURL")
-            if not isinstance(url, str) or not url.strip() or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            title = raw.get("title") or metadata.get("title")
-            snippet = (
-                raw.get("snippet")
-                or raw.get("description")
-                or metadata.get("description")
-                or ""
-            )
-            item = {"url": url, "title": title, "snippet": str(snippet).strip()}
-            published = raw.get("date") or raw.get("publishedDate")
-            if published:
-                item["published_date"] = published
-            out.append(item)
-            if len(out) >= num_results:
-                return out
-    return out
+    for raw in generic:
+        if not isinstance(raw, dict):
+            continue
+        url = raw.get("url")
+        if not isinstance(url, str) or not url.strip() or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        source = sources.get(url)
+        source = source if isinstance(source, dict) else {}
+        snippets = raw.get("snippets") or []
+        if not isinstance(snippets, list):
+            snippets = []
+        clean_snippets = [item for item in snippets if isinstance(item, str) and item]
+        item = {
+            "url": url,
+            "title": raw.get("title") or source.get("title"),
+            "snippets": clean_snippets,
+        }
+        published = _published_date(source)
+        if published:
+            item["published_date"] = published
+        if source.get("description"):
+            item["description"] = source["description"]
+        if source.get("site_name"):
+            item["site_name"] = source["site_name"]
+        results.append(item)
+        if len(results) >= num_results:
+            break
+    return results
 
 
 async def _enrich_result(url: str | None) -> dict | None:
-    """Fetch a URL just enough to extract structured metadata."""
+    """Fetch a URL just enough to extract structured page metadata."""
     if not url:
         return None
     try:
         fetched = await _enrich_fetch(url)
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as exc:
+        return {"error": str(exc)}
 
     if not fetched:
         return None
-    ctype = (fetched.get("content_type") or "").lower()
-    if _is_tika_document(ctype, url):
+    content_type = (fetched.get("content_type") or "").lower()
+    if _is_tika_document(content_type, url):
         return {"title": None, "description": None, "headings": [], "toc": None}
     text = fetched.get("text")
     if not text:
         return None
-    # lxml parsing is CPU-bound; offload it so enriching several results doesn't
-    # serialize on (and block) the event loop.
     return await anyio.to_thread.run_sync(_structured_from_html, text, url)
 
 
@@ -429,158 +529,137 @@ def register(mcp: FastMCP) -> None:
     async def search_web(
         query: str,
         time_range: str | None = None,
-        category: str | None = None,
+        country: str | None = None,
+        search_lang: str | None = None,
+        safesearch: str | None = None,
+        context_threshold_mode: str | None = None,
         num_results: Annotated[
             int | None,
             Field(
-                description=f"Max results to return, up to {cfg.max_num_results} "
+                description=f"Max source URLs to return, up to {cfg.max_num_results} "
                 "(larger is clamped); omit for the max."
+            ),
+        ] = None,
+        max_tokens: Annotated[
+            int | None,
+            Field(
+                description=f"Approximate total Brave excerpt-token budget, from "
+                f"1024 up to {cfg.max_context_tokens} (larger is clamped); omit "
+                "for the max."
             ),
         ] = None,
         enrich_results: Annotated[
             int | None,
             Field(
-                description=f"Top N results to enrich with page metadata, up to "
-                f"{cfg.max_enrich_results} (larger is clamped); default "
+                description=f"Top N results to enrich with page headings/metadata, "
+                f"up to {cfg.max_enrich_results} (larger is clamped); default "
                 f"{cfg.default_enrich_results}, 0 disables enrichment."
             ),
         ] = None,
-        page: int | None = None,
     ) -> str:
-        """Search the web. The model-facing guidance lives in the
-        @mcp.tool(description=...) above.
+        """Search the web. Model-facing guidance is in the tool description.
 
-        :param query: Concise keywords; combine operators: site:, "exact phrase",
-            -exclude, foo OR bar, filetype:, intitle:, inurl:.
-        :param time_range: Recency filter.
-        :param category: Category (comma-separate).
-        :param page: Result page number (1-based; default 1).
+        :param query: Concise keywords; supports Brave operators such as site:,
+            "exact phrase", -exclude, foo OR bar, filetype:, intitle:, inbody:, lang:, loc:.
+        :param time_range: Recency or custom inclusive date-range filter.
+        :param country: Two-letter result country code, such as US or GB.
+        :param search_lang: Result language code, such as en or zh-hans.
+        :param safesearch: Adult-content filter: off, moderate, strict, or omitted.
+        :param context_threshold_mode: Relevance filter: strict, balanced, lenient,
+            disabled, or omitted for Brave's default.
         """
         log_call(
             log,
             "search_web",
             query=query,
             time_range=time_range,
-            category=category,
+            country=country,
+            search_lang=search_lang,
+            safesearch=safesearch,
+            context_threshold_mode=context_threshold_mode,
             num_results=num_results,
+            max_tokens=max_tokens,
             enrich_results=enrich_results,
-            page=page,
         )
         query = (query or "").strip()
         if not query:
             raise ToolError("Empty query.")
+        if len(query) > 400:
+            raise ToolError("Query exceeds Brave's 400-character limit.")
+        if len(query.split()) > 50:
+            raise ToolError("Query exceeds Brave's 50-word limit.")
 
-        # Resolve optional overrides, falling back to the configured env valves.
-        if time_range is None:
-            resolved_time_range = cfg.searxng_time_range
-        else:
-            tr = time_range.strip().lower()
-            if tr in _TIME_RANGE_NO_RESTRICTION:
-                resolved_time_range = ""
-            elif tr in SEARXNG_TIME_RANGES:
-                resolved_time_range = tr
-            else:
-                raise ToolError(
-                    f"Invalid time_range {time_range!r}. Use one of: day, week, "
-                    "month, year, or all (no restriction)."
-                )
+        api_key = cfg.brave_api_key.strip()
+        if not api_key:
+            raise ToolError(
+                "Brave Search is not configured (set WEB_SEARCH_BRAVE_API_KEY)."
+            )
+        api_url = cfg.brave_api_url.strip()
+        if not api_url:
+            raise ToolError("WEB_SEARCH_BRAVE_API_URL must not be blank.")
 
-        if category is None:
-            resolved_categories = cfg.searxng_categories
-        else:
-            resolved_categories = category.strip() or cfg.searxng_categories
-
-        # Page is 1-based; anything below 1 (or unset) means the first page.
-        resolved_page = page if isinstance(page, int) and page > 1 else 1
-
+        resolved_time_range, freshness = _resolve_time_range(
+            time_range, cfg.brave_freshness
+        )
+        resolved_country = _resolve_country(country, cfg.brave_country)
+        resolved_language = _resolve_search_lang(search_lang, cfg.brave_search_lang)
+        resolved_safesearch = _resolve_optional_choice(
+            safesearch, cfg.brave_safesearch, _BRAVE_SAFESEARCH, "safesearch"
+        )
+        resolved_threshold = _resolve_optional_choice(
+            context_threshold_mode,
+            cfg.brave_context_threshold_mode,
+            _BRAVE_THRESHOLD_MODES,
+            "context_threshold_mode",
+        )
         resolved_num_results = _clamp_count(
             num_results, cfg.max_num_results, minimum=1
         )
-        provider: str | None = None
-        results: list[dict] | None = None
-        provider_errors: list[str] = []
+        resolved_max_tokens = _clamp_count(
+            max_tokens, cfg.max_context_tokens, minimum=1024
+        )
 
-        if cfg.searxng_enabled:
-            try:
-                search_query = (
-                    _youtube_engine_query(query)
-                    if _category_includes_videos(resolved_categories)
-                    else query
-                )
-                results = await _searxng_query(
-                    base_url=cfg.searxng_url,
-                    query=search_query,
-                    num_results=resolved_num_results,
-                    categories=resolved_categories,
-                    language=cfg.searxng_language,
-                    time_range=resolved_time_range,
-                    safe_search=cfg.searxng_safesearch,
-                    timeout=cfg.http_timeout_seconds,
-                    verify_ssl=cfg.verify_ssl,
-                    user_agent=cfg.user_agent,
-                    page=resolved_page,
-                    request_delay_seconds=cfg.searxng_request_delay_seconds,
-                )
-                provider = "searxng"
-            except Exception as exc:
-                provider_errors.append(f"SearXNG failed: {exc}")
-                log.warning(
-                    "SearXNG search failed; checking the Firecrawl fallback: %s",
-                    redact_secrets(exc, urlparse(cfg.searxng_url).password or ""),
-                )
-
-        firecrawl_url = cfg.firecrawl_search_api_url.strip()
-        firecrawl_key = cfg.firecrawl_api_key.strip()
-        if results is None and firecrawl_url and firecrawl_key:
-            try:
-                results = await _firecrawl_query(
-                    api_url=firecrawl_url,
-                    api_key=firecrawl_key,
-                    query=query,
-                    num_results=resolved_num_results,
-                    categories=resolved_categories,
-                    time_range=resolved_time_range,
-                    timeout=cfg.firecrawl_timeout_seconds,
-                    verify_ssl=cfg.verify_ssl,
-                    page=resolved_page,
-                )
-                provider = "firecrawl"
-            except Exception as exc:
-                provider_errors.append(f"Firecrawl failed: {exc}")
-        elif results is None:
-            provider_errors.append(
-                "Firecrawl search is not configured (set "
-                "WEB_SEARCH_FIRECRAWL_API_KEY and "
-                "WEB_SEARCH_FIRECRAWL_SEARCH_API_URL)"
+        try:
+            results = await _brave_query(
+                api_url=api_url,
+                api_key=api_key,
+                query=query,
+                num_results=resolved_num_results,
+                country=resolved_country,
+                search_lang=resolved_language,
+                freshness=freshness,
+                safesearch=resolved_safesearch,
+                context_threshold_mode=resolved_threshold,
+                max_tokens=resolved_max_tokens,
+                search_count=cfg.brave_search_count,
+                max_tokens_per_url=cfg.brave_max_tokens_per_url,
+                timeout=cfg.brave_timeout_seconds,
+                verify_ssl=cfg.verify_ssl,
+                user_agent=cfg.user_agent,
+                request_delay_seconds=cfg.brave_request_delay_seconds,
+                max_retries=cfg.brave_max_retries,
+                retry_backoff_seconds=cfg.brave_retry_backoff_seconds,
             )
-
-        if results is None or provider is None:
-            if not cfg.searxng_enabled:
-                provider_errors.insert(0, "SearXNG is disabled")
-            backend_password = urlparse(cfg.searxng_url).password or ""
-            detail = redact_secrets(
-                "; ".join(provider_errors), backend_password, firecrawl_key
-            )
-            raise ToolError(f"Web search failed for {query!r}: {detail}")
+        except Exception as exc:
+            detail = redact_secrets(exc, api_key)
+            raise ToolError(f"Web search failed for {query!r}: {detail}") from exc
 
         applied = {
-            "provider": provider,
-            "time_range": resolved_time_range or "all",
-            "category": resolved_categories,
-            "page": resolved_page,
+            "provider": "brave_llm_context",
+            "time_range": resolved_time_range,
+            "country": resolved_country,
+            "search_lang": resolved_language,
+            "max_tokens": resolved_max_tokens,
         }
+        if resolved_safesearch:
+            applied["safesearch"] = resolved_safesearch
+        if resolved_threshold:
+            applied["context_threshold_mode"] = resolved_threshold
 
         if not results:
             return log_result(
                 log, "search_web", to_json({"query": query, **applied, "results": []})
             )
-
-        if _category_includes_videos(resolved_categories):
-            results = [r for r in results if _is_youtube_result_url(r.get("url"))]
-
-        for r in results:
-            if r.get("snippet"):
-                r["snippet"] = _trim(r["snippet"], cfg.max_snippet_chars)
 
         enrich_n = min(
             _clamp_count(
@@ -592,28 +671,24 @@ def register(mcp: FastMCP) -> None:
             len(results),
         )
         if enrich_n > 0:
-            tasks = [_enrich_result(r.get("url")) for r in results[:enrich_n]]
+            tasks = [_enrich_result(result.get("url")) for result in results[:enrich_n]]
             enriched = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, data in enumerate(enriched):
+            for index, data in enumerate(enriched):
                 if isinstance(data, Exception):
-                    results[i]["page_meta_error"] = str(data)
+                    results[index]["page_meta_error"] = str(data)
                     continue
                 if not data:
                     continue
-                # `_enrich_result` reports a fetch failure as {"error": ...} rather
-                # than raising, so surface it as page_meta_error instead of letting
-                # it fall through (which would set page_title/description to null and
-                # drop the reason).
                 if data.get("error"):
-                    results[i]["page_meta_error"] = data["error"]
+                    results[index]["page_meta_error"] = data["error"]
                     continue
                 headings = (data.get("headings") or [])[: cfg.max_enrich_headings]
-                results[i]["page_title"] = data.get("title")
-                results[i]["page_description"] = data.get("description")
+                results[index]["page_title"] = data.get("title")
+                results[index]["page_description"] = data.get("description")
                 if headings:
-                    results[i]["page_headings"] = headings
+                    results[index]["page_headings"] = headings
                 if data.get("toc"):
-                    results[i]["page_toc"] = data["toc"][:20]
+                    results[index]["page_toc"] = data["toc"][:20]
 
         return log_result(
             log,
