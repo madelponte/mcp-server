@@ -198,15 +198,17 @@ def register(mcp: FastMCP) -> None:
         the SAME query with assumption=<value> from assumptions.alternatives.
         units="metric"(km, kg, °C) or "nonmetric"(miles, lb, °F) sets the unit
         system for the answer — set it to match what the question asks for.
-        NOT for opinions, news, code, or known facts.
+        DO use it for deterministic facts (constants, conversions, derivations, demographics).
+        DO NOT use it for news, opinions, or code.
+
+        Returns JSON {query, data:{section: value, ...}, assumptions?, url?}.
+        The answer is the first entry in data; assumptions appears only when
+        the query was ambiguous.
 
         :param query: Keyword query.
         :param assumption: Disambiguation value from a prior result's
             assumptions.alternatives (if any).
         :param units: "metric" or "nonmetric" (default: server config).
-        :return: JSON {query, data:{section: value, ...}, assumptions?, url?}.
-            The answer is the first entry in data; assumptions appears only when
-            the query was ambiguous.
         """
         log_call(
             log, "query_wolfram_alpha", query=query, assumption=assumption, units=units

@@ -113,6 +113,9 @@ def test_search_web_documents_common_operators(server):
     assert "Brave LLM Context" in tool.description
     assert "provider" in tool.description
     assert "does not support result-page pagination or search categories" in tool.description
+    assert "YYYY-MM-DD to YYYY-MM-DD" in tool.description
+    time_range_desc = tool.to_mcp_tool().inputSchema["properties"]["time_range"]["description"]
+    assert "YYYY-MM-DD to YYYY-MM-DD" in time_range_desc
 
 
 def test_search_web_schema_exposes_brave_caps(server):
@@ -178,6 +181,18 @@ def test_get_company_data_schema_has_section_params(server):
     props = (mcp_tool.inputSchema or {}).get("properties", {})
     for param in ("symbol", "sections", "statement", "period", "history_interval"):
         assert param in props
+
+
+def test_stock_wolfram_email_descriptions_include_return_shape(server):
+    stock = _tool_by_name(server, "get_company_data").description
+    assert "Returns JSON" in stock
+    assert "resolved_from?" in stock
+    wolfram = _tool_by_name(server, "query_wolfram_alpha").description
+    assert "Returns JSON" in wolfram
+    assert "assumptions?" in wolfram
+    email = _tool_by_name(server, "send_email").description
+    assert "Returns JSON" in email
+    assert "accepted_recipients" in email
 
 
 def test_tool_run_invokes_the_function(server):

@@ -104,7 +104,8 @@ def _fetch_page_desc(prefix: str) -> str:
         "(`exact_line`, `literal_substring`, or `regex_pattern`). Use "
         "max_matches/context_lines to control size. Set include_match_toc=true "
         "for a compact TOC of matching headings, transcript timestamps, or line "
-        "ranges only. YouTube matches retain [M:SS] timestamps.\n"
+        "ranges only. YouTube matches retain [M:SS] timestamps. Zero matches "
+        "return an empty result (match_count 0), not an error.\n"
         "• section — a heading's text. Returns only the content under that "
         "heading (in structured mode, only that section's sub-headings/toc).\n"
         '• mode — "text" (the default) returns the page content; "structured" '
@@ -512,11 +513,25 @@ async def _query_payload(
             "Use a simpler regex or a literal keyword/phrase."
         )
     if not windows:
-        raise ToolError(
-            f"No {kind} matching query {query!r} found on {url}. "
-            "Try a simpler keyword or a different spelling, loosen the regex, or "
-            "omit `query` to retrieve the full content."
-        )
+        payload = {
+            "query": query,
+            "match_count": 0,
+            "sections": 0,
+            "context_lines": context_lines,
+            "line_numbering": "1-based nonblank lines in searched content",
+            "match_metadata": [],
+            "content": "",
+            "note": (
+                f"No {kind} matching query {query!r} found on {url}. "
+                "This is an empty result, not a fetch failure — the page was "
+                "retrieved successfully. Try a simpler keyword or a different "
+                "spelling, loosen the regex, or omit `query` to retrieve the "
+                "full content."
+            ),
+        }
+        if include_match_toc:
+            payload["matching_toc"] = []
+        return payload
 
     metadata = []
     for window_number, window in enumerate(windows, 1):

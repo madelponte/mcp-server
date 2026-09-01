@@ -322,12 +322,20 @@ def test_query_controls_max_match_windows(monkeypatch, tool_fns):
     assert "showing the first 1" in out["note"]
 
 
-def test_query_no_match_raises(monkeypatch, tool_fns):
+def test_query_no_match_returns_empty_result(monkeypatch, tool_fns):
     html = "<body><article><p>Only this paragraph.</p></article></body>"
     _patch_fetch(monkeypatch, _fetched(text=html))
-    with pytest.raises(ToolError) as exc:
+    out = json.loads(
         run(tool_fns["fetch_page"](url="https://example.com", query="zebra"))
-    assert "matching query" in str(exc.value)
+    )
+    assert out["query"] == "zebra"
+    assert out["match_count"] == 0
+    assert out["sections"] == 0
+    assert out["match_metadata"] == []
+    assert "Only this paragraph" not in out.get("content", "")
+    assert "empty result" in out["note"]
+    assert "not a fetch failure" in out["note"]
+    assert "matching query 'zebra'" in out["note"]
 
 
 def test_query_timeout_surfaces_as_tool_error(monkeypatch, tool_fns):

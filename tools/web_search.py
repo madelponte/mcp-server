@@ -80,7 +80,7 @@ _TIME_RANGE_TO_FRESHNESS = {
 }
 _BRAVE_SAFESEARCH = {"off", "moderate", "strict"}
 _BRAVE_THRESHOLD_MODES = {"strict", "balanced", "lenient", "disabled"}
-_DATE_RANGE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})to(\d{4}-\d{2}-\d{2})$")
+_DATE_RANGE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*to\s*(\d{4}-\d{2}-\d{2})$")
 
 
 def _brave_client(verify_ssl: bool) -> httpx.AsyncClient:
@@ -121,7 +121,7 @@ def _search_web_desc(prefix: str) -> str:
         "filetype:pdf, intitle:word, inbody:word, lang:en, or loc:us. Operators "
         "are experimental and very restrictive combinations may return nothing.\n"
         "time_range: day/week/month/year/all, or an inclusive custom range "
-        "YYYY-MM-DDtoYYYY-MM-DD. country and search_lang influence result "
+        "YYYY-MM-DD to YYYY-MM-DD. country and search_lang influence result "
         "localization. safesearch: off/moderate/strict. context_threshold_mode: "
         "strict/balanced/lenient/disabled; omit it to use Brave's calibrated "
         "default. max_tokens controls the approximate total excerpt budget.\n\n"
@@ -182,11 +182,13 @@ def _resolve_time_range(value: str | None, default: str) -> tuple[str, str]:
             raise ToolError(
                 f"Invalid time_range {value!r}: start date must not follow end date."
             )
-        return normalized, normalized
+        # Echo the documented spaced form; Brave's freshness param is concatenated.
+        start_s, end_s = start.isoformat(), end.isoformat()
+        return f"{start_s} to {end_s}", f"{start_s}to{end_s}"
 
     raise ToolError(
         f"Invalid time_range {value!r}. Use day, week, month, year, all, or "
-        "YYYY-MM-DDtoYYYY-MM-DD."
+        "YYYY-MM-DD to YYYY-MM-DD."
     )
 
 
@@ -561,7 +563,7 @@ def register(mcp: FastMCP) -> None:
 
         :param query: Concise keywords; supports Brave operators such as site:,
             "exact phrase", -exclude, foo OR bar, filetype:, intitle:, inbody:, lang:, loc:.
-        :param time_range: Recency or custom inclusive date-range filter.
+        :param time_range: Recency (day/week/month/year/all) or inclusive YYYY-MM-DD to YYYY-MM-DD.
         :param country: Two-letter result country code, such as US or GB.
         :param search_lang: Result language code, such as en or zh-hans.
         :param safesearch: Adult-content filter: off, moderate, strict, or omitted.

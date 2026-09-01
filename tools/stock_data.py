@@ -1797,15 +1797,17 @@ def register(mcp: FastMCP) -> None:
         Crypto/FX/indices (BTC-USD, ^GSPC): quote/price_history/profile/news
         only (no fundamentals).
 
+        Returns JSON {symbol,sections,data:{...},resolved_from?,errors?} for one
+        symbol. For a list: {results:[<that object|{symbol,error}>,...],note?},
+        one entry per symbol in order. Check resolved_from when you passed a
+        name; errors lists sections that returned nothing.
+
         :param sections: Sections to fetch (default: quote,profile). Either an
             array (["quote","profile"]) or a comma-separated string
             ("quote,profile") works.
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
-        :return: For one symbol: JSON {symbol,sections,data:{...},resolved_from?,
-            errors?}. For a list: JSON {results:[<that object|{symbol,error}>,...],
-            note?}, one entry per symbol in order.
         """
         log_call(
             log,

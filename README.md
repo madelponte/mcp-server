@@ -45,7 +45,7 @@ published date, description, and site name. The top-level `provider` is
 `brave_llm_context`.
 
 `time_range` accepts `day`/`week`/`month`/`year`/`all` or an inclusive custom
-`YYYY-MM-DDtoYYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
+`YYYY-MM-DD to YYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
 (`off`/`moderate`/`strict`), and `context_threshold_mode`
 (`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
 `num_results` controls the source-URL count and `max_tokens` controls the

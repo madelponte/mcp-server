@@ -141,7 +141,7 @@ class WebSearchSettings(BaseSettings):
         "",
         description=(
             "Default Brave freshness filter: blank/all, day/week/month/year "
-            "(or pd/pw/pm/py), or YYYY-MM-DDtoYYYY-MM-DD."
+            "(or pd/pw/pm/py), or YYYY-MM-DD to YYYY-MM-DD."
         ),
     )
     brave_safesearch: str = Field(

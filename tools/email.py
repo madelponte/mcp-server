@@ -276,11 +276,14 @@ def register(mcp: FastMCP) -> None:
         deliver content you have already produced. Supports CC, BCC, Reply-To,
         and local file attachments.
 
+        Returns JSON {status, subject, recipients:{to,cc,bcc},
+        attempted_recipients, accepted_recipients, refused_recipients,
+        invalid_recipients, dropped_recipients, attachments, dropped}.
+        status is "sent", "partial", or "failed".
+
         :param subject: The email subject line.
         :param body: The plain-text message body.
         :param reply_to: Optional Reply-To email address.
-        :return: JSON with status, intended/accepted/refused recipients,
-            invalid/dropped recipients, and attachment metadata.
         """
         log_call(
             log,

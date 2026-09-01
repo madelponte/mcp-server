@@ -58,7 +58,9 @@ def test_clamp_count_uses_default_or_max_and_clamps():
         ("week", "week", "pw"),
         ("pm", "month", "pm"),
         ("year", "year", "py"),
-        ("2024-01-01to2024-02-29", "2024-01-01to2024-02-29", "2024-01-01to2024-02-29"),
+        ("2024-01-01to2024-02-29", "2024-01-01 to 2024-02-29", "2024-01-01to2024-02-29"),
+        ("2024-01-01 to 2024-02-29", "2024-01-01 to 2024-02-29", "2024-01-01to2024-02-29"),
+        ("2024-01-01  TO  2024-02-29", "2024-01-01 to 2024-02-29", "2024-01-01to2024-02-29"),
     ],
 )
 def test_resolve_time_range(value, model_value, freshness):
@@ -67,7 +69,12 @@ def test_resolve_time_range(value, model_value, freshness):
 
 @pytest.mark.parametrize(
     "value",
-    ["fortnight", "2024-02-30to2024-03-01", "2024-03-01to2024-02-01"],
+    [
+        "fortnight",
+        "2024-02-30to2024-03-01",
+        "2024-03-01to2024-02-01",
+        "2024-03-01 to 2024-02-01",
+    ],
 )
 def test_resolve_time_range_rejects_invalid_values(value):
     with pytest.raises(ToolError):
@@ -579,6 +586,27 @@ def test_search_web_happy_path_maps_options_and_caps(monkeypatch, tool_fns):
     assert seen["max_retries"] == ws.cfg.brave_max_retries
     assert seen["retry_backoff_seconds"] == ws.cfg.brave_retry_backoff_seconds
     assert out["results"][0]["snippets"] == ["excerpt"]
+
+
+def test_search_web_accepts_spaced_date_range(monkeypatch, tool_fns):
+    seen = {}
+
+    async def fake_query(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(ws, "_brave_query", fake_query)
+    out = json.loads(
+        run(
+            tool_fns["search_web"](
+                query="test",
+                time_range="2024-01-01 to 2024-02-29",
+                enrich_results=0,
+            )
+        )
+    )
+    assert out["time_range"] == "2024-01-01 to 2024-02-29"
+    assert seen["freshness"] == "2024-01-01to2024-02-29"
 
 
 def test_search_web_enriches_top_results(monkeypatch, tool_fns):
