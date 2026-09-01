@@ -36,45 +36,29 @@ overwhelm a model's context window. Omitting a value uses the cap.
 
 ### Agentic Web Search
 
-`search_web(query, time_range=None, category=None, num_results=None, enrich_results=None, page=None)`
-— Search the web via SearXNG, falling back to Firecrawl when SearXNG fails (or
-using Firecrawl directly when SearXNG is disabled), and return a ranked list of
-results. The top-level `provider` field reports which backend answered. Each
-result carries a url, title, snippet, optional published date, and (for the top
-results) page metadata: a description plus a heading/JSON-LD table-of-contents
-outline, so the model can decide which links are worth fetching in full.
-`time_range` accepts `day`/`week`/`month`/`year`/`all`; `category` accepts
-SearXNG categories (`general`, `news`, `science`, `it`, `social media`,
-`videos`, `map`, comma-separated to combine). Video searches use SearXNG's
-YouTube engine or a Firecrawl `site:youtube.com` web search and discard
-non-YouTube URLs, because `fetch_page` can only read transcripts from YouTube
-video results.
-`enrich_results` controls how many top results get full page metadata (`0`
-skips enrichment). `page` is a 1-based result page; use `page=2` with the same
-query to get the next batch before reformulating. Firecrawl's v2 search API has
-no page-number parameter, so `page > 1` requires SearXNG; the fallback returns a
-tool error instead of silently repeating page 1.
+`search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None, enrich_results=None)`
+— Search with Brave's [LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context),
+which returns relevance-ranked excerpts extracted from source pages for direct
+model consumption. Excerpts may contain text, tables, code, or JSON-serialized
+structured data. Each result carries a URL, title, `snippets` list, optional
+published date, description, and site name. The top-level `provider` is
+`brave_llm_context`.
 
-Firecrawl maps the tool's established categories onto its v2 search systems as
-follows, following the current
-[Firecrawl Search API](https://docs.firecrawl.dev/api-reference/endpoint/search).
-Combined categories use the union of sources and filters. The fallback does not
-request page scraping, so it returns Firecrawl's default URL/title/description
-search records before this server applies its existing optional enrichment.
+`time_range` accepts `day`/`week`/`month`/`year`/`all` or an inclusive custom
+`YYYY-MM-DDtoYYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
+(`off`/`moderate`/`strict`), and `context_threshold_mode`
+(`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
+`num_results` controls the source-URL count and `max_tokens` controls the
+approximate total excerpt budget; both are clamped to configured server caps.
+`enrich_results` optionally fetches top sources directly to add heading anchors
+and a compact TOC (`0` skips this extra fetch).
 
-| Tool category | Firecrawl mapping |
-| --- | --- |
-| `general` | `sources: ["web"]` |
-| `news` | `sources: ["news"]` |
-| `science` | `sources: ["web"]`, `categories: ["research"]` |
-| `it`, `social media`, `map` | `sources: ["web"]` |
-| `videos` | `sources: ["web"]` plus `site:youtube.com` |
-
-The Firecrawl Map endpoint is a site-URL discovery API, not a geographic search
-backend, so the tool's `map` category intentionally stays on web search.
-Firecrawl has no documented equivalents for SearXNG's language or safe-search
-parameters. Recency maps to Firecrawl's `tbs` values (`qdr:d`, `qdr:w`,
-`qdr:m`, and `qdr:y`).
+Brave LLM Context does not expose result-page pagination or search categories.
+Put those constraints in the query instead—for example `site:youtube.com` for
+videos, which `fetch_page` can then read as transcripts. Brave supports operators
+such as `site:`, `filetype:`, `intitle:`, `inbody:`, `lang:`, `loc:`, quoted
+phrases, exclusion with `-`, and uppercase `AND`/`OR`/`NOT`; operators are
+experimental and overly restrictive combinations may return no results.
 
 `fetch_page(url, mode="text", section=None, query=None, max_matches=None, context_lines=None, include_match_toc=false, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
@@ -265,9 +249,8 @@ for the full list with defaults. Key things to set:
 - `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
 - `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
 - `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
-- `WEB_SEARCH_SEARXNG_ENABLED` / `WEB_SEARCH_SEARXNG_URL` — SearXNG is the primary search provider and the bundled service is enabled by default. Set `WEB_SEARCH_SEARXNG_ENABLED=false` and restart the server to stop all requests while an upstream limit resets; configured Firecrawl search then becomes the only provider. Concurrent SearXNG calls are queued and sent sequentially; `WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS` sets the quiet period between completed responses and the next request (default `1`, `0` disables queueing).
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional shared credential; enables Firecrawl search fallback and the existing fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge.
-- `WEB_SEARCH_FIRECRAWL_SEARCH_API_URL` — Firecrawl v2 search endpoint. Blank disables only search fallback, leaving Firecrawl scraping available to `fetch_page`.
+- `WEB_SEARCH_BRAVE_API_KEY` — required for `search_web`; create a Search API subscription token at [Brave Search API](https://api.search.brave.com/). `WEB_SEARCH_BRAVE_API_URL`, localization/filter defaults, search candidate count, token budgets, and timeout are separately configurable. Calls are serialized with a default one-second quiet period (`WEB_SEARCH_BRAVE_REQUEST_DELAY_SECONDS`) for low-throughput plans; HTTP 429/502/503/504 and transient transport failures receive bounded exponential retries configured by `WEB_SEARCH_BRAVE_MAX_RETRIES` / `WEB_SEARCH_BRAVE_RETRY_BACKOFF_SECONDS`, honoring Brave's reset headers.
+- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional `fetch_page` credential; enables the last-resort fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge. Firecrawl is not used by `search_web`.
 - `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
 - `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
 - `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
@@ -384,11 +367,10 @@ MCP_AUTH_TOKEN=<your-generated-token>
 
 ## Run with Docker Compose (recommended)
 
-The compose file builds the server and also starts the supporting services the
-web search tool expects — [SearXNG](https://docs.searxng.org/) (search),
+The compose file starts the server plus the local services used by `fetch_page`:
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (Cloudflare
-fallback), and [Apache Tika](https://tika.apache.org/) (document text
-extraction):
+fallback) and [Apache Tika](https://tika.apache.org/) (document text extraction).
+`search_web` uses Brave's hosted API and requires `WEB_SEARCH_BRAVE_API_KEY`:
 
 ```
 cp .env.example .env        # then edit it
@@ -397,16 +379,10 @@ docker compose up --build
 
 The MCP endpoint is then available at `http://localhost:8000/mcp`.
 
-If you don't need web search, delete the `searxng` / `flaresolverr` / `tika`
-services (and the `depends_on` block) from `docker-compose.yml`. The stock,
-Wolfram, geocoding, and email tools have no local-service dependencies, though
-they may need API keys, SMTP credentials, or internet access.
-
-> **SearXNG note:** JSON output must be enabled for SearXNG search to work — the
-> bundled [searxng/settings.yml](https://github.com/madelponte/mcp-server/blob/main/searxng/settings.yml)
-> does this. Set a real `SEARXNG_SECRET` in your `.env`. To pause SearXNG without
-> editing Compose, set `WEB_SEARCH_SEARXNG_ENABLED=false` and configure a
-> Firecrawl API key.
+If you don't need `fetch_page`, delete the `flaresolverr` / `tika` services (and
+the `depends_on` block) from `docker-compose.yml`. The stock, Wolfram,
+geocoding, and email tools have no local-service dependencies, though they may
+need API keys, SMTP credentials, or internet access.
 
 ## Run with Docker (server only)
 
