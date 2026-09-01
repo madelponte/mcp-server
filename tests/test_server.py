@@ -90,7 +90,9 @@ def test_search_web_documents_common_operators(server):
         "foo OR bar",
         "filetype:pdf",
         "intitle:word",
-        "inurl:word",
+        "inbody:word",
+        "lang:en",
+        "loc:us",
     )
     for example in examples:
         assert example in tool.description
@@ -103,11 +105,23 @@ def test_search_web_documents_common_operators(server):
         " OR ",
         "filetype:",
         "intitle:",
-        "inurl:",
+        "inbody:",
+        "lang:",
+        "loc:",
     ):
         assert operator in query_desc
-    assert "Firecrawl" in tool.description
+    assert "Brave LLM Context" in tool.description
     assert "provider" in tool.description
+    assert "does not support result-page pagination or search categories" in tool.description
+
+
+def test_search_web_schema_exposes_brave_caps(server):
+    import tools.web_search as ws
+
+    props = _tool_by_name(server, "search_web").to_mcp_tool().inputSchema["properties"]
+    assert str(ws.cfg.max_num_results) in props["num_results"]["description"]
+    assert str(ws.cfg.max_context_tokens) in props["max_tokens"]["description"]
+    assert str(ws.cfg.max_enrich_results) in props["enrich_results"]["description"]
 
 
 def _tool_by_name(server, name):
@@ -305,7 +319,7 @@ def test_lifespan_cleanup_hook_failure_does_not_block_shutdown():
     ("module_name", "pool_attr"),
     [
         ("web_fetch", "_fetch_clients"),
-        ("web_search", "_searxng_clients"),
+        ("web_search", "_brave_clients"),
         ("geocoding", "_http_clients"),
         ("wolfram_alpha", "_http_clients"),
     ],

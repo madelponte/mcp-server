@@ -55,13 +55,13 @@ def _reset_shared_clients():
 
     web_fetch._fetch_clients.clear()
     web_fetch._enrich_inflight.clear()
-    web_search._searxng_clients.clear()
+    web_search._brave_clients.clear()
     geocoding._http_clients.clear()
     wolfram_alpha._http_clients.clear()
     yield
     web_fetch._fetch_clients.clear()
     web_fetch._enrich_inflight.clear()
-    web_search._searxng_clients.clear()
+    web_search._brave_clients.clear()
     geocoding._http_clients.clear()
     wolfram_alpha._http_clients.clear()
 

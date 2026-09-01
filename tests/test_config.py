@@ -77,18 +77,47 @@ def test_zero_download_cap_is_still_valid(monkeypatch):
     assert WebSearchSettings().max_download_bytes == 0
 
 
-def test_searxng_request_delay_must_be_nonnegative(monkeypatch):
-    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "-0.1")
+def test_brave_search_count_stays_within_api_range(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_SEARCH_COUNT", "0")
     with pytest.raises(ValidationError):
         WebSearchSettings()
 
-    monkeypatch.setenv("WEB_SEARCH_SEARXNG_REQUEST_DELAY_SECONDS", "0")
-    assert WebSearchSettings().searxng_request_delay_seconds == 0
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_SEARCH_COUNT", "51")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
 
 
-def test_searxng_can_be_disabled_for_firecrawl_only_search(monkeypatch):
-    monkeypatch.setenv("WEB_SEARCH_SEARXNG_ENABLED", "false")
-    assert WebSearchSettings().searxng_enabled is False
+def test_brave_result_cap_stays_within_api_range(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_NUM_RESULTS", "51")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+
+def test_brave_context_token_cap_stays_within_api_range(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_CONTEXT_TOKENS", "1023")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_MAX_CONTEXT_TOKENS", "32768")
+    assert WebSearchSettings().max_context_tokens == 32768
+
+
+def test_brave_retry_and_spacing_settings_are_bounded(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_REQUEST_DELAY_SECONDS", "-0.1")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_REQUEST_DELAY_SECONDS", "0")
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_RETRY_BACKOFF_SECONDS", "0")
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_MAX_RETRIES", "5")
+    settings = WebSearchSettings()
+    assert settings.brave_request_delay_seconds == 0
+    assert settings.brave_retry_backoff_seconds == 0
+    assert settings.brave_max_retries == 5
+
+    monkeypatch.setenv("WEB_SEARCH_BRAVE_MAX_RETRIES", "6")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
 
 
 def test_reddit_request_delay_must_be_nonnegative(monkeypatch):
