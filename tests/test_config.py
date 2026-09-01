@@ -173,6 +173,23 @@ def test_port_must_be_a_valid_tcp_port(monkeypatch):
     assert ServerSettings().port == 8443
 
 
+def test_tool_catalog_cache_settings(monkeypatch):
+    monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_TTL_SECONDS", "0")
+    monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_SCOPE", "private")
+    settings = ServerSettings(_env_file=None)
+    assert settings.tool_catalog_cache_ttl_seconds == 0
+    assert settings.tool_catalog_cache_scope == "private"
+
+    monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_TTL_SECONDS", "-1")
+    with pytest.raises(ValidationError):
+        ServerSettings(_env_file=None)
+
+    monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_TTL_SECONDS", "300")
+    monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_SCOPE", "shared")
+    with pytest.raises(ValidationError):
+        ServerSettings(_env_file=None)
+
+
 def test_zero_context_caps_are_rejected(monkeypatch):
     """Caps that would silently disable a feature (max=0) are startup errors;
     the documented opt-outs live on fields where 0 means "off" (e.g. TTLs)."""

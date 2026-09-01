@@ -62,7 +62,7 @@ async def _run(name: str | None, as_json: bool) -> int:
 
     if as_json:
         # The exact payload FastMCP serializes into a tools/list response.
-        print(json.dumps(mcp_tool.model_dump(exclude_none=True), indent=2))
+        print(json.dumps(mcp_tool.model_dump(exclude_none=True, by_alias=True), indent=2))
         return 0
 
     # Readable view: the description block plus each argument's description.
@@ -72,8 +72,8 @@ async def _run(name: str | None, as_json: bool) -> int:
     print(mcp_tool.description or "(no description)")
     print()
     print("ARGUMENTS:")
-    props = (mcp_tool.inputSchema or {}).get("properties", {})
-    required = set((mcp_tool.inputSchema or {}).get("required", []))
+    props = (mcp_tool.input_schema or {}).get("properties", {})
+    required = set((mcp_tool.input_schema or {}).get("required", []))
     if not props:
         print("  (none)")
     for arg, spec in props.items():

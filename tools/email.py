@@ -27,6 +27,7 @@ from pydantic import Field
 
 from config import email_settings as cfg
 from .serialize import log_call, log_result, to_json
+from .tool_annotations import SIDE_EFFECTING_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=SIDE_EFFECTING_EXTERNAL_TOOL)
     async def send_email(
         recipients: Annotated[
             list[str],
