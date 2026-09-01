@@ -21,6 +21,7 @@ TOOL_FLAG_ATTRS = {
     "find_nearby_places": "find_nearby_places_enabled",
     "send_email": "send_email_enabled",
 }
+READ_ONLY_TOOLS = EXPECTED_TOOLS - {"send_email"}
 
 
 def _list_tools(server):
@@ -51,6 +52,37 @@ def test_every_tool_has_a_description(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
 
 
+def test_tool_safety_annotations_match_effects(server):
+    for tool in _list_tools(server):
+        annotations = tool.to_mcp_tool().annotations
+        assert annotations is not None
+        assert annotations.open_world_hint is True
+        assert annotations.destructive_hint is False
+        if tool.name in READ_ONLY_TOOLS:
+            assert annotations.read_only_hint is True
+            assert annotations.idempotent_hint is True
+        else:
+            assert tool.name == "send_email"
+            assert annotations.read_only_hint is False
+            assert annotations.idempotent_hint is False
+
+
+def test_tool_catalog_cache_hint_uses_server_settings(server):
+    import server as server_mod
+
+    hint = server._mcp_server.cache_hints["tools/list"]
+    assert hint.ttl_ms == server_mod.server_settings.tool_catalog_cache_ttl_seconds * 1000
+    assert hint.scope == server_mod.server_settings.tool_catalog_cache_scope
+
+
+def test_zero_tool_catalog_cache_ttl_disables_hint(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "tool_catalog_cache_ttl_seconds", 0)
+    built = server_mod.build_server()
+    assert "tools/list" not in built._mcp_server.cache_hints
+
+
 def test_fetch_page_description_explains_image_placeholders(server):
     desc = _tool_by_name(server, "fetch_page").description
     assert "[Image at this location: ...]" in desc
@@ -75,7 +107,7 @@ def test_fetch_page_schema_exposes_query_window_controls(server):
     import tools.fetch_page as fp
 
     tool = _tool_by_name(server, "fetch_page").to_mcp_tool()
-    props = tool.inputSchema["properties"]
+    props = tool.input_schema["properties"]
     assert str(fp.cfg.max_query_matches) in props["max_matches"]["description"]
     assert str(fp.cfg.max_query_context_lines) in props["context_lines"]["description"]
     assert "include_match_toc" in props
@@ -97,7 +129,7 @@ def test_search_web_documents_common_operators(server):
     for example in examples:
         assert example in tool.description
 
-    query_desc = tool.to_mcp_tool().inputSchema["properties"]["query"]["description"]
+    query_desc = tool.to_mcp_tool().input_schema["properties"]["query"]["description"]
     for operator in (
         "site:",
         '"exact phrase"',
@@ -114,14 +146,14 @@ def test_search_web_documents_common_operators(server):
     assert "provider" in tool.description
     assert "does not support result-page pagination or search categories" in tool.description
     assert "YYYY-MM-DD to YYYY-MM-DD" in tool.description
-    time_range_desc = tool.to_mcp_tool().inputSchema["properties"]["time_range"]["description"]
+    time_range_desc = tool.to_mcp_tool().input_schema["properties"]["time_range"]["description"]
     assert "YYYY-MM-DD to YYYY-MM-DD" in time_range_desc
 
 
 def test_search_web_schema_exposes_brave_caps(server):
     import tools.web_search as ws
 
-    props = _tool_by_name(server, "search_web").to_mcp_tool().inputSchema["properties"]
+    props = _tool_by_name(server, "search_web").to_mcp_tool().input_schema["properties"]
     assert str(ws.cfg.max_num_results) in props["num_results"]["description"]
     assert str(ws.cfg.max_context_tokens) in props["max_tokens"]["description"]
     assert str(ws.cfg.max_enrich_results) in props["enrich_results"]["description"]
@@ -170,7 +202,7 @@ def test_find_nearby_places_description_interpolates_caps(server):
     # The configured nearby-towns radius is rendered as a concrete number.
     assert str(geo.cfg.nearby_towns_radius_m) in tool.description
     assert "Every POI search also lists nearby towns" in tool.description
-    props = (tool.to_mcp_tool().inputSchema or {}).get("properties", {})
+    props = (tool.to_mcp_tool().input_schema or {}).get("properties", {})
     assert "include_nearby_towns" not in props
     assert "nearby_towns_limit" in props
 
@@ -178,7 +210,7 @@ def test_find_nearby_places_description_interpolates_caps(server):
 def test_get_company_data_schema_has_section_params(server):
     tool = next(t for t in _list_tools(server) if t.name == "get_company_data")
     mcp_tool = tool.to_mcp_tool()
-    props = (mcp_tool.inputSchema or {}).get("properties", {})
+    props = (mcp_tool.input_schema or {}).get("properties", {})
     for param in ("symbol", "sections", "statement", "period", "history_interval"):
         assert param in props
 

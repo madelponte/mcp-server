@@ -34,6 +34,7 @@ from pydantic import Field
 from config import stock_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -1715,7 +1716,7 @@ async def _fetch_company(
 # ===================================================================
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
     async def get_company_data(
         symbol: Annotated[
             str | list[str],

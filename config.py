@@ -13,6 +13,7 @@ silently changing runtime behavior.
 """
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -108,6 +109,23 @@ class ServerSettings(BaseSettings):
             "search_web pointing at fetch_page), so those cross-references read as "
             "'mcp_fetch_page' and match what the model actually sees. Set it to "
             "match your client's prefix, or blank if it adds none."
+        ),
+    )
+    tool_catalog_cache_ttl_seconds: int = Field(
+        300,
+        ge=0,
+        description=(
+            "Advertise that clients may reuse the static MCP component catalog for "
+            "this many seconds (0 disables the cache hint). This affects tools/list "
+            "and other cacheable component metadata, not tool-call results."
+        ),
+    )
+    tool_catalog_cache_scope: Literal["public", "private"] = Field(
+        "public",
+        description=(
+            "Scope for FastMCP's component-catalog cache hint. 'public' permits "
+            "sharing across authorization contexts; use 'private' if component "
+            "visibility ever varies by caller. Ignored when the TTL is 0."
         ),
     )
 

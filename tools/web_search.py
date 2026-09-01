@@ -28,6 +28,7 @@ from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, redact_secrets
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 from .web_fetch import _enrich_fetch, _is_tika_document
 from .web_extract import _structured_from_html
 
@@ -527,7 +528,10 @@ async def _enrich_result(url: str | None) -> dict | None:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool(description=_search_web_desc(server_settings.tool_prefix))
+    @mcp.tool(
+        description=_search_web_desc(server_settings.tool_prefix),
+        annotations=READ_ONLY_EXTERNAL_TOOL,
+    )
     async def search_web(
         query: str,
         time_range: str | None = None,

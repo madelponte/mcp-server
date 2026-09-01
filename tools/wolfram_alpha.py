@@ -21,6 +21,7 @@ from fastmcp.exceptions import ToolError
 from config import wolfram_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result, redact_secrets
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -182,7 +183,7 @@ def _structure_result(body: str, query: str) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
     async def query_wolfram_alpha(
         query: str,
         assumption: str | None = None,

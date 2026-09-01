@@ -40,6 +40,7 @@ from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
     DownloadTooLargeError,
@@ -1820,7 +1821,10 @@ async def _fetch_one(
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool(description=_fetch_page_desc(server_settings.tool_prefix))
+    @mcp.tool(
+        description=_fetch_page_desc(server_settings.tool_prefix),
+        annotations=READ_ONLY_EXTERNAL_TOOL,
+    )
     async def fetch_page(
         url: str,
         mode: str = "text",

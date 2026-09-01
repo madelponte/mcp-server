@@ -48,11 +48,16 @@ def build_server() -> FastMCP:
             "MCP_DEBUG enabled: pretty-printed JSON output and verbose tool logging are ON."
         )
 
-    # FastMCP v3's constructor no longer accepts host/port — they're supplied
+    # FastMCP's constructor no longer accepts host/port — they're supplied
     # per-transport at serve time (see run_http() below, which passes them to
     # uvicorn directly, and mcp.run() for stdio which needs neither).
+    catalog_ttl = server_settings.tool_catalog_cache_ttl_seconds
     mcp = FastMCP(
         "openwebui-tools",
+        cache_ttl=catalog_ttl or None,
+        cache_scope=(
+            server_settings.tool_catalog_cache_scope if catalog_ttl > 0 else None
+        ),
         instructions=(
             "Tools for web search & page fetching (fetch_page also returns YouTube "
             "video transcripts), stock market data, Wolfram Alpha computations, "
@@ -139,7 +144,7 @@ def run_http(mcp: FastMCP, transport: str) -> None:
     """
     import uvicorn
 
-    # FastMCP v3 unifies app construction under http_app(transport=...); the
+    # FastMCP unifies app construction under http_app(transport=...); the
     # 1.0 streamable_http_app()/sse_app() helpers are gone. The streamable-http
     # app still mounts at /mcp and the SSE app at /sse by default.
     if transport == "sse":
