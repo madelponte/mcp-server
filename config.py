@@ -119,32 +119,106 @@ class WebSearchSettings(BaseSettings):
         env_prefix="WEB_SEARCH_", env_file=ENV_FILE, extra="ignore"
     )
 
-    searxng_enabled: bool = Field(
-        True,
+    brave_api_url: str = Field(
+        "https://api.search.brave.com/res/v1/llm/context",
+        description="Brave LLM Context endpoint used by search_web.",
+    )
+    brave_api_key: str = Field(
+        "",
         description=(
-            "Use SearXNG as the primary search_web provider. Disable this "
-            "temporarily to let an upstream rate limit reset; Firecrawl search "
-            "is used instead when configured."
+            "Brave Search API subscription token. Required by search_web and "
+            "sent only in the X-Subscription-Token request header."
         ),
     )
-    searxng_url: str = Field(
-        "http://searxng:8080",
-        description="Base URL of your SearXNG instance (no trailing /search).",
+    brave_country: str = Field(
+        "US",
+        description="Default Brave result country (two-letter code).",
     )
-    searxng_request_delay_seconds: float = Field(
-        1.0, ge=0,
+    brave_search_lang: str = Field(
+        "en", description="Default Brave result-language code."
+    )
+    brave_freshness: str = Field(
+        "",
         description=(
-            "Delay between sequential SearXNG requests, measured from one "
-            "completed response to the next request start. 0 disables queueing."
+            "Default Brave freshness filter: blank/all, day/week/month/year "
+            "(or pd/pw/pm/py), or YYYY-MM-DDtoYYYY-MM-DD."
         ),
     )
+    brave_safesearch: str = Field(
+        "",
+        description=(
+            "Default Brave adult-content filter: off, moderate, strict, or "
+            "blank to let Brave apply its endpoint default."
+        ),
+    )
+    brave_context_threshold_mode: str = Field(
+        "",
+        description=(
+            "Default Brave relevance threshold: strict, balanced, lenient, "
+            "disabled, or blank for Brave's calibrated default."
+        ),
+    )
+    brave_search_count: int = Field(
+        20,
+        ge=1,
+        le=50,
+        description=(
+            "Number of search candidates Brave may consider before selecting "
+            "the smaller model-requested result set."
+        ),
+    )
+    max_context_tokens: int = Field(
+        8192,
+        ge=1024,
+        le=32768,
+        description=(
+            "Maximum approximate Brave excerpt-token budget the model may "
+            "request; omission uses this value."
+        ),
+    )
+    brave_max_tokens_per_url: int = Field(
+        4096,
+        ge=512,
+        le=8192,
+        description="Maximum Brave excerpt tokens retained from one source URL.",
+    )
+    brave_timeout_seconds: float = Field(
+        30.0, gt=0, description="Timeout for one Brave LLM Context request."
+    )
+    brave_request_delay_seconds: float = Field(
+        1.0,
+        ge=0,
+        description=(
+            "Quiet period between completed Brave search calls. Calls are "
+            "serialized when positive to respect one-request-per-second plans; "
+            "0 disables spacing for higher-throughput plans."
+        ),
+    )
+    brave_max_retries: int = Field(
+        2,
+        ge=0,
+        le=5,
+        description=(
+            "Maximum retries after Brave HTTP 429/502/503/504 or a transient "
+            "transport failure."
+        ),
+    )
+    brave_retry_backoff_seconds: float = Field(
+        1.0,
+        ge=0,
+        description="Initial Brave retry delay; later retries double it.",
+    )
+
     # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
     # the model request fewer results / less enrichment per call; anything above
     # these caps is clamped down so an oversized response (or a pile of
     # table-of-contents outlines) can't overwhelm the model's context window.
     # When the model doesn't specify, the cap is used (the prior behavior).
     max_num_results: int = Field(
-        5, ge=1, description="Maximum number of search results to return."
+        5,
+        ge=1,
+        le=50,
+        description="Maximum number of Brave source URLs to return.",
     )
     max_enrich_results: int = Field(
         5, ge=0,
@@ -160,11 +234,6 @@ class WebSearchSettings(BaseSettings):
             "(clamped to max_enrich_results; 0 disables enrichment by default)."
         ),
     )
-    searxng_categories: str = Field("general", description="Comma-separated SearXNG categories.")
-    searxng_language: str = Field("en", description="SearXNG language code (e.g. 'en', 'all').")
-    searxng_time_range: str = Field("", description="'', 'day', 'week', 'month', or 'year'.")
-    searxng_safesearch: int = Field(0, ge=0, le=2, description="0=off, 1=moderate, 2=strict.")
-
     flaresolverr_url: str = Field(
         "http://flaresolverr:8191",
         description="Base URL of the first-line HTML renderer. Blank uses direct HTML fetching.",
@@ -185,26 +254,18 @@ class WebSearchSettings(BaseSettings):
         "https://api.firecrawl.dev/v2/scrape",
         description="Firecrawl v2 scrape endpoint used as the last-resort page fallback.",
     )
-    firecrawl_search_api_url: str = Field(
-        "https://api.firecrawl.dev/v2/search",
-        description=(
-            "Firecrawl v2 search endpoint used when SearXNG fails or is disabled. "
-            "Blank disables Firecrawl search without disabling Firecrawl scraping."
-        ),
-    )
     firecrawl_api_key: str = Field(
         "",
         description=(
-            "Firecrawl API key. When set, search_web can fall back to Firecrawl "
-            "search and fetch_page uses Firecrawl after the FlareSolverr render "
-            "is blocked, unusable, or unresolved, including for known documents "
-            "blocked by an HTML challenge. Blank disables both fallbacks."
+            "Firecrawl API key used only by fetch_page after the FlareSolverr "
+            "render is blocked, unusable, or unresolved, including for known "
+            "documents blocked by an HTML challenge. Blank disables that fallback."
         ),
     )
     firecrawl_timeout_seconds: float = Field(
         60.0, gt=0,
         description=(
-            "Timeout for a Firecrawl search or scrape request, in seconds "
+            "Timeout for a Firecrawl fetch_page scrape request, in seconds "
             "(clamped to Firecrawl's supported 1-300 second range)."
         ),
     )
@@ -393,7 +454,6 @@ class WebSearchSettings(BaseSettings):
         ),
     )
     max_enrich_headings: int = Field(25, ge=1, description="Max headings per enriched result.")
-    max_snippet_chars: int = Field(400, ge=1, description="Max characters of each result snippet.")
 
     # `fetch_page`'s optional `query` does server-side extractive filtering:
     # it returns only the segments (paragraphs / transcript caption lines) that
