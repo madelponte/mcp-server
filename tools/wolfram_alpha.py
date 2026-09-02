@@ -21,6 +21,7 @@ from fastmcp.exceptions import ToolError
 from config import wolfram_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result, redact_secrets
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -182,7 +183,7 @@ def _structure_result(body: str, query: str) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
     async def query_wolfram_alpha(
         query: str,
         assumption: str | None = None,
@@ -198,15 +199,17 @@ def register(mcp: FastMCP) -> None:
         the SAME query with assumption=<value> from assumptions.alternatives.
         units="metric"(km, kg, °C) or "nonmetric"(miles, lb, °F) sets the unit
         system for the answer — set it to match what the question asks for.
-        NOT for opinions, news, code, or known facts.
+        DO use it for deterministic facts (constants, conversions, derivations, demographics).
+        DO NOT use it for news, opinions, or code.
+
+        Returns JSON {query, data:{section: value, ...}, assumptions?, url?}.
+        The answer is the first entry in data; assumptions appears only when
+        the query was ambiguous.
 
         :param query: Keyword query.
         :param assumption: Disambiguation value from a prior result's
             assumptions.alternatives (if any).
         :param units: "metric" or "nonmetric" (default: server config).
-        :return: JSON {query, data:{section: value, ...}, assumptions?, url?}.
-            The answer is the first entry in data; assumptions appears only when
-            the query was ambiguous.
         """
         log_call(
             log, "query_wolfram_alpha", query=query, assumption=assumption, units=units
