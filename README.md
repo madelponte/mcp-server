@@ -6,7 +6,7 @@ MCP-capable client (Claude Desktop, IDEs, custom agents, Open WebUI's MCP
 support, etc.). `fetch_page` doubles as a YouTube transcript fetcher, and the
 email tool is send-only.
 
-Built on [FastMCP v3](https://github.com/jlowin/fastmcp). The
+Built on [FastMCP v4](https://github.com/jlowin/fastmcp). The
 default transport is **streamable-http**, so the server is reachable over the
 network at `http://<host>:8000/mcp`.
 
@@ -45,7 +45,7 @@ published date, description, and site name. The top-level `provider` is
 `brave_llm_context`.
 
 `time_range` accepts `day`/`week`/`month`/`year`/`all` or an inclusive custom
-`YYYY-MM-DDtoYYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
+`YYYY-MM-DD to YYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
 (`off`/`moderate`/`strict`), and `context_threshold_mode`
 (`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
 `num_results` controls the source-URL count and `max_tokens` controls the
@@ -326,6 +326,16 @@ redacted fallback trace to `note`, showing whether OAuth JSON, RSS, old Reddit,
 and oEmbed were skipped, failed, or succeeded. Useful for troubleshooting; leave
 it off in normal operation so responses stay compact in the model's context
 window.
+
+### Tool-catalog caching
+
+FastMCP 4 advertises that opted-in modern clients may reuse the static MCP
+component catalog for `MCP_TOOL_CATALOG_CACHE_TTL_SECONDS` (default 300 seconds),
+reducing repeated `tools/list` round trips. Set it to `0` to disable the hint.
+`MCP_TOOL_CATALOG_CACHE_SCOPE` defaults to `public` because every authenticated
+caller currently sees the same tools; use `private` if visibility ever varies by
+caller. These settings do **not** cache tool-call results—the provider-specific
+TTL caches remain separate.
 
 ### Tool-name prefix in cross-references
 

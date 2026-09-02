@@ -34,6 +34,7 @@ from pydantic import Field
 from config import stock_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -1715,7 +1716,7 @@ async def _fetch_company(
 # ===================================================================
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
     async def get_company_data(
         symbol: Annotated[
             str | list[str],
@@ -1797,15 +1798,17 @@ def register(mcp: FastMCP) -> None:
         Crypto/FX/indices (BTC-USD, ^GSPC): quote/price_history/profile/news
         only (no fundamentals).
 
+        Returns JSON {symbol,sections,data:{...},resolved_from?,errors?} for one
+        symbol. For a list: {results:[<that object|{symbol,error}>,...],note?},
+        one entry per symbol in order. Check resolved_from when you passed a
+        name; errors lists sections that returned nothing.
+
         :param sections: Sections to fetch (default: quote,profile). Either an
             array (["quote","profile"]) or a comma-separated string
             ("quote,profile") works.
         :param statement: Financials statement type.
         :param period: Annual or quarterly.
         :param history_interval: Price-history bar size: 1d, 1wk, or 1mo.
-        :return: For one symbol: JSON {symbol,sections,data:{...},resolved_from?,
-            errors?}. For a list: JSON {results:[<that object|{symbol,error}>,...],
-            note?}, one entry per symbol in order.
         """
         log_call(
             log,

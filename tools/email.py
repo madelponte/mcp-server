@@ -27,6 +27,7 @@ from pydantic import Field
 
 from config import email_settings as cfg
 from .serialize import log_call, log_result, to_json
+from .tool_annotations import SIDE_EFFECTING_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool()
+    @mcp.tool(annotations=SIDE_EFFECTING_EXTERNAL_TOOL)
     async def send_email(
         recipients: Annotated[
             list[str],
@@ -276,11 +277,14 @@ def register(mcp: FastMCP) -> None:
         deliver content you have already produced. Supports CC, BCC, Reply-To,
         and local file attachments.
 
+        Returns JSON {status, subject, recipients:{to,cc,bcc},
+        attempted_recipients, accepted_recipients, refused_recipients,
+        invalid_recipients, dropped_recipients, attachments, dropped}.
+        status is "sent", "partial", or "failed".
+
         :param subject: The email subject line.
         :param body: The plain-text message body.
         :param reply_to: Optional Reply-To email address.
-        :return: JSON with status, intended/accepted/refused recipients,
-            invalid/dropped recipients, and attachment metadata.
         """
         log_call(
             log,

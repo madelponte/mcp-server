@@ -37,6 +37,7 @@ from pydantic import Field
 from config import geocoding_settings as cfg
 from .cache import TTLCache
 from .serialize import to_json, log_call, log_result, redact_secrets
+from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -960,7 +961,10 @@ def register(mcp: FastMCP) -> None:
         f"{_RETURN_SCHEMA}\n{_PLACE_RETURN_SCHEMA}"
     )
 
-    @mcp.tool(description=description)
+    @mcp.tool(
+        description=description,
+        annotations=READ_ONLY_EXTERNAL_TOOL,
+    )
     async def find_nearby_places(
         category: str = "",
         near: str | None = None,
