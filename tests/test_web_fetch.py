@@ -756,3 +756,87 @@ def test_httpx_fetch_revalidates_redirect_target(monkeypatch, patch_httpx):
                 "https://example.com/start", timeout=5, user_agent="t", verify_ssl=False
             )
         )
+
+
+def test_flaresolverr_discards_body_when_final_url_is_private(monkeypatch, patch_httpx):
+    """FlareSolverr follows redirects internally; a private final URL must not
+    be returned as page content even though the sidecar already fetched it."""
+    _clear_allowlist(monkeypatch)
+    payload = {
+        "status": "ok",
+        "solution": {
+            "url": "http://127.0.0.1/secret",
+            "status": 200,
+            "headers": {},
+            "response": "internal secret body",
+        },
+    }
+    patch_httpx(lambda request: httpx.Response(200, content=json.dumps(payload).encode()))
+    with pytest.raises(SSRFError):
+        run(
+            web_fetch._flaresolverr_fetch(
+                "https://example.com",
+                "http://flaresolverr:8191",
+                max_timeout_ms=1000,
+                http_timeout=5,
+            )
+        )
+
+
+def test_firecrawl_discards_body_when_metadata_url_is_private(monkeypatch, patch_httpx):
+    _clear_allowlist(monkeypatch)
+    payload = {
+        "success": True,
+        "data": {
+            "html": "<html><body>internal secret body</body></html>",
+            "metadata": {
+                "statusCode": 200,
+                "url": "http://169.254.169.254/latest/meta-data",
+                "sourceURL": "https://example.com/page",
+            },
+        },
+    }
+    patch_httpx(lambda request: httpx.Response(200, json=payload))
+    with pytest.raises(SSRFError):
+        run(
+            web_fetch._firecrawl_fetch(
+                "https://example.com/page",
+                api_url="https://api.firecrawl.dev/v2/scrape",
+                api_key="fc-test",
+                timeout_seconds=60,
+                max_bytes=10000,
+            )
+        )
+
+
+def test_assert_peer_allowed_blocks_private_connect(monkeypatch):
+    _clear_allowlist(monkeypatch)
+
+    class _Stream:
+        def get_extra_info(self, name):
+            assert name == "peername"
+            return ("169.254.169.254", 80)
+
+    class _Resp:
+        extensions = {"network_stream": _Stream()}
+
+    with pytest.raises(SSRFError, match="connected to non-public"):
+        web_fetch._assert_peer_allowed("https://example.com/page", _Resp())
+
+
+def test_assert_peer_allowed_skips_missing_peer(monkeypatch):
+    _clear_allowlist(monkeypatch)
+
+    class _Resp:
+        extensions = {}
+
+    web_fetch._assert_peer_allowed("https://example.com/page", _Resp())
+
+
+def test_capacity_limiter_reuses_until_total_changes():
+    first = web_fetch._capacity_limiter("direct", 2)
+    second = web_fetch._capacity_limiter("direct", 2)
+    assert first is second
+    third = web_fetch._capacity_limiter("direct", 3)
+    assert third is not first
+    assert third.total_tokens == 3

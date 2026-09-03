@@ -116,9 +116,18 @@ injection — so `fetch_page` resolves the target host and **refuses any non-pub
 address** (loopback, private, link-local, etc.), blocking access to `localhost`,
 cloud metadata endpoints like `169.254.169.254`, and LAN hosts. The check is
 applied to the initial URL *and* every redirect hop (a public URL can't `302`
-into an internal one) and gates the FlareSolverr path too. To deliberately allow
-a trusted local/private target you host, list its host, IP, or CIDR in
+into an internal one). Direct fetches also verify the connected peer IP so a DNS
+rebinding race cannot swap a public lookup for a private connect. FlareSolverr
+and Firecrawl follow redirects inside their own browsers — that request cannot
+be intercepted — but the provider-reported final URL is SSRF-checked and the
+body is discarded if it landed on a blocked host. To deliberately allow a
+trusted local/private target you host, list its host, IP, or CIDR in
 `WEB_SEARCH_SSRF_ALLOWLIST` (e.g. `localhost,127.0.0.1,10.0.0.0/8`).
+
+Concurrent `fetch_page` work is also bounded: `WEB_SEARCH_MAX_CONCURRENT_DIRECT_FETCHES`,
+`WEB_SEARCH_MAX_CONCURRENT_FLARESOLVERR`, `WEB_SEARCH_MAX_CONCURRENT_TIKA`, and
+`WEB_SEARCH_MAX_CONCURRENT_FIRECRAWL` cap in-flight sidecar/API calls so a model
+that fans out many reads cannot stampede FlareSolverr or Tika.
 
 ### Stock Data
 
@@ -262,7 +271,11 @@ for the full list with defaults. Key things to set:
 - `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
   `EMAIL_PASSWORD` must be a 16-character App Password, not the normal account
   password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,
-  recipient cap, and attachment limits are configurable.
+  and recipient/attachment caps are configurable. Set `EMAIL_ALLOWED_RECIPIENTS`
+  (addresses and/or domains) on any network-exposed server. Attachments stay off
+  until `EMAIL_ATTACHMENT_ROOT` points at a directory the tool may read.
+- `WEB_SEARCH_MAX_CONCURRENT_*` — in-flight caps for direct fetches, FlareSolverr,
+  Tika, and Firecrawl (defaults 8 / 2 / 2 / 2).
 
 Provider variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`,
 `STOCK_`, `WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`. Tool availability uses the
@@ -308,8 +321,13 @@ the [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875
 sends a plain-text email through the configured SMTP account. It is send-only:
 it cannot read, list, or delete mailbox contents. `recipients`, `cc`, and `bcc`
 are lists of email addresses; BCC recipients are included in the SMTP envelope
-but not written into message headers. `attachments` is an optional list of local
-file paths, capped by `EMAIL_MAX_ATTACHMENTS` and `EMAIL_MAX_ATTACHMENT_BYTES`.
+but not written into message headers. Set `EMAIL_ALLOWED_RECIPIENTS` to a list of
+addresses and/or domains so a prompt-injected model cannot mail arbitrary people;
+when that list is set, To/Cc/Bcc/Reply-To outside it are rejected. Attachments
+are disabled unless `EMAIL_ATTACHMENT_ROOT` is set; paths must stay inside that
+directory (symlink escapes are rejected), and the result reports only the
+filename, not the resolved filesystem path. Counts are still capped by
+`EMAIL_MAX_ATTACHMENTS` and `EMAIL_MAX_ATTACHMENT_BYTES`.
 
 The result reports `status` (`sent` or `partial`), intended recipients by field,
 attempted recipients, accepted recipients, refused recipients with SMTP codes and
@@ -352,11 +370,12 @@ separator (e.g. the `_`).
 
 ### Authentication
 
-Set `MCP_AUTH_TOKEN` to require a bearer token on every HTTP request. Clients
-must then send an `Authorization: Bearer <token>` header; anything else gets a
-`401`. Leaving it blank disables auth and leaves the server open to anyone who
-can reach it (the server logs a warning at startup in that case). The token is
-ignored for the `stdio` transport, which has no network surface.
+HTTP transports **require** `MCP_AUTH_TOKEN`. Clients must send an
+`Authorization: Bearer <token>` header; anything else gets a `401`. Starting
+streamable-http or SSE without a token is a startup error. Set
+`MCP_ALLOW_UNAUTHENTICATED=true` only for a tightly firewalled local setup (the
+server logs a warning in that case). The token is ignored for the `stdio`
+transport, which has no network surface.
 
 Generate a strong token, e.g.:
 
@@ -380,7 +399,10 @@ MCP_AUTH_TOKEN=<your-generated-token>
 The compose file starts the server plus the local services used by `fetch_page`:
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (Cloudflare
 fallback) and [Apache Tika](https://tika.apache.org/) (document text extraction).
-`search_web` uses Brave's hosted API and requires `WEB_SEARCH_BRAVE_API_KEY`:
+Sidecar images are digest-pinned (Tika 4.0.0 minimal, FlareSolverr v3.5.0);
+bump the digest when you intentionally upgrade. `search_web` uses Brave's hosted
+API and requires `WEB_SEARCH_BRAVE_API_KEY`. HTTP mode also requires
+`MCP_AUTH_TOKEN` in `.env`:
 
 ```
 cp .env.example .env        # then edit it

@@ -362,6 +362,35 @@ def test_lifespan_cleanup_hook_failure_does_not_block_shutdown():
     assert delivered == ["lifespan.shutdown"]
 
 
+def test_http_auth_fails_closed_without_token(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
+    monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", False)
+    with pytest.raises(SystemExit, match="MCP_AUTH_TOKEN"):
+        server_mod.configure_http_auth(object())
+
+
+def test_http_auth_allows_explicit_unauthenticated(monkeypatch):
+    import server as server_mod
+
+    sentinel = object()
+    monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
+    monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", True)
+    assert server_mod.configure_http_auth(sentinel) is sentinel
+
+
+def test_http_auth_wraps_app_when_token_set(monkeypatch):
+    import server as server_mod
+    from auth import BearerAuthMiddleware
+
+    sentinel = object()
+    monkeypatch.setattr(server_mod.server_settings, "auth_token", "s3cret")
+    wrapped = server_mod.configure_http_auth(sentinel)
+    assert isinstance(wrapped, BearerAuthMiddleware)
+    assert wrapped.app is sentinel
+
+
 @pytest.mark.parametrize(
     ("module_name", "pool_attr"),
     [
