@@ -136,6 +136,30 @@ class _LifespanCleanup:
         await self.app(scope, receiving, send)
 
 
+def configure_http_auth(app: ASGIApp) -> ASGIApp:
+    """Install bearer auth, or refuse to start an unauthenticated HTTP server.
+
+    HTTP transports are fail-closed: a blank ``MCP_AUTH_TOKEN`` is a startup
+    error unless ``MCP_ALLOW_UNAUTHENTICATED`` is explicitly true. stdio never
+    uses this helper.
+    """
+    token = (server_settings.auth_token or "").strip()
+    if token:
+        log.info("Bearer token authentication is ENABLED.")
+        return BearerAuthMiddleware(app, token)
+    if server_settings.allow_unauthenticated:
+        log.warning(
+            "MCP_AUTH_TOKEN is not set and MCP_ALLOW_UNAUTHENTICATED is true — "
+            "the server is UNAUTHENTICATED and open to anyone who can reach it."
+        )
+        return app
+    raise SystemExit(
+        "MCP_AUTH_TOKEN is not set. HTTP transports require a bearer token. "
+        "Set MCP_AUTH_TOKEN in .env (e.g. openssl rand -hex 32), or set "
+        "MCP_ALLOW_UNAUTHENTICATED=true for a tightly firewalled local setup."
+    )
+
+
 def run_http(mcp: FastMCP, transport: str) -> None:
     """Serve an HTTP transport, optionally gated by a bearer token.
 
@@ -165,16 +189,7 @@ def run_http(mcp: FastMCP, transport: str) -> None:
         ),
     )
 
-    token = server_settings.auth_token
-    if token:
-        app = BearerAuthMiddleware(app, token)
-        log.info("Bearer token authentication is ENABLED.")
-    else:
-        log.warning(
-            "MCP_AUTH_TOKEN is not set — the server is UNAUTHENTICATED and open "
-            "to anyone who can reach it. Set MCP_AUTH_TOKEN in your .env to "
-            "require a bearer token."
-        )
+    app = configure_http_auth(app)
 
     uvicorn.run(
         app,
