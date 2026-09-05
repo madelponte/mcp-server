@@ -526,4 +526,8 @@ async def acquire_page(url: str) -> dict:
                 done.exception()
 
         task.add_done_callback(completed)
-    return await asyncio.shield(task)
+    # wait() does not propagate waiter cancellation to the shared task. Unlike
+    # shield() on Python 3.14, it does not independently log a later failure
+    # after a waiter leaves; the completion callback above owns that cleanup.
+    await asyncio.wait({task})
+    return task.result()
