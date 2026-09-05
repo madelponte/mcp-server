@@ -1,4 +1,4 @@
-"""Tests for Brave-backed tools/web_search.py and optional enrichment."""
+"""Tests for Brave-backed tools/web_search.py."""
 
 import json
 
@@ -11,7 +11,6 @@ from tools.web_search import (
     _BraveRequestQueue,
     _brave_query,
     _clamp_count,
-    _enrich_result,
     _resolve_country,
     _resolve_optional_choice,
     _resolve_search_lang,
@@ -40,7 +39,6 @@ def _pin_brave_defaults(monkeypatch):
 
 
 def test_clamp_count_uses_default_or_max_and_clamps():
-    assert _clamp_count(None, 5, minimum=0, default=3) == 3
     assert _clamp_count(None, 5, minimum=1) == 5
     assert _clamp_count(2, 5, minimum=1) == 2
     assert _clamp_count(100, 5, minimum=1) == 5
@@ -347,6 +345,43 @@ def test_brave_query_retries_429_using_exhausted_rate_window_reset(
     assert out[0]["url"] == "https://a.example/page"
 
 
+def test_brave_query_does_not_retry_exhausted_monthly_and_burst_quotas(
+    monkeypatch, patch_httpx
+):
+    calls = []
+
+    async def no_sleep(seconds):
+        pytest.fail("Monthly quota exhaustion must not retry")
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            429,
+            headers={
+                "X-RateLimit-Remaining": "0, 0",
+                "X-RateLimit-Reset": "1, 2592000",
+            },
+            json={"error": {"detail": "quota exhausted"}},
+        )
+
+    monkeypatch.setattr(ws.anyio, "sleep", no_sleep)
+    patch_httpx(handler)
+    with pytest.raises(RuntimeError, match="quota exhausted"):
+        run(_brave_query(**_query_kwargs(max_retries=2)))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("remaining", "resets", "expected"),
+    [("0, 0", "1, 5", 5), ("0, 10", "1, 500", 1), (None, "1, 500", 1)],
+)
+def test_retry_reset_selection(remaining, resets, expected):
+    headers = {"X-RateLimit-Reset": resets}
+    if remaining is not None:
+        headers["X-RateLimit-Remaining"] = remaining
+    assert ws._retry_after_seconds(httpx.Response(429, headers=headers)) == expected
+
+
 def test_brave_query_honors_retry_after_and_exponential_backoff(
     monkeypatch, patch_httpx
 ):
@@ -480,45 +515,6 @@ def test_brave_query_reuses_client_within_event_loop(monkeypatch):
     assert created == 1
 
 
-# --------------------------- enrichment ---------------------------
-
-
-def test_enrich_result_none_url():
-    assert run(_enrich_result(None)) is None
-
-
-def test_enrich_result_html(monkeypatch):
-    async def fake_fetch(url):
-        return {
-            "content_type": "text/html",
-            "text": "<title>My Page</title><meta name=description content='D'><h1>H</h1>",
-        }
-
-    monkeypatch.setattr(ws, "_enrich_fetch", fake_fetch)
-    out = run(_enrich_result("https://e.com"))
-    assert out["title"] == "My Page"
-    assert out["description"] == "D"
-
-
-def test_enrich_result_document_and_failures(monkeypatch):
-    async def document(url):
-        return {"content_type": "application/pdf", "text": None}
-
-    monkeypatch.setattr(ws, "_enrich_fetch", document)
-    assert run(_enrich_result("https://e.com/file.pdf")) == {
-        "title": None,
-        "description": None,
-        "headings": [],
-        "toc": None,
-    }
-
-    async def failure(url):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(ws, "_enrich_fetch", failure)
-    assert "error" in run(_enrich_result("https://e.com"))
-
-
 # --------------------------- search_web tool ---------------------------
 
 
@@ -569,7 +565,6 @@ def test_search_web_happy_path_maps_options_and_caps(monkeypatch, tool_fns):
                 context_threshold_mode="balanced",
                 num_results=999,
                 max_tokens=999999,
-                enrich_results=0,
             )
         )
     )
@@ -601,7 +596,6 @@ def test_search_web_accepts_spaced_date_range(monkeypatch, tool_fns):
             tool_fns["search_web"](
                 query="test",
                 time_range="2024-01-01 to 2024-02-29",
-                enrich_results=0,
             )
         )
     )
@@ -609,41 +603,23 @@ def test_search_web_accepts_spaced_date_range(monkeypatch, tool_fns):
     assert seen["freshness"] == "2024-01-01to2024-02-29"
 
 
-def test_search_web_enriches_top_results(monkeypatch, tool_fns):
-    monkeypatch.setattr(ws.cfg, "max_enrich_results", 5)
+def test_search_web_only_calls_brave_and_returns_provider_metadata(
+    monkeypatch, patch_httpx, tool_fns
+):
+    monkeypatch.setattr(ws.cfg, "brave_request_delay_seconds", 0)
+    calls = []
 
-    async def fake_query(**kwargs):
-        return [{"url": "https://a.com", "title": "A", "snippets": ["s"]}]
+    def handler(request):
+        calls.append(str(request.url))
+        assert str(request.url) == ws.cfg.brave_api_url
+        return httpx.Response(200, json=_brave_response())
 
-    async def fake_enrich(url):
-        return {
-            "title": "Enriched",
-            "description": "desc",
-            "headings": [{"level": 1, "text": "H"}],
-            "toc": "toc",
-        }
-
-    monkeypatch.setattr(ws, "_brave_query", fake_query)
-    monkeypatch.setattr(ws, "_enrich_result", fake_enrich)
-    out = json.loads(run(tool_fns["search_web"](query="test", enrich_results=1)))
-    result = out["results"][0]
-    assert result["page_title"] == "Enriched"
-    assert result["page_description"] == "desc"
-    assert result["page_headings"][0]["text"] == "H"
-    assert result["page_toc"] == "toc"
-
-
-def test_search_web_enrich_error_surfaces_as_page_meta_error(monkeypatch, tool_fns):
-    async def fake_query(**kwargs):
-        return [{"url": "https://a.com", "title": "A", "snippets": ["s"]}]
-
-    async def fake_enrich(url):
-        return {"error": "boom"}
-
-    monkeypatch.setattr(ws, "_brave_query", fake_query)
-    monkeypatch.setattr(ws, "_enrich_result", fake_enrich)
-    out = json.loads(run(tool_fns["search_web"](query="test", enrich_results=1)))
-    assert out["results"][0]["page_meta_error"] == "boom"
+    patch_httpx(handler)
+    out = json.loads(run(tool_fns["search_web"](query="test")))
+    assert calls == [ws.cfg.brave_api_url]
+    assert out["results"][0]["description"] == "Page description"
+    assert out["results"][0]["site_name"] == "Example A"
+    assert not any(key.startswith("page_") for result in out["results"] for key in result)
 
 
 def test_search_web_valid_empty_result_is_not_error(monkeypatch, tool_fns):

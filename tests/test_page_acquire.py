@@ -40,6 +40,90 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(pa, "_assert_url_allowed", allowed)
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_cancelled_waiter_does_not_evict_shared_acquisition(monkeypatch, fails):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        url = "https://example.com/shared"
+        artifact = _artifact("content")
+
+        async def acquire(url):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            if fails:
+                raise RuntimeError("provider failed")
+            return artifact
+
+        monkeypatch.setattr(pa, "_acquire_page", acquire)
+        first = asyncio.create_task(pa.acquire_page(url))
+        await started.wait()
+        underlying = pa._acquire_inflight[url]
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert pa._acquire_inflight[url] is underlying
+        assert not underlying.cancelled()
+
+        second = asyncio.create_task(pa.acquire_page(url))
+        third = asyncio.create_task(pa.acquire_page(url))
+        await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(second, third, return_exceptions=True)
+        assert calls == 1
+        if fails:
+            assert all(isinstance(result, RuntimeError) for result in results)
+            assert all(str(result) == "provider failed" for result in results)
+        else:
+            assert all(result is artifact for result in results)
+        assert url not in pa._acquire_inflight
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("cancel_underlying", [False, True])
+def test_abandoned_acquisition_cleans_up_and_retrieves_failure(monkeypatch, cancel_underlying):
+    async def scenario():
+        import gc
+
+        loop = asyncio.get_running_loop()
+        errors = []
+        loop.set_exception_handler(lambda loop, context: errors.append(context))
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished = asyncio.Event()
+        url = "https://example.com/abandoned"
+
+        async def acquire(url):
+            started.set()
+            await release.wait()
+            raise RuntimeError("abandoned provider failure")
+
+        monkeypatch.setattr(pa, "_acquire_page", acquire)
+        waiter = asyncio.create_task(pa.acquire_page(url))
+        await started.wait()
+        underlying = pa._acquire_inflight[url]
+        underlying.add_done_callback(lambda task: finished.set())
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        if cancel_underlying:
+            underlying.cancel()
+        else:
+            release.set()
+        await finished.wait()
+        assert url not in pa._acquire_inflight
+        del underlying, waiter
+        gc.collect()
+        await asyncio.sleep(0)
+        assert errors == []
+
+    run(scenario())
+
+
 def test_json_stays_on_direct_path(monkeypatch):
     calls = []
 

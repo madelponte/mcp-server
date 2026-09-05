@@ -236,30 +236,12 @@ class WebSearchSettings(BaseSettings):
         description="Initial Brave retry delay; later retries double it.",
     )
 
-    # Both of the following are MAXIMUMS, not fixed amounts. `search_web` lets
-    # the model request fewer results / less enrichment per call; anything above
-    # these caps is clamped down so an oversized response (or a pile of
-    # table-of-contents outlines) can't overwhelm the model's context window.
-    # When the model doesn't specify, the cap is used (the prior behavior).
+    # A maximum, not a fixed amount: search_web can request fewer source URLs.
     max_num_results: int = Field(
         5,
         ge=1,
         le=50,
         description="Maximum number of Brave source URLs to return.",
-    )
-    max_enrich_results: int = Field(
-        5, ge=0,
-        description=(
-            "Maximum number of top results to fetch structured metadata "
-            "(description + table-of-contents outline) for (0 disables)."
-        ),
-    )
-    default_enrich_results: int = Field(
-        3, ge=0,
-        description=(
-            "Number of top results to enrich when the model doesn't specify "
-            "(clamped to max_enrich_results; 0 disables enrichment by default)."
-        ),
     )
     flaresolverr_url: str = Field(
         "http://flaresolverr:8191",
@@ -352,8 +334,8 @@ class WebSearchSettings(BaseSettings):
     max_concurrent_direct_fetches: int = Field(
         8, ge=1,
         description=(
-            "Maximum in-flight direct httpx fetches (fetch_page probes and "
-            "search_web enrichment). Bounds a model that fans out many reads."
+            "Maximum in-flight direct httpx fetches for fetch_page. "
+            "Bounds a model that fans out many reads."
         ),
     )
     max_concurrent_flaresolverr: int = Field(
@@ -402,18 +384,6 @@ class WebSearchSettings(BaseSettings):
             "reasonable document — an image-heavy/scanned PDF, which Tika still "
             "reduces to plain text — while protecting the single-process server "
             "from a multi-GB body exhausting memory."
-        ),
-    )
-    enrich_max_bytes: int = Field(
-        3145728, ge=0,  # 3 MiB
-        description=(
-            "Maximum bytes search_web downloads per result when enriching it with "
-            "page metadata (title/description/headings). Enrichment only needs the "
-            "document head, so this is far smaller than max_download_bytes: a result "
-            "whose page exceeds it is left un-enriched rather than pulled in full, "
-            "and — unlike a fetch_page read — enrichment skips the FlareSolverr/"
-            "Firecrawl fallbacks, so a single bot-walled hit can't slow the whole "
-            "search. 0 = unbounded."
         ),
     )
     verify_ssl: bool = Field(True, description="Verify TLS certificates.")
@@ -500,7 +470,10 @@ class WebSearchSettings(BaseSettings):
             "(0 disables image descriptions)."
         ),
     )
-    max_enrich_headings: int = Field(25, ge=1, description="Max headings per enriched result.")
+    # Keep the historical env name for existing fetch_page configurations.
+    max_enrich_headings: int = Field(
+        25, ge=1, description="Max headings in fetch_page structured/section responses."
+    )
 
     # `fetch_page`'s optional `query` does server-side extractive filtering:
     # it returns only the segments (paragraphs / transcript caption lines) that
