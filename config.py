@@ -94,9 +94,18 @@ class ServerSettings(BaseSettings):
         "",
         description=(
             "Shared bearer token required on every HTTP request "
-            "(Authorization: Bearer <token>). Blank disables auth — the server "
-            "is then open to anyone who can reach it. Ignored for the 'stdio' "
-            "transport, which has no network surface."
+            "(Authorization: Bearer <token>). HTTP transports refuse to start "
+            "when this is blank unless allow_unauthenticated is true. Ignored "
+            "for the 'stdio' transport, which has no network surface."
+        ),
+    )
+    allow_unauthenticated: bool = Field(
+        False,
+        description=(
+            "Permit HTTP transports to start without MCP_AUTH_TOKEN. Default "
+            "false: streamable-http and sse refuse to start if the token is "
+            "blank. Set true only for a tightly firewalled local setup. stdio "
+            "is never authenticated."
         ),
     )
     tool_prefix: str = Field(
@@ -338,6 +347,26 @@ class WebSearchSettings(BaseSettings):
     )
     circuit_breaker_ttl_seconds: int = Field(
         300, ge=0, description="How long an opened host circuit bypasses FlareSolverr."
+    )
+
+    max_concurrent_direct_fetches: int = Field(
+        8, ge=1,
+        description=(
+            "Maximum in-flight direct httpx fetches (fetch_page probes and "
+            "search_web enrichment). Bounds a model that fans out many reads."
+        ),
+    )
+    max_concurrent_flaresolverr: int = Field(
+        2, ge=1,
+        description="Maximum in-flight FlareSolverr renders."
+    )
+    max_concurrent_tika: int = Field(
+        2, ge=1,
+        description="Maximum in-flight Apache Tika extractions."
+    )
+    max_concurrent_firecrawl: int = Field(
+        2, ge=1,
+        description="Maximum in-flight Firecrawl scrapes."
     )
 
     tika_url: str = Field(
@@ -861,6 +890,25 @@ class EmailSettings(BaseSettings):
         description=(
             "Maximum size in bytes for each individual email attachment "
             "(default 10 MiB)."
+        ),
+    )
+    allowed_recipients: str = Field(
+        "",
+        description=(
+            "Comma/space-separated allowlist of recipient addresses and/or "
+            "domains (e.g. 'you@example.com, example.com, @corp.com'). When "
+            "set, To/Cc/Bcc/Reply-To outside the list are rejected. Blank "
+            "allows any address — set this on any network-exposed server."
+        ),
+    )
+    attachment_root: str = Field(
+        "",
+        description=(
+            "Directory the send_email tool may read attachments from. Blank "
+            "disables attachments entirely so a prompt-injected model cannot "
+            "exfiltrate local files. Relative attachment paths are resolved "
+            "inside this directory; absolute paths must stay within it, and "
+            "symlink escapes are rejected."
         ),
     )
 

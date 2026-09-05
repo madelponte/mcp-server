@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 import config
-from config import GeocodingSettings, ServerSettings, ToolSettings, WebSearchSettings
+from config import EmailSettings, GeocodingSettings, ServerSettings, ToolSettings, WebSearchSettings
 
 
 def test_env_file_is_anchored_next_to_config_module():
@@ -188,6 +188,30 @@ def test_tool_catalog_cache_settings(monkeypatch):
     monkeypatch.setenv("MCP_TOOL_CATALOG_CACHE_SCOPE", "shared")
     with pytest.raises(ValidationError):
         ServerSettings(_env_file=None)
+
+
+def test_allow_unauthenticated_defaults_to_false(monkeypatch):
+    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED", raising=False)
+    assert ServerSettings(_env_file=None).allow_unauthenticated is False
+
+
+def test_concurrent_fetch_caps_reject_zero(monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_MAX_CONCURRENT_FLARESOLVERR", "0")
+    with pytest.raises(ValidationError):
+        WebSearchSettings()
+    monkeypatch.setenv("WEB_SEARCH_MAX_CONCURRENT_FLARESOLVERR", "2")
+    monkeypatch.setenv("WEB_SEARCH_MAX_CONCURRENT_TIKA", "1")
+    settings = WebSearchSettings()
+    assert settings.max_concurrent_flaresolverr == 2
+    assert settings.max_concurrent_tika == 1
+
+
+def test_email_allowlist_and_attachment_root_default_empty(monkeypatch):
+    monkeypatch.delenv("EMAIL_ALLOWED_RECIPIENTS", raising=False)
+    monkeypatch.delenv("EMAIL_ATTACHMENT_ROOT", raising=False)
+    settings = EmailSettings(_env_file=None)
+    assert settings.allowed_recipients == ""
+    assert settings.attachment_root == ""
 
 
 def test_zero_context_caps_are_rejected(monkeypatch):
