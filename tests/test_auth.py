@@ -38,6 +38,23 @@ def test_empty_token_rejected_at_construction():
         BearerAuthMiddleware(_dummy_app, "")
 
 
+@pytest.mark.parametrize("token", ["caf\u00e9", "secret\u2603"])
+def test_non_ascii_configured_token_rejected(token):
+    with pytest.raises(ValueError, match="ASCII"):
+        BearerAuthMiddleware(_dummy_app, token)
+
+
+@pytest.mark.parametrize("value", [b"Bearer \xff", b"Bearer \xc3\xa9", b"Bearer \xa0" + TOKEN.encode()])
+def test_non_ascii_header_returns_401(value, caplog):
+    mw = BearerAuthMiddleware(_dummy_app, TOKEN)
+    events, send, receive = _collect_sends()
+    with caplog.at_level(logging.WARNING, logger="auth"):
+        run(mw(_http_scope([(b"authorization", value)]), receive, send))
+    assert events[0]["status"] == 401
+    assert events[1]["body"] == b'{"error": "unauthorized"}'
+    assert "Rejected unauthorized MCP request" in caplog.text
+
+
 def test_non_http_scope_passes_through():
     mw = BearerAuthMiddleware(_dummy_app, TOKEN)
     events, send, receive = _collect_sends()

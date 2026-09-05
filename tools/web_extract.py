@@ -1,12 +1,10 @@
 """
-HTML → content extraction helpers, shared by the web-search and fetch-page tools.
+HTML → content extraction helpers for fetch_page.
 
 Pure, side-effect-free functions that turn a fetched HTML document into the
 shapes the tools return: a markdown/plain-text rendering, a structured metadata
 summary (title, description, heading outline, JSON-LD), or a single named
-section. `search_web` uses `_structured_from_html` to enrich its results;
-`fetch_page` uses the whole set. Kept free of any config or network dependency so
-both tools can import it without coupling.
+section. Kept free of any config or network dependency.
 """
 
 import json
@@ -21,9 +19,8 @@ from markdownify import MarkdownConverter
 # ---------------------------------------------------------------------------
 # Text truncation
 #
-# Both tools cap how much text they return to protect the model's context
-# window — `search_web` on each result snippet, `fetch_page` on page content
-# (where `_trim_flagged`'s `truncated` flag also drives the offset-paging hint).
+# fetch_page caps returned content to protect the model's context window.
+# `_trim_flagged`'s `truncated` flag also drives the offset-paging hint.
 # ---------------------------------------------------------------------------
 
 def _trim_flagged(text: str, limit: int) -> tuple[str, bool]:

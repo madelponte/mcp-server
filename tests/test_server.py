@@ -98,9 +98,9 @@ def test_fetch_page_description_explains_citation_anchors(server):
     assert "generated `cite-*` anchors" in desc
     assert "citation_url" in desc
 
-    search_desc = _tool_by_name(server, "search_web").description
-    assert "stable anchors" in search_desc
-    assert "citation_url" in search_desc
+    assert 'mode="structured"' in desc
+    assert "enrich_results" not in desc
+    assert "page_headings/page_toc" not in desc
 
 
 def test_fetch_page_schema_exposes_query_window_controls(server):
@@ -156,7 +156,11 @@ def test_search_web_schema_exposes_brave_caps(server):
     props = _tool_by_name(server, "search_web").to_mcp_tool().input_schema["properties"]
     assert str(ws.cfg.max_num_results) in props["num_results"]["description"]
     assert str(ws.cfg.max_context_tokens) in props["max_tokens"]["description"]
-    assert str(ws.cfg.max_enrich_results) in props["enrich_results"]["description"]
+    assert "enrich_results" not in props
+    description = _tool_by_name(server, "search_web").description
+    assert 'mode="structured"' in description
+    assert "page_headings" not in description
+    assert "page_toc" not in description
 
 
 def _tool_by_name(server, name):

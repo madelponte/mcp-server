@@ -36,7 +36,7 @@ overwhelm a model's context window. Omitting a value uses the cap.
 
 ### Agentic Web Search
 
-`search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None, enrich_results=None)`
+`search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None)`
 — Search with Brave's [LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context),
 which returns relevance-ranked excerpts extracted from source pages for direct
 model consumption. Excerpts may contain text, tables, code, or JSON-serialized
@@ -50,8 +50,15 @@ published date, description, and site name. The top-level `provider` is
 (`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
 `num_results` controls the source-URL count and `max_tokens` controls the
 approximate total excerpt budget; both are clamped to configured server caps.
-`enrich_results` optionally fetches top sources directly to add heading anchors
-and a compact TOC (`0` skips this extra fetch).
+Search uses only Brave's excerpts and metadata; it does not fetch source pages.
+Call `fetch_page(url, mode="structured")` when you need a page outline, then use
+`section=` to read a specific section.
+
+Migration note: `enrich_results` and the settings `WEB_SEARCH_MAX_ENRICH_RESULTS`,
+`WEB_SEARCH_DEFAULT_ENRICH_RESULTS`, and `WEB_SEARCH_ENRICH_MAX_BYTES` have been
+removed. Delete these obsolete settings from existing `.env` files.
+`WEB_SEARCH_MAX_ENRICH_HEADINGS` remains as the historical name for fetch_page's
+heading cap; it does not enable search enrichment.
 
 Brave LLM Context does not expose result-page pagination or search categories.
 Put those constraints in the query instead—for example `site:youtube.com` for

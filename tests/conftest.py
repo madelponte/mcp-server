@@ -41,7 +41,7 @@ def make_mock_async_client_cls(handler):
 
 @pytest.fixture(autouse=True)
 def _reset_shared_clients():
-    """Drop shared async clients and in-flight fetch maps between tests.
+    """Drop shared async clients and capacity limiters between tests.
 
     `web_fetch` reuses one `httpx.AsyncClient` per `verify` setting for keep-alive.
     Tests build that client lazily under a patched `httpx.AsyncClient` (a fresh
@@ -54,7 +54,6 @@ def _reset_shared_clients():
     from tools import wolfram_alpha
 
     web_fetch._fetch_clients.clear()
-    web_fetch._enrich_inflight.clear()
     web_fetch._capacity_limiters.clear()
     web_fetch._tika_sema = None
     web_fetch._tika_sema_total = None
@@ -63,7 +62,6 @@ def _reset_shared_clients():
     wolfram_alpha._http_clients.clear()
     yield
     web_fetch._fetch_clients.clear()
-    web_fetch._enrich_inflight.clear()
     web_fetch._capacity_limiters.clear()
     web_fetch._tika_sema = None
     web_fetch._tika_sema_total = None

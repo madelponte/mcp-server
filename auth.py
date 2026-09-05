@@ -18,7 +18,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
-_BEARER_PREFIX = "Bearer "
+_BEARER_PREFIX = b"Bearer "
 # Rejections are logged at most this often (seconds) so a misbehaving client or
 # an active probe can't flood the log; rejections in between are counted and
 # reported with the next warning.
@@ -31,8 +31,13 @@ class BearerAuthMiddleware:
     def __init__(self, app: ASGIApp, token: str) -> None:
         if not token:
             raise ValueError("BearerAuthMiddleware requires a non-empty token.")
+        try:
+            self._token = token.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                "BearerAuthMiddleware token must contain only ASCII characters."
+            ) from exc
         self.app = app
-        self._token = token
         self._last_reject_log: float | None = None
         self._rejects_suppressed = 0
 
@@ -51,10 +56,9 @@ class BearerAuthMiddleware:
     def _is_authorized(self, scope: Scope) -> bool:
         for name, value in scope.get("headers") or []:
             if name == b"authorization":
-                header = value.decode("latin-1")
-                if not header.startswith(_BEARER_PREFIX):
+                if not value.startswith(_BEARER_PREFIX):
                     return False
-                presented = header[len(_BEARER_PREFIX):].strip()
+                presented = value[len(_BEARER_PREFIX):].strip()
                 # Constant-time compare so a wrong token can't be guessed via timing.
                 return hmac.compare_digest(presented, self._token)
         return False
