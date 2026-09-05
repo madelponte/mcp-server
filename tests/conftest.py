@@ -55,12 +55,18 @@ def _reset_shared_clients():
 
     web_fetch._fetch_clients.clear()
     web_fetch._enrich_inflight.clear()
+    web_fetch._capacity_limiters.clear()
+    web_fetch._tika_sema = None
+    web_fetch._tika_sema_total = None
     web_search._brave_clients.clear()
     geocoding._http_clients.clear()
     wolfram_alpha._http_clients.clear()
     yield
     web_fetch._fetch_clients.clear()
     web_fetch._enrich_inflight.clear()
+    web_fetch._capacity_limiters.clear()
+    web_fetch._tika_sema = None
+    web_fetch._tika_sema_total = None
     web_search._brave_clients.clear()
     geocoding._http_clients.clear()
     wolfram_alpha._http_clients.clear()

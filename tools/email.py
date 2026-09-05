@@ -86,6 +86,61 @@ def _recipient_addresses(entries: list[dict], field: str) -> list[str]:
     return [e["address"] for e in entries if e["field"] == field]
 
 
+def _recipient_allowlist() -> tuple[frozenset[str], frozenset[str]] | None:
+    """Parse EMAIL_ALLOWED_RECIPIENTS into (exact emails, domains), or None.
+
+    ``None`` means unrestricted (the list is blank). Domain entries may be
+    written ``example.com`` or ``@example.com``; anything containing ``@`` is
+    an exact address.
+    """
+    raw = (cfg.allowed_recipients or "").strip()
+    if not raw:
+        return None
+    emails: set[str] = set()
+    domains: set[str] = set()
+    for item in re.split(r"[,\s]+", raw):
+        if not item:
+            continue
+        item = item.lower()
+        if item.startswith("@"):
+            domains.add(item[1:])
+        elif "@" in item:
+            emails.add(item)
+        else:
+            domains.add(item)
+    return frozenset(emails), frozenset(domains)
+
+
+def _recipient_allowed(
+    addr: str, allowlist: tuple[frozenset[str], frozenset[str]] | None
+) -> bool:
+    if allowlist is None:
+        return True
+    emails, domains = allowlist
+    key = addr.lower()
+    if key in emails:
+        return True
+    domain = key.rsplit("@", 1)[-1]
+    return domain in domains
+
+
+def _filter_allowed_recipients(
+    entries: list[dict],
+    allowlist: tuple[frozenset[str], frozenset[str]] | None,
+) -> tuple[list[dict], list[dict]]:
+    """Drop addresses that are not on EMAIL_ALLOWED_RECIPIENTS."""
+    if allowlist is None:
+        return entries, []
+    kept: list[dict] = []
+    rejected: list[dict] = []
+    for entry in entries:
+        if _recipient_allowed(entry["address"], allowlist):
+            kept.append(entry)
+        else:
+            rejected.append({**entry, "reason": "not_allowed"})
+    return kept, rejected
+
+
 def _format_refused(refused: dict | None) -> list[dict]:
     """Turn smtplib's refused-recipient mapping into JSON-safe records."""
     out: list[dict] = []
@@ -100,12 +155,50 @@ def _format_refused(refused: dict | None) -> list[dict]:
     return out
 
 
+def _attachment_root() -> Path | None:
+    """Resolved EMAIL_ATTACHMENT_ROOT, or None when attachments are disabled."""
+    raw = (cfg.attachment_root or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
+def _jail_attachment_path(raw: str, root: Path) -> Path:
+    """Resolve ``raw`` inside ``root``; reject symlink/absolute escapes.
+
+    Error messages do not echo the caller-supplied path so a probe for
+    ``/etc/passwd`` cannot confirm that a file exists outside the jail.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        raise ToolError("Attachment path is empty.")
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ToolError("Attachment path is outside EMAIL_ATTACHMENT_ROOT.")
+    if not resolved.is_file():
+        raise ToolError(
+            "Attachment path is not a readable file inside EMAIL_ATTACHMENT_ROOT."
+        )
+    return resolved
+
+
 def _prepare_attachments(paths: list[str] | None) -> list[dict]:
     """Validate attachment paths and read bytes for EmailMessage.add_attachment."""
     if not paths:
         return []
     if not isinstance(paths, list):
         raise ToolError("`attachments` must be a list of local file paths.")
+    root = _attachment_root()
+    if root is None:
+        raise ToolError(
+            "Attachments are disabled. Set EMAIL_ATTACHMENT_ROOT to a directory "
+            "the tool may read."
+        )
     if len(paths) > cfg.max_attachments:
         raise ToolError(
             f"`attachments` may include at most {cfg.max_attachments} files."
@@ -113,16 +206,14 @@ def _prepare_attachments(paths: list[str] | None) -> list[dict]:
 
     prepared: list[dict] = []
     for raw in paths:
-        path = Path(str(raw or "").strip()).expanduser()
-        if not str(path):
+        if not str(raw or "").strip():
             continue
+        path = _jail_attachment_path(str(raw), root)
         try:
-            if not path.is_file():
-                raise ToolError(f"Attachment path is not a readable file: {path}")
             declared_size = path.stat().st_size
             if declared_size > cfg.max_attachment_bytes:
                 raise ToolError(
-                    f"Attachment {path} is {declared_size} bytes, above the "
+                    f"Attachment {path.name} is {declared_size} bytes, above the "
                     f"{cfg.max_attachment_bytes}-byte per-file limit."
                 )
             # Read at most one byte past the limit. The file can change between
@@ -131,19 +222,20 @@ def _prepare_attachments(paths: list[str] | None) -> list[dict]:
                 data = stream.read(cfg.max_attachment_bytes + 1)
         except ToolError:
             raise
-        except OSError as exc:
-            raise ToolError(f"Attachment path is not a readable file: {path}: {exc}")
+        except OSError:
+            raise ToolError(
+                "Attachment path is not a readable file inside EMAIL_ATTACHMENT_ROOT."
+            )
         size = len(data)
         if size > cfg.max_attachment_bytes:
             raise ToolError(
-                f"Attachment {path} is {size} bytes, above the "
+                f"Attachment {path.name} is {size} bytes, above the "
                 f"{cfg.max_attachment_bytes}-byte per-file limit."
             )
         ctype, _ = mimetypes.guess_type(path.name)
         maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
         prepared.append(
             {
-                "path": str(path),
                 "filename": path.name,
                 "content_type": ctype or "application/octet-stream",
                 "size_bytes": size,
@@ -226,6 +318,21 @@ def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
+    allowlist_note = (
+        " Addresses must match the server recipient allowlist."
+        if (cfg.allowed_recipients or "").strip()
+        else ""
+    )
+    root_set = bool((cfg.attachment_root or "").strip())
+    attachments_desc = (
+        f"Optional files under the server attachment directory, up to "
+        f"{cfg.max_attachments} files; each file max "
+        f"{cfg.max_attachment_bytes} bytes. Use a filename or a path inside "
+        "that directory; paths outside it are rejected."
+        if root_set
+        else "Disabled on this server (EMAIL_ATTACHMENT_ROOT is unset)."
+    )
+
     @mcp.tool(annotations=SIDE_EFFECTING_EXTERNAL_TOOL)
     async def send_email(
         recipients: Annotated[
@@ -233,7 +340,7 @@ def register(mcp: FastMCP) -> None:
             Field(
                 description=(
                     f"List of recipient email addresses (max {cfg.max_recipients}; "
-                    "addresses past the cap are dropped)."
+                    f"addresses past the cap are dropped).{allowlist_note}"
                 ),
             ),
         ],
@@ -245,6 +352,7 @@ def register(mcp: FastMCP) -> None:
                 description=(
                     f"Optional CC recipient addresses. Total To+Cc+Bcc cap is "
                     f"{cfg.max_recipients}; extras are dropped and reported."
+                    f"{allowlist_note}"
                 ),
             ),
         ] = None,
@@ -254,20 +362,15 @@ def register(mcp: FastMCP) -> None:
                 description=(
                     f"Optional BCC recipient addresses. Total To+Cc+Bcc cap is "
                     f"{cfg.max_recipients}; extras are dropped and reported. "
-                    "BCC addresses are not written into message headers."
+                    f"BCC addresses are not written into message headers."
+                    f"{allowlist_note}"
                 ),
             ),
         ] = None,
         reply_to: str | None = None,
         attachments: Annotated[
             list[str] | None,
-            Field(
-                description=(
-                    f"Optional local file paths to attach, up to "
-                    f"{cfg.max_attachments} files; each file max "
-                    f"{cfg.max_attachment_bytes} bytes."
-                ),
-            ),
+            Field(description=attachments_desc),
         ] = None,
     ) -> str:
         """Send a plain-text email from the server's configured account.
@@ -275,7 +378,7 @@ def register(mcp: FastMCP) -> None:
         Send-only: this delivers a message; no other interaction.
         Use it to notify a person of a result, forward a summary, or
         deliver content you have already produced. Supports CC, BCC, Reply-To,
-        and local file attachments.
+        and optional local file attachments when the server allows them.
 
         Returns JSON {status, subject, recipients:{to,cc,bcc},
         attempted_recipients, accepted_recipients, refused_recipients,
@@ -336,6 +439,11 @@ def register(mcp: FastMCP) -> None:
         reply_to = (reply_to or "").strip() or None
         if reply_to and not _ADDR_RE.match(reply_to):
             raise ToolError(f"`reply_to` is not a valid email address: {reply_to}")
+        allowlist = _recipient_allowlist()
+        if reply_to and not _recipient_allowed(reply_to, allowlist):
+            raise ToolError(
+                "`reply_to` is not permitted by EMAIL_ALLOWED_RECIPIENTS."
+            )
 
         entries = (
             [{"field": "to", "address": a} for a in to_valid]
@@ -347,6 +455,13 @@ def register(mcp: FastMCP) -> None:
             raise ToolError(
                 "No valid recipient addresses. Rejected: "
                 + ", ".join(e["address"] for e in invalid)
+            )
+        entries, not_allowed_dropped = _filter_allowed_recipients(entries, allowlist)
+        if not entries:
+            raise ToolError(
+                "No recipients remain after applying EMAIL_ALLOWED_RECIPIENTS. "
+                "Rejected: "
+                + ", ".join(e["address"] for e in not_allowed_dropped)
             )
 
         # Clamp to the configured cap (a context/abuse guard). Over-cap addresses
@@ -426,10 +541,11 @@ def register(mcp: FastMCP) -> None:
             "accepted_recipients": accepted,
             "refused_recipients": refused,
             "invalid_recipients": invalid,
-            "dropped_recipients": duplicate_dropped + over_limit_dropped,
+            "dropped_recipients": (
+                duplicate_dropped + not_allowed_dropped + over_limit_dropped
+            ),
             "attachments": [
                 {
-                    "path": att["path"],
                     "filename": att["filename"],
                     "content_type": att["content_type"],
                     "size_bytes": att["size_bytes"],
@@ -437,7 +553,10 @@ def register(mcp: FastMCP) -> None:
                 for att in prepared_attachments
             ],
             # Backward-compatible flat summary for older callers.
-            "dropped": [e["address"] for e in invalid + duplicate_dropped + over_limit_dropped],
+            "dropped": [
+                e["address"]
+                for e in invalid + duplicate_dropped + not_allowed_dropped + over_limit_dropped
+            ],
         }
         if refused and not accepted:
             payload["status"] = "failed"

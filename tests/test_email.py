@@ -30,6 +30,8 @@ def configured(monkeypatch):
     monkeypatch.setattr(email_mod.cfg, "from_name", "")
     monkeypatch.setattr(email_mod.cfg, "max_attachments", 5)
     monkeypatch.setattr(email_mod.cfg, "max_attachment_bytes", 10_000_000)
+    monkeypatch.setattr(email_mod.cfg, "allowed_recipients", "")
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", "")
 
 
 def _capture_send(monkeypatch):
@@ -104,6 +106,7 @@ def test_happy_path_sends_and_returns_json(monkeypatch, tool_fns):
 def test_cc_bcc_reply_to_and_attachment(monkeypatch, tmp_path, tool_fns):
     attachment = tmp_path / "report.txt"
     attachment.write_text("hello attachment")
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(tmp_path))
     sent = _capture_send(monkeypatch)
     fn = tool_fns["send_email"]
     out = json.loads(
@@ -133,12 +136,12 @@ def test_cc_bcc_reply_to_and_attachment(monkeypatch, tmp_path, tool_fns):
     ]
     assert out["attachments"] == [
         {
-            "path": str(attachment),
             "filename": "report.txt",
             "content_type": "text/plain",
             "size_bytes": len("hello attachment"),
         }
     ]
+    assert "path" not in out["attachments"][0]
 
     msg = sent["msg"]
     assert msg["To"] == "to@example.com"
@@ -242,7 +245,7 @@ def test_partial_refusals_are_returned(monkeypatch, tool_fns):
     ]
 
 
-def test_missing_attachment_raises(tool_fns):
+def test_attachments_disabled_without_root(tool_fns):
     fn = tool_fns["send_email"]
     with pytest.raises(ToolError) as exc:
         run(
@@ -253,12 +256,118 @@ def test_missing_attachment_raises(tool_fns):
                 attachments=["/tmp/does-not-exist-for-email-test.txt"],
             )
         )
-    assert "attachment path" in str(exc.value).lower()
+    assert "disabled" in str(exc.value).lower()
+
+
+def test_missing_attachment_inside_root_raises(monkeypatch, tmp_path, tool_fns):
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(tmp_path))
+    fn = tool_fns["send_email"]
+    with pytest.raises(ToolError) as exc:
+        run(
+            fn(
+                recipients=["a@b.com"],
+                subject="hi",
+                body="yo",
+                attachments=["missing-for-email-test.txt"],
+            )
+        )
+    assert "readable file" in str(exc.value).lower()
+    assert "missing-for-email-test.txt" not in str(exc.value)
+
+
+def test_attachment_outside_root_is_rejected(monkeypatch, tmp_path, tool_fns):
+    jail = tmp_path / "jail"
+    jail.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not leak")
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(jail))
+    fn = tool_fns["send_email"]
+    with pytest.raises(ToolError) as exc:
+        run(
+            fn(
+                recipients=["a@b.com"],
+                subject="hi",
+                body="yo",
+                attachments=[str(secret)],
+            )
+        )
+    assert "outside" in str(exc.value).lower()
+    assert "secret.txt" not in str(exc.value)
+
+
+def test_attachment_symlink_escape_is_rejected(monkeypatch, tmp_path):
+    jail = tmp_path / "jail"
+    jail.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not leak")
+    link = jail / "link.txt"
+    link.symlink_to(secret)
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(jail))
+    with pytest.raises(ToolError) as exc:
+        email_mod._prepare_attachments(["link.txt"])
+    assert "outside" in str(exc.value).lower()
+
+
+def test_attachment_relative_path_stays_in_root(monkeypatch, tmp_path):
+    jail = tmp_path / "jail"
+    jail.mkdir()
+    (jail / "note.txt").write_text("ok")
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(jail))
+    prepared = email_mod._prepare_attachments(["note.txt"])
+    assert prepared[0]["filename"] == "note.txt"
+    assert prepared[0]["data"] == b"ok"
+    assert "path" not in prepared[0]
+
+
+def test_recipient_allowlist_drops_unlisted_addresses(monkeypatch, tool_fns):
+    monkeypatch.setattr(email_mod.cfg, "allowed_recipients", "good@example.com, example.com")
+    sent = _capture_send(monkeypatch)
+    fn = tool_fns["send_email"]
+    out = json.loads(
+        run(
+            fn(
+                recipients=["good@example.com", "evil@attacker.test", "other@example.com"],
+                subject="hi",
+                body="yo",
+            )
+        )
+    )
+    assert out["attempted_recipients"] == ["good@example.com", "other@example.com"]
+    assert sent["envelope_recipients"] == ["good@example.com", "other@example.com"]
+    assert out["dropped_recipients"] == [
+        {"field": "to", "address": "evil@attacker.test", "reason": "not_allowed"}
+    ]
+
+
+def test_recipient_allowlist_rejects_when_none_remain(monkeypatch, tool_fns):
+    monkeypatch.setattr(email_mod.cfg, "allowed_recipients", "@corp.com")
+    _capture_send(monkeypatch)
+    fn = tool_fns["send_email"]
+    with pytest.raises(ToolError) as exc:
+        run(fn(recipients=["evil@attacker.test"], subject="hi", body="yo"))
+    assert "allowed_recipients" in str(exc.value).lower()
+
+
+def test_reply_to_must_match_allowlist(monkeypatch, tool_fns):
+    monkeypatch.setattr(email_mod.cfg, "allowed_recipients", "a@b.com")
+    _capture_send(monkeypatch)
+    fn = tool_fns["send_email"]
+    with pytest.raises(ToolError) as exc:
+        run(
+            fn(
+                recipients=["a@b.com"],
+                reply_to="evil@attacker.test",
+                subject="hi",
+                body="yo",
+            )
+        )
+    assert "reply_to" in str(exc.value).lower()
 
 
 def test_attachment_growth_after_stat_is_bounded(monkeypatch, tmp_path):
     path = tmp_path / "growing.bin"
     path.write_bytes(b"small")
+    monkeypatch.setattr(email_mod.cfg, "attachment_root", str(tmp_path))
     monkeypatch.setattr(email_mod.cfg, "max_attachment_bytes", 5)
 
     original_open = email_mod.Path.open

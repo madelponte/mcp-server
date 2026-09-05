@@ -16,10 +16,13 @@ import json
 import logging
 import re
 import socket
+import threading
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 from bs4 import UnicodeDammit
 
@@ -48,6 +51,15 @@ _enrich_inflight: dict[str, asyncio.Task] = {}
 # Built lazily so tests that patch `httpx.AsyncClient` are still honored.
 _fetch_clients: dict[bool, httpx.AsyncClient] = {}
 
+# Process-wide caps so a model that fans out many fetch_page calls cannot
+# stampede FlareSolverr, Tika, Firecrawl, or the direct-fetch pool. Recreated
+# when the configured total changes (tests monkeypatch caps per case).
+_capacity_limiters: dict[str, anyio.CapacityLimiter] = {}
+_capacity_lock = threading.Lock()
+_tika_sema: threading.BoundedSemaphore | None = None
+_tika_sema_total: int | None = None
+_tika_lock = threading.Lock()
+
 
 def _cache_page(url: str, fetched: dict) -> None:
     """Cache a raw fetch only when one entry cannot dominate process memory."""
@@ -75,6 +87,32 @@ def _fetch_client(verify_ssl: bool) -> httpx.AsyncClient:
         client = httpx.AsyncClient(follow_redirects=False, verify=verify_ssl)
         _fetch_clients[verify_ssl] = client
     return client
+
+
+def _capacity_limiter(name: str, total: int) -> anyio.CapacityLimiter:
+    total = max(1, int(total))
+    with _capacity_lock:
+        limiter = _capacity_limiters.get(name)
+        if limiter is None or limiter.total_tokens != total:
+            limiter = anyio.CapacityLimiter(total)
+            _capacity_limiters[name] = limiter
+        return limiter
+
+
+@asynccontextmanager
+async def _limit(name: str, total: int):
+    async with _capacity_limiter(name, total):
+        yield
+
+
+def _tika_semaphore() -> threading.BoundedSemaphore:
+    total = max(1, int(cfg.max_concurrent_tika))
+    global _tika_sema, _tika_sema_total
+    with _tika_lock:
+        if _tika_sema is None or _tika_sema_total != total:
+            _tika_sema = threading.BoundedSemaphore(total)
+            _tika_sema_total = total
+        return _tika_sema
 
 
 async def close_clients() -> None:
@@ -455,23 +493,28 @@ def _tika_extract(
         headers["X-Tika-PDFOcrStrategy"] = ocr_strategy
     chunks: list[bytes] = []
     total = 0
-    with httpx.stream(
-        "PUT",
-        f"{tika_url.rstrip('/')}/tika",
-        content=data,
-        headers=headers,
-        timeout=timeout,
-    ) as resp:
-        resp.raise_for_status()
-        for chunk in resp.iter_bytes():
-            total += len(chunk)
-            if max_output_bytes and total > max_output_bytes:
-                raise DownloadTooLargeError(
-                    "Tika extraction output exceeds the configured "
-                    f"{max_output_bytes}-byte download cap."
-                )
-            chunks.append(chunk)
-        encoding = resp.encoding or "utf-8"
+    sema = _tika_semaphore()
+    sema.acquire()
+    try:
+        with httpx.stream(
+            "PUT",
+            f"{tika_url.rstrip('/')}/tika",
+            content=data,
+            headers=headers,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_bytes():
+                total += len(chunk)
+                if max_output_bytes and total > max_output_bytes:
+                    raise DownloadTooLargeError(
+                        "Tika extraction output exceeds the configured "
+                        f"{max_output_bytes}-byte download cap."
+                    )
+                chunks.append(chunk)
+            encoding = resp.encoding or "utf-8"
+    finally:
+        sema.release()
     text = b"".join(chunks).decode(encoding, errors="replace").strip()
     if not text:
         raise RuntimeError("Document contained no extractable text.")
@@ -486,8 +529,12 @@ def _tika_extract(
 # targets — cloud metadata (169.254.169.254), localhost, or LAN hosts. We resolve
 # the host and refuse any non-publicly-routable address, on the initial URL AND
 # every redirect hop (follow_redirects can otherwise 302 a public URL into a
-# private one). Cap redirects while we follow them by hand. Operators can opt
-# specific hosts/IPs/CIDRs back in via WEB_SEARCH_SSRF_ALLOWLIST.
+# private one). Direct fetches also check the connected peer IP so a DNS rebinding
+# race cannot swap a public lookup for a private connect. FlareSolverr/Firecrawl
+# follow redirects inside the browser; we cannot prevent that request, but we
+# SSRF-check the provider-reported final URL and discard the body if it landed
+# on a blocked host. Cap redirects while we follow them by hand. Operators can
+# opt specific hosts/IPs/CIDRs back in via WEB_SEARCH_SSRF_ALLOWLIST.
 # ---------------------------------------------------------------------------
 
 MAX_REDIRECTS = 20
@@ -587,6 +634,58 @@ async def _assert_url_allowed(url: str) -> None:
         )
 
 
+def _peer_ip(resp: httpx.Response) -> str | None:
+    """Return the connected peer address, or None when the transport has none."""
+    stream = resp.extensions.get("network_stream")
+    if stream is None:
+        return None
+    getter = getattr(stream, "get_extra_info", None)
+    if getter is None:
+        return None
+    try:
+        extra = getter("peername")
+    except Exception:
+        return None
+    if isinstance(extra, tuple) and extra:
+        return str(extra[0])
+    return None
+
+
+def _assert_peer_allowed(url: str, resp: httpx.Response) -> None:
+    """Refuse a response whose connected peer is a non-public address.
+
+    Closes the DNS-rebinding window between ``_assert_url_allowed`` (which
+    resolved the host) and the TCP connect httpx makes independently. Mock
+    transports have no peer name and are skipped.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    allowed_hosts, allowed_nets = _parse_allowlist(cfg.ssrf_allowlist)
+    if host in allowed_hosts:
+        return
+    peer = _peer_ip(resp)
+    if not peer:
+        return
+    if _addr_is_blocked(peer, allowed_nets):
+        raise SSRFError(
+            f"Refusing to use response from {host!r}: connected to non-public "
+            f"address {peer} (allowlist via WEB_SEARCH_SSRF_ALLOWLIST)"
+        )
+
+
+async def _assert_fetched_url_allowed(url: str | None) -> None:
+    """SSRF-check a browser-provider final URL; ignore blank/relative values."""
+    if not isinstance(url, str):
+        return
+    candidate = url.strip()
+    if not candidate:
+        return
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        return
+    await _assert_url_allowed(candidate)
+
+
 # ---------------------------------------------------------------------------
 # Direct-resource probing and browser provider transports
 # ---------------------------------------------------------------------------
@@ -661,28 +760,30 @@ async def _httpx_fetch(
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    client = _fetch_client(verify_ssl)
-    current = url
-    for _ in range(MAX_REDIRECTS + 1):
-        async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
-            location = resp.headers.get("location")
-            if resp.is_redirect and location:
-                current = str(resp.url.join(location))
-                await _assert_url_allowed(current)
-                continue
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if max_bytes and total > max_bytes:
-                    raise DownloadTooLargeError(
-                        f"Response from {current!r} exceeds the "
-                        f"{max_bytes}-byte download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
-                    )
-                chunks.append(chunk)
-            ctype = resp.headers.get("content-type", "")
-            return resp.status_code, dict(resp.headers), b"".join(chunks), ctype
-    raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
+    async with _limit("direct", cfg.max_concurrent_direct_fetches):
+        client = _fetch_client(verify_ssl)
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
+                _assert_peer_allowed(current, resp)
+                location = resp.headers.get("location")
+                if resp.is_redirect and location:
+                    current = str(resp.url.join(location))
+                    await _assert_url_allowed(current)
+                    continue
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise DownloadTooLargeError(
+                            f"Response from {current!r} exceeds the "
+                            f"{max_bytes}-byte download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
+                        )
+                    chunks.append(chunk)
+                ctype = resp.headers.get("content-type", "")
+                return resp.status_code, dict(resp.headers), b"".join(chunks), ctype
+        raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
 async def _direct_resource_fetch(
@@ -707,52 +808,54 @@ async def _direct_resource_fetch(
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
-    client = _fetch_client(verify_ssl)
-    current = url
-    for _ in range(MAX_REDIRECTS + 1):
-        async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
-            location = resp.headers.get("location")
-            if resp.is_redirect and location:
-                current = str(resp.url.join(location))
-                await _assert_url_allowed(current)
-                continue
-            status = resp.status_code
-            response_headers = dict(resp.headers)
-            ctype = resp.headers.get("content-type", "")
-            base = ctype.split(";", 1)[0].strip().lower()
-            document_url = _is_tika_document("", current)
-            if not document_url and (base in {"text/html", "application/xhtml+xml"} or "html" in base):
-                return status, response_headers, b"", ctype, True
+    async with _limit("direct", cfg.max_concurrent_direct_fetches):
+        client = _fetch_client(verify_ssl)
+        current = url
+        for _ in range(MAX_REDIRECTS + 1):
+            async with client.stream("GET", current, headers=headers, timeout=timeout) as resp:
+                _assert_peer_allowed(current, resp)
+                location = resp.headers.get("location")
+                if resp.is_redirect and location:
+                    current = str(resp.url.join(location))
+                    await _assert_url_allowed(current)
+                    continue
+                status = resp.status_code
+                response_headers = dict(resp.headers)
+                ctype = resp.headers.get("content-type", "")
+                base = ctype.split(";", 1)[0].strip().lower()
+                document_url = _is_tika_document("", current)
+                if not document_url and (base in {"text/html", "application/xhtml+xml"} or "html" in base):
+                    return status, response_headers, b"", ctype, True
 
-            chunks: list[bytes] = []
-            total = 0
-            undecided = not document_url and _generic_binary_ctype(ctype)
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if max_bytes and total > max_bytes:
-                    raise DownloadTooLargeError(
-                        f"Response from {current!r} exceeds the {max_bytes}-byte "
-                        "download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
-                    )
-                chunks.append(chunk)
-                if undecided and total >= min(sniff_bytes, max_bytes or sniff_bytes):
-                    sample = b"".join(chunks)
-                    sniffed = _sniff_textlike_ctype(sample, ctype)
+                chunks: list[bytes] = []
+                total = 0
+                undecided = not document_url and _generic_binary_ctype(ctype)
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if max_bytes and total > max_bytes:
+                        raise DownloadTooLargeError(
+                            f"Response from {current!r} exceeds the {max_bytes}-byte "
+                            "download cap (WEB_SEARCH_MAX_DOWNLOAD_BYTES)."
+                        )
+                    chunks.append(chunk)
+                    if undecided and total >= min(sniff_bytes, max_bytes or sniff_bytes):
+                        sample = b"".join(chunks)
+                        sniffed = _sniff_textlike_ctype(sample, ctype)
+                        if sniffed == "text/html":
+                            return status, response_headers, b"", sniffed, True
+                        # JSON/XML can now continue in this same response.
+                        if sniffed:
+                            ctype = sniffed
+                        undecided = False
+                body = b"".join(chunks)
+                if undecided:
+                    sniffed = _sniff_textlike_ctype(body, ctype)
                     if sniffed == "text/html":
                         return status, response_headers, b"", sniffed, True
-                    # JSON/XML can now continue in this same response.
                     if sniffed:
                         ctype = sniffed
-                    undecided = False
-            body = b"".join(chunks)
-            if undecided:
-                sniffed = _sniff_textlike_ctype(body, ctype)
-                if sniffed == "text/html":
-                    return status, response_headers, b"", sniffed, True
-                if sniffed:
-                    ctype = sniffed
-            return status, response_headers, body, ctype, False
-    raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
+                return status, response_headers, body, ctype, False
+        raise RuntimeError(f"Exceeded {MAX_REDIRECTS} redirects fetching {url!r}")
 
 
 async def _flaresolverr_fetch(
@@ -763,33 +866,36 @@ async def _flaresolverr_fetch(
     max_bytes: int = 0,
 ) -> tuple[int, dict, str]:
     """Use FlareSolverr to fetch a page without bypassing the download cap."""
-    endpoint = flaresolverr_url.rstrip("/") + "/v1"
-    payload = {"cmd": "request.get", "url": url, "maxTimeout": max_timeout_ms}
-    async with httpx.AsyncClient(timeout=http_timeout) as client:
-        async with client.stream(
-            "POST", endpoint, json=payload, headers={"Content-Type": "application/json"}
-        ) as resp:
-            resp.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            # FlareSolverr wraps the rendered body in JSON, so permit modest
-            # protocol overhead beyond the configured body limit.
-            response_limit = max_bytes + 1048576 if max_bytes else 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if response_limit and total > response_limit:
-                    raise DownloadTooLargeError(
-                        f"FlareSolverr response for {url!r} exceeds the configured "
-                        f"{max_bytes}-byte download cap."
-                    )
-                chunks.append(chunk)
-        data = json.loads(b"".join(chunks))
+    async with _limit("flaresolverr", cfg.max_concurrent_flaresolverr):
+        endpoint = flaresolverr_url.rstrip("/") + "/v1"
+        payload = {"cmd": "request.get", "url": url, "maxTimeout": max_timeout_ms}
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
+            async with client.stream(
+                "POST", endpoint, json=payload, headers={"Content-Type": "application/json"}
+            ) as resp:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                # FlareSolverr wraps the rendered body in JSON, so permit modest
+                # protocol overhead beyond the configured body limit.
+                response_limit = max_bytes + 1048576 if max_bytes else 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if response_limit and total > response_limit:
+                        raise DownloadTooLargeError(
+                            f"FlareSolverr response for {url!r} exceeds the configured "
+                            f"{max_bytes}-byte download cap."
+                        )
+                    chunks.append(chunk)
+            data = json.loads(b"".join(chunks))
     if not isinstance(data, dict):
         raise RuntimeError("FlareSolverr returned a JSON value that is not an object.")
     if data.get("status") != "ok":
         msg = str(data.get("message", "unknown FlareSolverr error"))[:500]
         raise RuntimeError(f"FlareSolverr failed: {msg}")
     sol = data.get("solution") or {}
+    final_url = sol.get("url") if isinstance(sol.get("url"), str) else None
+    await _assert_fetched_url_allowed(final_url)
     status = int(sol.get("status") or 0)
     hdrs = sol.get("headers") or {}
     body = sol.get("response") or ""
@@ -953,22 +1059,23 @@ async def _firecrawl_fetch(
     }
     http_timeout = timeout_ms / 1000 + 10
 
-    async with httpx.AsyncClient(timeout=http_timeout) as client:
-        async with client.stream("POST", api_url, json=payload, headers=headers) as resp:
-            chunks: list[bytes] = []
-            total = 0
-            # Firecrawl wraps the rendered page in JSON. Match the modest
-            # protocol-overhead allowance used for FlareSolverr.
-            response_limit = max_bytes + 1048576 if max_bytes else 0
-            async for chunk in resp.aiter_bytes():
-                total += len(chunk)
-                if response_limit and total > response_limit:
-                    raise DownloadTooLargeError(
-                        f"Firecrawl response for {url!r} exceeds the configured "
-                        f"{max_bytes}-byte download cap."
-                    )
-                chunks.append(chunk)
-            response_status = resp.status_code
+    async with _limit("firecrawl", cfg.max_concurrent_firecrawl):
+        async with httpx.AsyncClient(timeout=http_timeout) as client:
+            async with client.stream("POST", api_url, json=payload, headers=headers) as resp:
+                chunks: list[bytes] = []
+                total = 0
+                # Firecrawl wraps the rendered page in JSON. Match the modest
+                # protocol-overhead allowance used for FlareSolverr.
+                response_limit = max_bytes + 1048576 if max_bytes else 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if response_limit and total > response_limit:
+                        raise DownloadTooLargeError(
+                            f"Firecrawl response for {url!r} exceeds the configured "
+                            f"{max_bytes}-byte download cap."
+                        )
+                    chunks.append(chunk)
+                response_status = resp.status_code
 
     try:
         response_data = json.loads(b"".join(chunks))
@@ -997,6 +1104,11 @@ async def _firecrawl_fetch(
         )
 
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    for key in ("url", "sourceURL", "ogUrl"):
+        candidate = metadata.get(key)
+        await _assert_fetched_url_allowed(
+            candidate if isinstance(candidate, str) else None
+        )
     try:
         status = int(metadata.get("statusCode") or 200)
     except (TypeError, ValueError):
