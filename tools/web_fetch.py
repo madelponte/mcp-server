@@ -1,11 +1,11 @@
 """
-HTTP fetching infrastructure, shared by the web-search and fetch-page tools.
+HTTP fetching infrastructure for the fetch_page tool.
 
-This is the provider/transport layer both tools sit on top of. It SSRF-guards
+This is fetch_page's provider/transport layer. It SSRF-guards
 URLs and redirect hops, streams direct resources with size limits, talks to
 FlareSolverr and Firecrawl, extracts binary documents through Tika, and owns the
 raw page cache. `page_acquire` defines fetch_page's browser-first policy and page
-acceptance; `search_web` keeps a separate direct-only enrichment path. Returned
+acceptance. Returned
 dicts are raw artifacts (status / content-type / text-or-bytes / via).
 """
 
@@ -31,17 +31,10 @@ from .cache import TTLCache
 
 log = logging.getLogger(__name__)
 
-# Process-wide cache of fetched pages, keyed by URL. Shared by fetch_page and
-# search_web's result enrichment so a repeated fetch within a task skips the
-# network round-trip. Fetch settings all come from static config, so the URL
+# Process-wide cache of fetched pages, keyed by URL, so repeated fetch_page
+# calls skip the network round-trip. Fetch settings come from static config, so the URL
 # alone is a sufficient key. See the README "Caching" section.
 _page_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
-
-# Lean search-result enrichment has its own in-flight map. It deliberately does
-# not use the full fetch path because enrichment skips browser/Firecrawl fallbacks,
-# but concurrent enrichment of the same URL should still share the one direct,
-# byte-capped download.
-_enrich_inflight: dict[str, asyncio.Task] = {}
 
 # Shared httpx clients for direct fetches, keyed by the `verify` setting (the
 # only client-construction option that varies). Reusing one client per setting
@@ -129,97 +122,6 @@ async def close_clients() -> None:
         except Exception:
             log.exception("Failed to close a shared direct-fetch client.")
     _fetch_clients.clear()
-
-
-# ---------------------------------------------------------------------------
-# Lean enrichment bot-wall detection
-#
-# Search enrichment is intentionally direct-only, but must avoid caching an
-# obvious challenge as reusable page content. fetch_page does not use this
-# marker list for fallback decisions; page_quality applies its generic gate.
-# Cloudflare is the common direct-enrichment case, but it is not the only one:
-# PerimeterX/HUMAN, DataDome, and Akamai Bot Manager all serve a 403 (sometimes a
-# 401, 429, or even a 200) whose body is a JS/CAPTCHA challenge bearing none of
-# the Cloudflare markers — so they must be matched explicitly or the fallback
-# never fires. DataDome in particular (e.g. Reuters) answers its interstitial
-# with HTTP 401, which is why 401 is a block status here even though it normally
-# means "authentication required": a plain 401 with no challenge marker/cookie
-# still falls through as not-blocked (the marker check below must also pass).
-# ---------------------------------------------------------------------------
-
-BLOCK_STATUS_CODES = {401, 403, 503, 520, 521, 522, 523, 524, 525, 526, 527}
-CLOUDFLARE_MARKERS = (
-    "cf-ray",
-    "cf-chl",
-    "just a moment",
-    "attention required",
-    "cf-browser-verification",
-    "cf_chl_opt",
-    "challenge-platform",
-    "please enable cookies",
-    "/cdn-cgi/challenge-platform",
-    # Cloudflare's managed-challenge interstitial doesn't always carry a "just a
-    # moment" title or a cf-* token in a stripped/minimal response — but its
-    # visible body text is this. Distinctive enough not to false-positive on a
-    # real page (and the >=2-marker rule still guards the bare-200 case).
-    "enable javascript and cookies to continue",
-)
-# Markers for the other major bot walls. Kept separate from the Cloudflare set
-# only for clarity; detection treats them the same way.
-CHALLENGE_MARKERS = (
-    "px-cloud.net",            # PerimeterX / HUMAN (e.g. captcha.px-cloud.net)
-    "/captcha/captcha.js",     # PerimeterX block script path
-    "px-captcha",
-    "perimeterx",
-    "_pxhd",                   # PerimeterX cookie
-    "datadome",                # DataDome
-    "geo.captcha-delivery.com",
-    "ak_bmsc",                 # Akamai Bot Manager
-    "/_sec/cp_challenge",
-    # Human-readable text of the *rendered* interstitial these walls serve — what
-    # FlareSolverr gets back when it can't solve an interactive challenge (e.g.
-    # PerimeterX "Press & Hold"). Distinctive enough that the >=2-marker rule on a
-    # 200 keeps them from false-positiving on real pages.
-    "access to this page has been denied",
-    "confirm you are a human",
-    "and not a bot",
-    "your request originates from an undeclared automated tool",
-)
-ALL_BLOCK_MARKERS = CLOUDFLARE_MARKERS + CHALLENGE_MARKERS
-
-
-def _is_blocked_response(status: int, text: str, headers: dict) -> bool:
-    """Best-effort detection that a response is a bot wall / CAPTCHA challenge.
-
-    Covers Cloudflare plus PerimeterX/HUMAN, DataDome, and Akamai Bot Manager —
-    each of which serves a challenge under one of ``BLOCK_STATUS_CODES`` (or a
-    bare 200) carrying its own marker rather than the page's real content — and
-    any HTTP 429, which is definitionally a throttle and never real content.
-    """
-    # A 429 ("Too Many Requests") is always a rate-limit/throttle: it never
-    # carries the page's real content, and is frequently fingerprint-based bot
-    # detection. Always treat it as blocked so enrichment does not cache a
-    # "Too Many Requests" page as reusable content.
-    if status == 429:
-        return True
-    hdr_lower = {k.lower(): str(v).lower() for k, v in (headers or {}).items()}
-    server = hdr_lower.get("server", "")
-    set_cookie = hdr_lower.get("set-cookie", "")
-    if "cloudflare" in server and status in BLOCK_STATUS_CODES:
-        return True
-    if status in BLOCK_STATUS_CODES:
-        # Some walls signal in headers even when the body is opaque/minified.
-        if "x-datadome" in hdr_lower or "datadome" in set_cookie or "_px" in set_cookie:
-            return True
-        t = (text or "")[:8000].lower()
-        if any(m in t for m in ALL_BLOCK_MARKERS):
-            return True
-    if status == 200 and text:
-        t = text[:4000].lower()
-        hits = sum(1 for m in ALL_BLOCK_MARKERS if m in t)
-        if hits >= 2:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -913,86 +815,6 @@ async def _flaresolverr_fetch(
             f"{url!r} ({browser_error})."
         )
     return status, hdrs, body
-
-
-async def _direct_enrich_fetch(url: str) -> dict | None:
-    """One direct, byte-capped enrichment fetch. Call via `_enrich_fetch`."""
-    await _assert_url_allowed(url)
-    try:
-        status, headers, body, ctype = await _httpx_fetch(
-            url,
-            timeout=cfg.http_timeout_seconds,
-            user_agent=cfg.user_agent,
-            verify_ssl=cfg.verify_ssl,
-            max_bytes=cfg.enrich_max_bytes,
-        )
-    except (SSRFError, DownloadTooLargeError):
-        # Blocked redirect host, or a page too big to enrich cheaply — skip it.
-        return None
-
-    is_document = _is_tika_document(ctype, url) or _sniff_document_bytes(body)
-    sniffed_ctype = (
-        None
-        if is_document or _declared_textlike(ctype)
-        else _sniff_textlike_ctype(body, ctype)
-    )
-    is_textlike = (
-        not is_document
-        and (_declared_textlike(ctype) or sniffed_ctype is not None)
-    )
-    if sniffed_ctype:
-        ctype = sniffed_ctype
-    text = _decode_body(body, ctype) if is_textlike else None
-    blocked = _is_blocked_response(status, text or "", headers)
-    result = {
-        "url": url,
-        "status": status,
-        "content_type": ctype,
-        "text": text,
-        "bytes": None if is_textlike else body,
-        "via": "direct",
-        "blocked_detected": blocked,
-    }
-    # Cache only a complete, readable, un-blocked page, so a later fetch_page read
-    # can reuse it. A blocked direct response must not be cached: fetch_page would
-    # then reuse it and skip its own FlareSolverr attempt.
-    if is_textlike and not blocked:
-        _cache_page(url, result)
-    return result
-
-
-async def _enrich_fetch(url: str) -> dict | None:
-    """Lean cached/coalesced fetch used only to enrich a search result with page metadata.
-
-    Enrichment wants a hit's title/description/heading outline — all in the
-    document head — not its whole body, and it isn't worth a multi-second browser
-    render. Unlike fetch_page's acquisition pipeline this:
-
-    * reuses an already-cached accepted artifact when one exists, but
-    * on a miss does a single direct, byte-capped (``cfg.enrich_max_bytes``) httpx
-      fetch through the same SSRF-guarded redirect path — and **skips** the
-      FlareSolverr and Firecrawl fallbacks, so one bot-walled result among the top
-      hits can't stall the whole ``search_web`` call.
-
-    A page larger than the cap returns ``None`` (left un-enriched) rather than
-    being pulled in full. Only a complete, textlike, un-blocked result is written
-    to the shared page cache — never a truncated/blocked one, which would poison a
-    later real ``fetch_page`` read. Returns a raw-fetch-shaped dict, or ``None``.
-    """
-    cached = _page_cache.get(url)
-    if cached is not None:
-        return cached
-
-    task = _enrich_inflight.get(url)
-    if task is None:
-        task = asyncio.create_task(_direct_enrich_fetch(url))
-        _enrich_inflight[url] = task
-
-    try:
-        return await asyncio.shield(task)
-    finally:
-        if _enrich_inflight.get(url) is task:
-            _enrich_inflight.pop(url, None)
 
 
 async def _render_with_flaresolverr(url: str) -> dict:

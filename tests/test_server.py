@@ -98,9 +98,9 @@ def test_fetch_page_description_explains_citation_anchors(server):
     assert "generated `cite-*` anchors" in desc
     assert "citation_url" in desc
 
-    search_desc = _tool_by_name(server, "search_web").description
-    assert "stable anchors" in search_desc
-    assert "citation_url" in search_desc
+    assert 'mode="structured"' in desc
+    assert "enrich_results" not in desc
+    assert "page_headings/page_toc" not in desc
 
 
 def test_fetch_page_schema_exposes_query_window_controls(server):
@@ -156,7 +156,11 @@ def test_search_web_schema_exposes_brave_caps(server):
     props = _tool_by_name(server, "search_web").to_mcp_tool().input_schema["properties"]
     assert str(ws.cfg.max_num_results) in props["num_results"]["description"]
     assert str(ws.cfg.max_context_tokens) in props["max_tokens"]["description"]
-    assert str(ws.cfg.max_enrich_results) in props["enrich_results"]["description"]
+    assert "enrich_results" not in props
+    description = _tool_by_name(server, "search_web").description
+    assert 'mode="structured"' in description
+    assert "page_headings" not in description
+    assert "page_toc" not in description
 
 
 def _tool_by_name(server, name):
@@ -365,9 +369,10 @@ def test_lifespan_cleanup_hook_failure_does_not_block_shutdown():
 def test_http_auth_fails_closed_without_token(monkeypatch):
     import server as server_mod
 
+    monkeypatch.setattr(server_mod.server_settings, "auth_tokens", [])
     monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
     monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", False)
-    with pytest.raises(SystemExit, match="MCP_AUTH_TOKEN"):
+    with pytest.raises(SystemExit, match="No bearer token is configured"):
         server_mod.configure_http_auth(object())
 
 
@@ -375,6 +380,7 @@ def test_http_auth_allows_explicit_unauthenticated(monkeypatch):
     import server as server_mod
 
     sentinel = object()
+    monkeypatch.setattr(server_mod.server_settings, "auth_tokens", [])
     monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
     monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", True)
     assert server_mod.configure_http_auth(sentinel) is sentinel
@@ -389,6 +395,23 @@ def test_http_auth_wraps_app_when_token_set(monkeypatch):
     wrapped = server_mod.configure_http_auth(sentinel)
     assert isinstance(wrapped, BearerAuthMiddleware)
     assert wrapped.app is sentinel
+
+
+def test_http_auth_installs_every_named_client(monkeypatch):
+    """Each configured token must reach the middleware with its name intact."""
+    import server as server_mod
+    from config import AuthToken
+
+    monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
+    monkeypatch.setattr(
+        server_mod.server_settings,
+        "auth_tokens",
+        [AuthToken(name="open-webui", token="one"), AuthToken(name="agent", token="two")],
+    )
+    assert server_mod.configure_http_auth(object()).client_names == (
+        "open-webui",
+        "agent",
+    )
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,9 @@ email tool is send-only.
 
 Built on [FastMCP v4](https://github.com/jlowin/fastmcp). The
 default transport is **streamable-http**, so the server is reachable over the
-network at `http://<host>:8000/mcp`.
+network at `http://<host>:8000/mcp`. Everything is configured from a single YAML
+file (`config.example.yaml` → `config.yaml`), which is bind-mounted into the
+container.
 
 ## Tools
 
@@ -20,14 +22,14 @@ network at `http://<host>:8000/mcp`.
 | **Place Search**       | `find_nearby_places`                  |
 | **Email**              | `send_email`                          |
 
-Each tool can be independently omitted from MCP registration with its
-`<TOOL_NAME>_ENABLED` environment variable. For example, set
-`SEARCH_WEB_ENABLED=false` and `FETCH_PAGE_ENABLED=false` to replace those two
-with third-party tools. The available flags are `SEARCH_WEB_ENABLED`,
-`FETCH_PAGE_ENABLED`, `GET_COMPANY_DATA_ENABLED`,
-`QUERY_WOLFRAM_ALPHA_ENABLED`, `FIND_NEARBY_PLACES_ENABLED`, and
-`SEND_EMAIL_ENABLED`. All default to `true`; restart the server after changing
-them.
+Each tool can be independently omitted from MCP registration with a flag in the
+config file's `tools:` section. For example, set `search_web_enabled: false` and
+`fetch_page_enabled: false` to replace those two with third-party tools. The
+available flags are `search_web_enabled`, `fetch_page_enabled`,
+`get_company_data_enabled`, `query_wolfram_alpha_enabled`,
+`find_nearby_places_enabled`, and `send_email_enabled` (as environment
+variables: `SEARCH_WEB_ENABLED`, `FETCH_PAGE_ENABLED`, …). All default to `true`;
+restart the server after changing them.
 
 Every tool is context-budget aware: list/range parameters are **maximums**, not
 fixed amounts. The model can request less per call, and anything above the
@@ -36,7 +38,7 @@ overwhelm a model's context window. Omitting a value uses the cap.
 
 ### Agentic Web Search
 
-`search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None, enrich_results=None)`
+`search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None)`
 — Search with Brave's [LLM Context API](https://api-dashboard.search.brave.com/documentation/services/llm-context),
 which returns relevance-ranked excerpts extracted from source pages for direct
 model consumption. Excerpts may contain text, tables, code, or JSON-serialized
@@ -50,8 +52,16 @@ published date, description, and site name. The top-level `provider` is
 (`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
 `num_results` controls the source-URL count and `max_tokens` controls the
 approximate total excerpt budget; both are clamped to configured server caps.
-`enrich_results` optionally fetches top sources directly to add heading anchors
-and a compact TOC (`0` skips this extra fetch).
+Search uses only Brave's excerpts and metadata; it does not fetch source pages.
+Call `fetch_page(url, mode="structured")` when you need a page outline, then use
+`section=` to read a specific section.
+
+Migration note: `enrich_results` and the settings
+`web_search.max_enrich_results`, `web_search.default_enrich_results`, and
+`web_search.enrich_max_bytes` have been removed. An old config file that still
+mentions them only logs a warning and starts anyway.
+`web_search.max_enrich_headings` remains as the historical name for fetch_page's
+heading cap; it does not enable search enrichment.
 
 Brave LLM Context does not expose result-page pagination or search categories.
 Put those constraints in the query instead—for example `site:youtube.com` for
@@ -65,7 +75,7 @@ of a single page (or a URL returned by `search_web`). Reads one URL per call —
 to read several pages, call the tool once per URL. `mode="text"` returns the
 page as markdown — headings, lists, tables, and hyperlinks (resolved to absolute URLs)
 are preserved, so the model sees the page's structure and can fetch a link it
-found in the content (set `WEB_SEARCH_MARKDOWN=false` for bare plain text).
+found in the content (set `web_search.markdown: false` for bare plain text).
 Prominent images are replaced at their original positions by explicit
 `[Image at this location: ...]` markers populated from page-provided alt text,
 captions, or image metadata; these are textual stand-ins, not visual analysis.
@@ -122,11 +132,11 @@ and Firecrawl follow redirects inside their own browsers — that request cannot
 be intercepted — but the provider-reported final URL is SSRF-checked and the
 body is discarded if it landed on a blocked host. To deliberately allow a
 trusted local/private target you host, list its host, IP, or CIDR in
-`WEB_SEARCH_SSRF_ALLOWLIST` (e.g. `localhost,127.0.0.1,10.0.0.0/8`).
+`web_search.ssrf_allowlist` (e.g. `[localhost, 127.0.0.1, 10.0.0.0/8]`).
 
-Concurrent `fetch_page` work is also bounded: `WEB_SEARCH_MAX_CONCURRENT_DIRECT_FETCHES`,
-`WEB_SEARCH_MAX_CONCURRENT_FLARESOLVERR`, `WEB_SEARCH_MAX_CONCURRENT_TIKA`, and
-`WEB_SEARCH_MAX_CONCURRENT_FIRECRAWL` cap in-flight sidecar/API calls so a model
+Concurrent `fetch_page` work is also bounded: `web_search.max_concurrent_direct_fetches`,
+`max_concurrent_flaresolverr`, `max_concurrent_tika`, and
+`max_concurrent_firecrawl` cap in-flight sidecar/API calls so a model
 that fans out many reads cannot stampede FlareSolverr or Tika.
 
 ### Stock Data
@@ -196,7 +206,7 @@ There is no separate YouTube tool — pass a YouTube video URL to `fetch_page` a
 it returns the video's transcript / closed captions instead of scraping the
 watch page, for summarizing, quoting, searching, or translating. Any YouTube URL
 form works (`watch`, `youtu.be`, `/shorts/`, `/embed/`, `/live/`). Preferred
-languages come from `YOUTUBE_DEFAULT_LANGUAGES` (falling back to any available
+languages come from `youtube.default_languages` (falling back to any available
 transcript). Transcripts are cached (they almost never change), and optional
 Webshare / generic proxy settings are supported for networks where YouTube
 blocks the server's IP. Folding this into `fetch_page` keeps the tool count low,
@@ -237,50 +247,109 @@ silently guessing a location.
 
 It uses the public OpenStreetMap APIs by default and honors Nominatim's
 [usage policy](https://operations.osmfoundation.org/policies/nominatim/): a
-descriptive `GEO_USER_AGENT` (set this!) and a ~1 req/sec throttle on the public
-API. To self-host, point `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL` at your own
-instances, clear `GEO_OVERPASS_FALLBACK_URLS` if queries must stay private, and
-set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`. Results are cached
+descriptive `geocoding.user_agent` (set this!) and a ~1 req/sec throttle on the
+public API. To self-host, point `geocoding.nominatim_url` /
+`geocoding.overpass_url` at your own instances, clear
+`geocoding.overpass_fallback_urls` if queries must stay private, and set
+`geocoding.min_request_interval_seconds: 0`. Results are cached
 (place data changes slowly), which also eases the rate limits.
 
 ## Configuration
 
-Every Open WebUI "valve" became an environment variable. Copy the example file
-and edit it:
+The whole server is configured by **one YAML file**. Copy the example and edit it:
 
 ```
-cp .env.example .env
+cp config.example.yaml config.yaml
 ```
 
-See [.env.example](https://github.com/madelponte/mcp-server/blob/main/.env.example)
-for the full list with defaults. Key things to set:
+[config.example.yaml](https://github.com/madelponte/mcp-server/blob/main/config.example.yaml)
+lists every setting with its default and a comment. Keep `config.yaml` out of git
+(it is `.gitignored`) — it holds API keys, the SMTP password, and the bearer
+tokens that gate the HTTP transports.
 
-- `WOLFRAM_APP_ID` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
-- `STOCK_FINNHUB_API_KEY` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
-- `STOCK_FMP_API_KEY` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
-- `WEB_SEARCH_BRAVE_API_KEY` — required for `search_web`; create a Search API subscription token at [Brave Search API](https://api.search.brave.com/). `WEB_SEARCH_BRAVE_API_URL`, localization/filter defaults, search candidate count, token budgets, and timeout are separately configurable. Calls are serialized with a default one-second quiet period (`WEB_SEARCH_BRAVE_REQUEST_DELAY_SECONDS`) for low-throughput plans; HTTP 429/502/503/504 and transient transport failures receive bounded exponential retries configured by `WEB_SEARCH_BRAVE_MAX_RETRIES` / `WEB_SEARCH_BRAVE_RETRY_BACKOFF_SECONDS`, honoring Brave's reset headers.
-- `WEB_SEARCH_FIRECRAWL_API_KEY` — optional `fetch_page` credential; enables the last-resort fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge. Firecrawl is not used by `search_web`.
-- `WEB_SEARCH_FIRECRAWL_HEDGE_ENABLED` / `WEB_SEARCH_FIRECRAWL_HEDGE_DELAY_SECONDS` — optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
-- `WEB_SEARCH_CLASSIFIER_API_URL` / `WEB_SEARCH_CLASSIFIER_MODEL` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `WEB_SEARCH_CLASSIFIER_API_KEY` supplies an optional bearer token.
-- `WEB_SEARCH_CIRCUIT_BREAKER_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
-- `WEB_SEARCH_REDDIT_CLIENT_ID` / `WEB_SEARCH_REDDIT_CLIENT_SECRET` / `WEB_SEARCH_REDDIT_USER_AGENT` — optional Reddit OAuth credentials; strongly recommended for reliable Reddit post/comment fetching. See [Reddit Data API setup](#reddit-data-api-setup).
-- `WEB_SEARCH_REDDIT_REQUEST_DELAY_SECONDS` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/HTML burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
-- `WEB_SEARCH_REDDIT_RATE_LIMIT_RETRY_SECONDS` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to old Reddit/oEmbed; `0` disables the retry. These throttling mitigations are not a substitute for OAuth on hosted-server IPs.
-- `WEB_SEARCH_SSRF_ALLOWLIST` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
-- `GEO_USER_AGENT` — for Geocoding & Places: set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `GEO_NOMINATIM_EMAIL` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `GEO_NOMINATIM_URL` / `GEO_OVERPASS_URL`, clear `GEO_OVERPASS_FALLBACK_URLS` when queries must stay private, and set `GEO_MIN_REQUEST_INTERVAL_SECONDS=0`.
-- `EMAIL_USERNAME` / `EMAIL_PASSWORD` — required for `send_email`. For Gmail,
-  `EMAIL_PASSWORD` must be a 16-character App Password, not the normal account
-  password. `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`, SMTP host/port/TLS, timeout,
-  and recipient/attachment caps are configurable. Set `EMAIL_ALLOWED_RECIPIENTS`
+Where the file is read from, first match wins:
+
+1. `$MCP_CONFIG_FILE` — an explicitly named file **must exist**; a typo fails at
+   startup instead of silently booting on defaults. This is what the Dockerfile
+   sets (`/app/config.yaml`) and what `docker-compose.yml` bind-mounts.
+2. `config.yaml` / `config.yml` next to `server.py` (the repo root).
+3. `/etc/mcp-server/config.yaml` — for a host-managed file mounted without
+   touching the compose file.
+
+Finding no file at all is fine: every setting has a default, and HTTP transports
+still refuse to start without a bearer token.
+
+### Layout, precedence, and environment overrides
+
+Settings are grouped into one section per tool group:
+
+| YAML section | Covers                                   | Env prefix    |
+| ------------ | ---------------------------------------- | ------------- |
+| `tools:`     | which tools get registered               | *(none)*      |
+| `server:`    | transport, logging, bearer auth          | `MCP_`        |
+| `web_search:`| `search_web` **and** `fetch_page`        | `WEB_SEARCH_` |
+| `stock:`     | `get_company_data`                       | `STOCK_`      |
+| `wolfram:`   | `query_wolfram_alpha`                    | `WOLFRAM_`    |
+| `youtube:`   | transcript retrieval inside `fetch_page` | `YOUTUBE_`    |
+| `geocoding:` | `find_nearby_places`                     | `GEO_`        |
+| `email:`     | `send_email`                             | `EMAIL_`      |
+
+Precedence for any single value is **process environment variable → YAML file →
+built-in default**. The variable name is the section's prefix plus the key in
+upper case, so the pre-YAML names keep working and a secret can stay out of the
+mounted file: `web_search.brave_api_key` ⇄ `WEB_SEARCH_BRAVE_API_KEY`,
+`geocoding.max_radius_m` ⇄ `GEO_MAX_RADIUS_M`, `tools.send_email_enabled` ⇄
+`SEND_EMAIL_ENABLED`. A variable set to an **empty** value counts as unset, so a
+stale `FOO=` inherited from a shell or image layer cannot wipe a YAML value.
+Nested/list settings such as `server.auth_tokens` are YAML-only.
+
+**Migrating from `.env`:** the server no longer loads `.env`, and Compose no
+longer passes it to the MCP container. Copy your values into the corresponding
+YAML sections, or explicitly inject overrides with Compose `environment:` /
+`env_file:` or Docker `--env-file`. Exported process variables still work even
+without a YAML file when running locally. The image requires its configured
+`MCP_CONFIG_FILE` mount unless that variable is explicitly cleared.
+
+About the format:
+
+- **Invalid values abort startup** with a message naming the section, the key,
+  and — when it came from the environment — the responsible variable. Caps are
+  range-constrained in `config.py`, so a misconfiguration fails at boot instead
+  of mid-request.
+- **Unknown keys are logged as warnings and ignored**, so a file kept from an
+  older release still starts a newer server. Duplicate keys (including alternate
+  case/hyphen spellings) are rejected instead of silently overwriting settings.
+- Settings that took comma-separated lists also accept YAML lists:
+  `geocoding.overpass_fallback_urls`, `web_search.ssrf_allowlist`,
+  `email.allowed_recipients`, `youtube.default_languages`. Entries must be
+  strings; quote language codes such as `"no"` that YAML interprets as booleans.
+- **Quote words YAML reads as booleans**: `brave_safesearch: "off"`, not
+  `brave_safesearch: off`. Bare `off`/`on`/`yes`/`no`/`true`/`false` are boolean
+  values in YAML, and the startup error says to quote them.
+
+Key things to set:
+
+- `server.auth_tokens` — at least one named bearer token, or the HTTP transports refuse to start. See [Authentication](#authentication).
+- `wolfram.app_id` — required for the Wolfram tool ([free AppID](https://developer.wolframalpha.com)).
+- `stock.finnhub_api_key` — recommended for Stock Data (improves name→ticker resolution and quote/profile coverage; everything falls back to keyless yfinance).
+- `stock.fmp_api_key` — optional [Financial Modeling Prep](https://financialmodelingprep.com) key; when set, financial statements (`financials` section) are sourced from FMP instead of yfinance.
+- `web_search.brave_api_key` — required for `search_web`; create a Search API subscription token at [Brave Search API](https://api.search.brave.com/). `brave_api_url`, localization/filter defaults, search candidate count, token budgets, and timeout are separately configurable. Calls are serialized with a default one-second quiet period (`brave_request_delay_seconds`) for low-throughput plans; HTTP 429/502/503/504 and transient transport failures receive bounded exponential retries configured by `brave_max_retries` / `brave_retry_backoff_seconds`, honoring Brave's reset headers.
+- `web_search.firecrawl_api_key` — optional `fetch_page` credential; enables the last-resort fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge. Firecrawl is not used by `search_web`. `firecrawl_hedge_enabled` / `firecrawl_hedge_delay_seconds` optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
+- `web_search.classifier_api_url` / `classifier_model` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `classifier_api_key` supplies an optional bearer token.
+- `web_search.circuit_breaker_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
+- `web_search.reddit_client_id` / `reddit_client_secret` / `reddit_user_agent` — optional Reddit OAuth credentials; strongly recommended for reliable Reddit post/comment fetching. See [Reddit Data API setup](#reddit-data-api-setup).
+- `web_search.reddit_request_delay_seconds` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/HTML burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
+- `web_search.reddit_rate_limit_retry_seconds` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to old Reddit/oEmbed; `0` disables the retry. These throttling mitigations are not a substitute for OAuth on hosted-server IPs.
+- `web_search.ssrf_allowlist` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
+- `geocoding.user_agent` — set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `nominatim_email` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `nominatim_url` / `overpass_url`, clear `overpass_fallback_urls` when queries must stay private, and set `min_request_interval_seconds: 0`.
+- `email.username` / `email.password` — required for `send_email`. For Gmail,
+  `password` must be a 16-character App Password, not the normal account
+  password. `from_address`, `from_name`, SMTP host/port/TLS, timeout, and
+  recipient/attachment caps are configurable. Set `email.allowed_recipients`
   (addresses and/or domains) on any network-exposed server. Attachments stay off
-  until `EMAIL_ATTACHMENT_ROOT` points at a directory the tool may read.
-- `WEB_SEARCH_MAX_CONCURRENT_*` — in-flight caps for direct fetches, FlareSolverr,
+  until `email.attachment_root` points at a directory the tool may read.
+- `web_search.max_concurrent_*` — in-flight caps for direct fetches, FlareSolverr,
   Tika, and Firecrawl (defaults 8 / 2 / 2 / 2).
-
-Provider variables are grouped by prefix: `MCP_` (server), `WEB_SEARCH_`,
-`STOCK_`, `WOLFRAM_`, `YOUTUBE_`, `GEO_`, `EMAIL_`. Tool availability uses the
-exact MCP tool name followed by `_ENABLED` (for example,
-`SEARCH_WEB_ENABLED=false`).
 
 ### Reddit Data API setup
 
@@ -298,16 +367,17 @@ Reddit's approval and rate limits:
    valid URL such as `http://localhost:8080`.
 5. Copy the short value displayed beneath the application name as the client ID,
    and copy the value labeled `secret` as the client secret.
-6. Add the credentials to `.env`, replacing `your_username` with the owning
-   Reddit username:
+6. Add the credentials to the `web_search:` section of `config.yaml`, replacing
+   `your_username` with the owning Reddit username:
 
-   ```dotenv
-   WEB_SEARCH_REDDIT_CLIENT_ID=your_client_id
-   WEB_SEARCH_REDDIT_CLIENT_SECRET=your_client_secret
-   WEB_SEARCH_REDDIT_USER_AGENT=linux:mcp-server:1.0 (by /u/your_username)
+   ```yaml
+   web_search:
+     reddit_client_id: "your_client_id"
+     reddit_client_secret: "your_client_secret"
+     reddit_user_agent: "linux:mcp-server:1.0 (by /u/your_username)"
    ```
 
-7. Restart the MCP server. Do not commit `.env` or expose the client secret.
+7. Restart the MCP server. Do not commit `config.yaml` or expose the client secret.
 
 The server exchanges these credentials for a short-lived application-only OAuth
 token, caches it until shortly before expiration, and sends requests to
@@ -321,13 +391,13 @@ the [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875
 sends a plain-text email through the configured SMTP account. It is send-only:
 it cannot read, list, or delete mailbox contents. `recipients`, `cc`, and `bcc`
 are lists of email addresses; BCC recipients are included in the SMTP envelope
-but not written into message headers. Set `EMAIL_ALLOWED_RECIPIENTS` to a list of
+but not written into message headers. Set `email.allowed_recipients` to a list of
 addresses and/or domains so a prompt-injected model cannot mail arbitrary people;
 when that list is set, To/Cc/Bcc/Reply-To outside it are rejected. Attachments
-are disabled unless `EMAIL_ATTACHMENT_ROOT` is set; paths must stay inside that
+are disabled unless `email.attachment_root` is set; paths must stay inside that
 directory (symlink escapes are rejected), and the result reports only the
 filename, not the resolved filesystem path. Counts are still capped by
-`EMAIL_MAX_ATTACHMENTS` and `EMAIL_MAX_ATTACHMENT_BYTES`.
+`email.max_attachments` and `email.max_attachment_bytes`.
 
 The result reports `status` (`sent` or `partial`), intended recipients by field,
 attempted recipients, accepted recipients, refused recipients with SMTP codes and
@@ -337,7 +407,7 @@ raise tool errors instead of being returned as successful sends.
 
 ### Debug mode
 
-Set `MCP_DEBUG=true` to enable debug mode: tool responses are serialized as
+Set `server.debug: true` to enable debug mode: tool responses are serialized as
 indented, human-readable JSON (instead of compact JSON) and each tool call emits
 verbose per-call logs to stdout. Reddit `fetch_page` results also append a
 redacted fallback trace to `note`, showing whether OAuth JSON, RSS, old Reddit,
@@ -348,9 +418,9 @@ window.
 ### Tool-catalog caching
 
 FastMCP 4 advertises that opted-in modern clients may reuse the static MCP
-component catalog for `MCP_TOOL_CATALOG_CACHE_TTL_SECONDS` (default 300 seconds),
-reducing repeated `tools/list` round trips. Set it to `0` to disable the hint.
-`MCP_TOOL_CATALOG_CACHE_SCOPE` defaults to `public` because every authenticated
+component catalog for `server.tool_catalog_cache_ttl_seconds` (default 300
+seconds), reducing repeated `tools/list` round trips. Set it to `0` to disable
+the hint. `server.tool_catalog_cache_scope` defaults to `public` because every authenticated
 caller currently sees the same tools; use `private` if visibility ever varies by
 caller. These settings do **not** cache tool-call results—the provider-specific
 TTL caches remain separate.
@@ -362,7 +432,7 @@ model — Open WebUI, for example, forces an `mcp_` prefix, so `fetch_page` appe
 to the model as `mcp_fetch_page`. The server keeps its tool names **bare**
 (prefixing them here too would double it, e.g. `mcp_mcp_fetch_page`), but a few
 docstrings point one tool at another (e.g. `search_web` tells the model to use
-`fetch_page` to read a result). `MCP_TOOL_PREFIX` is the prefix spliced into
+`fetch_page` to read a result). `server.tool_prefix` is the prefix spliced into
 those cross-references so they match what the model actually sees. It defaults to
 blank (no prefix); set it to `mcp_` when serving Open WebUI, or to whatever
 prefix your client adds. The value is inserted verbatim, so include any trailing
@@ -370,24 +440,41 @@ separator (e.g. the `_`).
 
 ### Authentication
 
-HTTP transports **require** `MCP_AUTH_TOKEN`. Clients must send an
+HTTP transports **require at least one bearer token**. Clients must send an
 `Authorization: Bearer <token>` header; anything else gets a `401`. Starting
-streamable-http or SSE without a token is a startup error. Set
-`MCP_ALLOW_UNAUTHENTICATED=true` only for a tightly firewalled local setup (the
-server logs a warning in that case). The token is ignored for the `stdio`
+streamable-http or SSE with no token configured is a startup error. Set
+`server.allow_unauthenticated: true` only for a tightly firewalled local setup
+(the server logs a warning in that case). Tokens are ignored for the `stdio`
 transport, which has no network surface.
 
-Generate a strong token, e.g.:
+Tokens are **named**, one entry per client (or per trust boundary):
+
+```yaml
+server:
+  auth_tokens:
+    - name: open-webui
+      token: "9f1c…"   # openssl rand -hex 32
+    - name: claude-desktop
+      token: "a77b…"
+```
+
+Any listed token authenticates, and the matched name is logged with the request
+at DEBUG level (enable `server.debug` or set `server.log_level: DEBUG`), so you
+can tell clients apart in `docker logs`. Revoke one credential by deleting its
+entry and restarting — without resetting anybody else's. Names are
+not secrets, must be unique, and a blank token is a startup error rather than an
+empty credential. Each token is compared against every configured entry with a
+constant-time compare.
+
+Generate a strong token per client:
 
 ```
 openssl rand -hex 32
 ```
 
-and put it in your `.env`:
-
-```
-MCP_AUTH_TOKEN=<your-generated-token>
-```
+The single-token `server.auth_token` field (and the `MCP_AUTH_TOKEN` environment
+variable) still work and appear in the log as a client named `default`; prefer
+`auth_tokens` once you have more than one client.
 
 > Open WebUI per-user valves and UI-only behaviors that don't apply to MCP were
 > dropped: status/progress events, citation events, the Wolfram HTML result
@@ -399,17 +486,33 @@ MCP_AUTH_TOKEN=<your-generated-token>
 The compose file starts the server plus the local services used by `fetch_page`:
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (Cloudflare
 fallback) and [Apache Tika](https://tika.apache.org/) (document text extraction).
-Sidecar images are digest-pinned (Tika 4.0.0 minimal, FlareSolverr v3.5.0);
-bump the digest when you intentionally upgrade. `search_web` uses Brave's hosted
-API and requires `WEB_SEARCH_BRAVE_API_KEY`. HTTP mode also requires
-`MCP_AUTH_TOKEN` in `.env`:
+The supplied Compose file uses published images with `latest` tags; pin tags or
+digests yourself if you need reproducible deployments. `search_web` uses Brave's hosted
+API and requires `web_search.brave_api_key`. HTTP mode also requires at least one
+`server.auth_tokens` entry. The container reads its configuration from
+`./config.yaml`, bind-mounted read-only at `/app/config.yaml`:
 
 ```
-cp .env.example .env        # then edit it
-docker compose up --build
+cp config.example.yaml config.yaml   # then edit it
+docker compose up -d
 ```
 
 The MCP endpoint is then available at `http://localhost:8000/mcp`.
+
+The server process runs as uid 10001, so `config.yaml` must be world-readable or
+otherwise readable by that uid. On a Linux host, either:
+
+```
+sudo setfacl -m u:10001:r config.yaml   # keep 0600 for the owner
+chmod 644 config.yaml                   # simpler, but any local user can read it
+```
+
+A missing or unreadable `config.yaml` is a startup failure, not a silent fall
+back to defaults; Compose will not create a directory in place of the file.
+After editing configuration, run `docker compose up -d --force-recreate mcp-server`
+to reload it. Recreating also refreshes a single-file bind mount when an editor
+replaces the file atomically. Compose uses the published server image; to test
+local source changes, build and run your own image as shown below.
 
 If you don't need `fetch_page`, delete the `flaresolverr` / `tika` services (and
 the `depends_on` block) from `docker-compose.yml`. The stock, Wolfram,
@@ -420,31 +523,41 @@ need API keys, SMTP credentials, or internet access.
 
 ```
 docker build -t openwebui-tools-mcp .
-docker run --rm -p 8000:8000 --env-file .env openwebui-tools-mcp
+docker run --rm -p 8000:8000 \
+  -v "$PWD/config.yaml:/app/config.yaml:ro" \
+  openwebui-tools-mcp
 ```
+
+The image expects its configuration at `/app/config.yaml` (`MCP_CONFIG_FILE`), so
+the mount is required; override that variable to read the file from another path.
+Never add `config.yaml` to the image — it holds credentials (it is already in
+`.dockerignore`).
 
 ## Run locally (no Docker)
 
 ```
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then edit it
+cp config.example.yaml config.yaml   # then edit it
 python server.py
 ```
 
-Set `MCP_TRANSPORT=stdio` to run as a stdio MCP server instead (useful for
-clients that spawn the process directly rather than connecting over HTTP). Or
-`MCP_TRANSPORT=sse` for SSE (Server-Sent Events) transport.
+`config.yaml` next to `server.py` is found automatically, whichever directory you
+start the process from. Set `server.transport: stdio` (or `MCP_TRANSPORT=stdio`)
+to run as a stdio MCP server instead — useful for clients that spawn the process
+directly rather than connecting over HTTP — or `sse` for Server-Sent Events
+transport. stdio has no network surface, so no token is required.
 
 ## Connecting a client
 
 For an HTTP client, point it at `http://<host>:8000/mcp` (streamable-http). For
 example, a Claude Desktop / generic client config using a stdio bridge or native
-streamable-http support would reference that URL. If `MCP_AUTH_TOKEN` is set,
-configure the client to send an `Authorization: Bearer <token>` header (most MCP
-clients expose a "headers" or "auth token" field for HTTP servers). For stdio
-mode, configure the client to launch `python server.py` with the environment
-variables set.
+streamable-http support would reference that URL. Give each client its own
+`server.auth_tokens` entry and configure it to send an `Authorization: Bearer
+<token>` header (most MCP clients expose a "headers" or "auth token" field for
+HTTP servers) — that is what makes the two of them distinguishable in the log.
+For stdio mode, configure the client to launch `python server.py`; it reads the
+same `config.yaml` (point `MCP_CONFIG_FILE` at it if it lives elsewhere).
 
 ## License
 

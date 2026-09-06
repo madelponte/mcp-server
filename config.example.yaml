@@ -1,0 +1,397 @@
+# =============================================================================
+# MCP server — configuration file.
+#
+# Copy to `config.yaml` (next to this file, i.e. the repo root / /app in the
+# image) and fill in what you use. Every key shown is optional and carries the
+# default value; delete anything you are happy with.
+#
+#   Docker Compose   bind-mounted read-only at /app/config.yaml (see
+#                    docker-compose.yml).
+#   Docker           docker run -v "$PWD/config.yaml:/app/config.yaml:ro" ...
+#   Local            ./config.yaml is picked up automatically; MCP_CONFIG_FILE
+#                    overrides the location (an explicitly named file must exist).
+#   stdio clients    the same file, since it is read the same way.
+#
+# Precedence for any single value: process environment variable > this file >
+# built-in default. The variable name is the section's prefix plus the key in
+# upper case (WEB_SEARCH_BRAVE_API_KEY, GEO_MAX_RADIUS_M, STOCK_FINNHUB_API_KEY,
+# SEARCH_WEB_ENABLED, ...), so a secret can stay out of the file. A variable set
+# to an empty value counts as unset. Nested/list fields (auth_tokens) are
+# YAML-only. The server no longer reads .env automatically.
+#
+# Unknown keys are logged as warnings and ignored, so a file kept from an older
+# release still starts. Invalid values (an out-of-range cap, a bad port) abort
+# startup with a message naming the section and key. Duplicate keys are errors.
+# YAML list entries must be strings; quote boolean words such as "no".
+# Restart after changes; for Compose, recreate the container to refresh a file
+# replaced atomically by your editor: docker compose up -d --force-recreate mcp-server
+#
+# YAML gotcha: bare off / on / yes / no / true / false are booleans, not words.
+# Textual settings whose value happens to be one of those must be quoted —
+# e.g. brave_safesearch: "off" (below), or startup fails with a type error.
+# =============================================================================
+
+tools:
+  # Register each MCP tool independently; a disabled tool is absent from
+  # tools/list entirely. Changes take effect on restart.
+  search_web_enabled: true
+  fetch_page_enabled: true
+  get_company_data_enabled: true
+  query_wolfram_alpha_enabled: true
+  find_nearby_places_enabled: true
+  send_email_enabled: true
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  # streamable-http (recommended, network accessible), sse, or stdio.
+  transport: streamable-http
+  log_level: INFO
+  # Debug mode: tools return indented JSON instead of the compact default, and
+  # every tool call is logged with its arguments. Forces the effective log level
+  # to DEBUG regardless of log_level above. Leave false in production.
+  debug: false
+
+  # Named bearer credentials, one per client (or per trust boundary). Any listed
+  # token authenticates, and the name is logged with each request at DEBUG level,
+  # so clients stay distinguishable. Revoke one credential by editing this file
+  # and restarting without touching the others. Generate one per client:  openssl rand -hex 32
+  # HTTP transports refuse to start while this list is empty, unless
+  # allow_unauthenticated below is true. Ignored by the stdio transport.
+  # (Uncomment and fill in — a blank token is rejected at startup rather than
+  # silently accepting an empty credential.)
+  # auth_tokens:
+  #   - name: open-webui
+  #     token: "9f1c...64 hex chars"
+  #   - name: claude-desktop
+  #     token: "a77b...64 hex chars"
+  #   - name: internal-agent
+  #     token: "3d02...64 hex chars"
+
+  # Legacy single shared token, equivalent to one entry above named "default".
+  # Prefer auth_tokens once you have more than one client. MCP_AUTH_TOKEN also
+  # still works and folds in here.
+  auth_token: ""
+
+  # Start streamable-http / sse with no token at all. Only for a tightly
+  # firewalled local setup; the server logs a warning when it does.
+  allow_unauthenticated: false
+
+  # Prefix your MCP client prepends to tool names when it shows them to the
+  # model (Open WebUI forces "mcp_"). The server does NOT rename its own tools —
+  # this is only spliced into docstrings where one tool points at another, so
+  # those references read as "mcp_fetch_page" and match what the model sees.
+  # Include the trailing separator. Blank = no prefix; use "mcp_" for Open WebUI.
+  tool_prefix: ""
+
+  # FastMCP cache hints let opted-in clients reuse the static tools/list catalog
+  # without another round trip. This does NOT cache tool-call results. TTL 0
+  # disables the hint. "public" is safe while every caller sees the same catalog;
+  # use "private" if tool visibility ever varies by client.
+  tool_catalog_cache_ttl_seconds: 300
+  tool_catalog_cache_scope: public
+
+# ------------------------- Agentic Web Search --------------------------------
+# The web_search section covers both search_web and fetch_page.
+
+web_search:
+  # --- search_web: Brave LLM Context ---------------------------------------
+  # Create a Search API subscription token at https://api.search.brave.com/.
+  # Required for search_web; sent in the X-Subscription-Token header.
+  brave_api_url: "https://api.search.brave.com/res/v1/llm/context"
+  brave_api_key: ""
+  # Defaults used when the model omits Brave-native localization/filter options.
+  # country is a supported two-letter code. Blank safesearch/threshold values let
+  # Brave use its endpoint defaults.
+  brave_country: US
+  brave_search_lang: en
+  # Blank/all, day/week/month/year (or pd/pw/pm/py), or YYYY-MM-DD to YYYY-MM-DD.
+  brave_freshness: ""
+  # Blank, "off", moderate, or strict. Quote it: bare off is a YAML boolean.
+  brave_safesearch: ""
+  # Blank, strict, balanced, lenient, or disabled.
+  brave_context_threshold_mode: ""
+  # Search candidates Brave considers before selecting the returned source URLs.
+  brave_search_count: 20
+  # Maximum excerpt-token budget the model may request; omission uses this cap.
+  max_context_tokens: 8192
+  # Maximum excerpt tokens Brave may retain from one source URL.
+  brave_max_tokens_per_url: 4096
+  brave_timeout_seconds: 30
+  # Serialize Brave calls and wait this long after each completed call. The
+  # default protects one-request-per-second plans; set 0 for a higher-throughput
+  # plan.
+  brave_request_delay_seconds: 1
+  # Retry HTTP 429/502/503/504 and transient transport failures this many times.
+  # Retry-After / X-RateLimit-Reset are honored; otherwise delays start here and
+  # double after each retry.
+  brave_max_retries: 2
+  brave_retry_backoff_seconds: 1
+  # MAXIMUM number of source URLs to return. The model asks for fewer per call.
+  max_num_results: 5
+
+  # --- fetch_page: HTML rendering and last-resort scraping ------------------
+  # HTML pages are rendered through FlareSolverr first; direct HTTP is kept for
+  # documents, JSON/XML, plain text, and unsupported binary files. Blank disables
+  # the browser path (direct fetching only).
+  flaresolverr_url: "http://flaresolverr:8191"
+  flaresolverr_timeout_ms: 60000
+  # When Firecrawl is configured, bound the browser attempt so the sequential
+  # fallback can still complete inside a typical MCP request timeout.
+  flaresolverr_attempt_timeout_seconds: 20
+  # Firecrawl is the last-resort fallback when a FlareSolverr render is
+  # blocked/unusable, or when a known-document URL returns an HTML challenge
+  # instead of document bytes. Create a key at https://www.firecrawl.dev/; blank
+  # disables the fallback.
+  firecrawl_api_url: "https://api.firecrawl.dev/v2/scrape"
+  firecrawl_api_key: ""
+  firecrawl_timeout_seconds: 60
+  # Optionally start Firecrawl while a slow FlareSolverr render is still running.
+  # Disabled by default because a cancelled remote scrape may still consume
+  # credits.
+  firecrawl_hedge_enabled: false
+  firecrawl_hedge_delay_seconds: 8
+  # Optional OpenAI-compatible classifier for pages the deterministic quality
+  # gate cannot confidently classify. Both api_url and model must be set. The URL
+  # may be an API base (e.g. http://ollama:11434/v1) or a /chat/completions
+  # endpoint.
+  classifier_api_url: ""
+  classifier_api_key: ""
+  classifier_model: ""
+  classifier_timeout_seconds: 5
+  classifier_max_input_chars: 8000
+  classifier_min_confidence: 0.7
+  # Repeated failed FlareSolverr renders on one host temporarily route that host
+  # straight to Firecrawl (only when Firecrawl is configured).
+  circuit_breaker_enabled: true
+  circuit_breaker_failure_threshold: 3
+  circuit_breaker_window_seconds: 300
+  circuit_breaker_ttl_seconds: 300
+  # Process-wide in-flight caps so a model that fans out many fetches cannot
+  # stampede FlareSolverr, Tika, Firecrawl, or the direct-fetch pool.
+  max_concurrent_direct_fetches: 8
+  max_concurrent_flaresolverr: 2
+  max_concurrent_tika: 2
+  max_concurrent_firecrawl: 2
+
+  # --- fetch_page: document extraction -------------------------------------
+  # Apache Tika handles PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB.
+  tika_url: "http://tika:9998"
+  tika_timeout_seconds: 90
+  # no_ocr (fast, embedded text only) | auto | ocr_and_text_extraction | ocr_only
+  tika_ocr_strategy: no_ocr
+
+  # --- fetch_page: transport, limits, and caching ---------------------------
+  http_timeout_seconds: 25
+  # Lightweight direct resource-type probe. If an ordinary page does not return
+  # headers in time, fetch_page proceeds to FlareSolverr instead of failing.
+  direct_probe_timeout_seconds: 5
+  # Max bytes one fetch_page response may download before it is aborted
+  # (0 = unbounded). The 100 MiB default accommodates image-heavy documents.
+  max_download_bytes: 104857600
+  verify_ssl: true
+  # UA sent with direct fetches (and by search_web).
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  # Optional Reddit Data API OAuth. When all three are set, fetch_page tries the
+  # authenticated JSON API before RSS, old.reddit HTML, and oEmbed fallbacks.
+  # Setup steps are in README.md; never commit the secret.
+  reddit_client_id: ""
+  reddit_client_secret: ""
+  # Required by Reddit for OAuth clients; replace the username and keep it honest.
+  reddit_user_agent: ""
+  # Serialize Reddit acquisitions with this quiet period between calls to reduce
+  # anonymous RSS/HTML burst throttling (OAuth is still strongly recommended).
+  # 0 disables queueing.
+  reddit_request_delay_seconds: 1
+  # On HTTP 429, wait this long and retry the RSS representation once. 0 goes
+  # straight to the old.reddit/oEmbed fallbacks.
+  reddit_rate_limit_retry_seconds: 3
+  # fetch_page refuses URLs resolving to non-public addresses. Allowlist only
+  # trusted local/private hosts, IPs, or CIDRs (redirect targets are checked too).
+  # A YAML list or a comma-separated string both work.
+  # ssrf_allowlist:
+  #   - localhost
+  #   - 192.168.1.50
+  #   - 10.0.0.0/8
+  ssrf_allowlist: ""
+  # Cache raw accepted pages for repeated reads within an agent loop.
+  cache_ttl_seconds: 300
+  cache_max_entries: 128
+  # Max raw size of one cached page; 0 disables the per-item bound.
+  cache_max_item_bytes: 5242880
+
+  # --- fetch_page: output shape --------------------------------------------
+  # Markdown keeps headings, lists, tables, and absolute links. False gives the
+  # older structure-free plain text.
+  markdown: true
+  # Content is truncated here and the result reports a next_offset to re-request
+  # the remainder from.
+  max_page_chars: 15000
+  # Prominent image placeholders per HTML page; 0 strips images.
+  max_image_descriptions: 10
+  # Cap on headings in structured/section responses. Historical name: it used to
+  # size search-result enrichment, which no longer exists.
+  max_enrich_headings: 25
+  # Query filtering defaults/caps. The model can ask for fewer surrounding lines
+  # and match windows per call; larger requests are clamped to these bounds.
+  query_context_segments: 2
+  max_query_context_lines: 8
+  max_query_matches: 10
+
+# ----------------------------- Stock Data ------------------------------------
+stock:
+  # Finnhub is the recommended primary provider (free key, 60 calls/min): it
+  # improves name→ticker resolution and quote/profile coverage.
+  finnhub_api_key: ""
+  # Optional Financial Modeling Prep key; when set, the financials section is
+  # sourced from FMP instead of yfinance.
+  fmp_api_key: ""
+  # auto | finnhub | yfinance | fmp
+  default_provider: auto
+  # auto | fmp | yfinance | finnhub
+  financials_provider: auto
+  prefer_yfinance_fallback: true
+  request_timeout: 15
+  # Cache responses this many seconds (0 disables).
+  cache_ttl_seconds: 60
+  # The max_* values below are upper bounds, not fixed amounts. get_company_data
+  # lets the model request a smaller range per call (periods / news_items /
+  # insider_weeks / history_bars); anything larger is clamped so a response
+  # cannot blow up its context window, and omitting an amount uses the cap.
+  # Max tickers/names one call reads when passed a list (extras are skipped).
+  # This number is stated to the model in the tool description.
+  max_symbols: 2
+  max_news_items: 5
+  # Max days of company news the "news" section can look back on.
+  max_news_lookback_days: 30
+  # Max periods for the financials section (income/balance/cashflow).
+  max_financial_periods: 4
+  # Max periods for the earnings section.
+  max_earnings_periods: 8
+  # Max weeks of insider buying/selling the "insiders" section can look back on.
+  max_insider_lookback_weeks: 12
+  # Max OHLC bars the price_history section can return at the chosen interval.
+  max_history_bars: 30
+  # Server-side size caps for sections whose natural length is open-ended (not
+  # model-tunable): peer tickers, dividend payments/splits (newest first), and
+  # top institutional holders.
+  max_peers: 15
+  max_dividend_events: 24
+  max_institutional_holders: 10
+
+# ---------------------------- Wolfram Alpha ----------------------------------
+wolfram:
+  # Required for the Wolfram tool. Free AppID: https://developer.wolframalpha.com
+  app_id: ""
+  # metric | nonmetric
+  default_units: metric
+  max_chars: 6800
+  http_timeout_seconds: 30
+  # Results are deterministic per (input, assumption, units), so a long TTL is
+  # safe and lets a re-asked computation skip the network (0 disables).
+  cache_ttl_seconds: 3600
+  cache_max_entries: 256
+
+# ------------------------- YouTube transcripts -------------------------------
+# Served by fetch_page when it is given a YouTube video URL.
+youtube:
+  # Comma-separated string or a YAML list, in priority order.
+  default_languages: en
+  include_timestamps: false
+  # Truncate transcripts to this many characters (0 = no limit).
+  max_characters: 0
+  # Transcripts almost never change, so a long TTL (default 24h) is safe.
+  cache_ttl_seconds: 86400
+  cache_max_entries: 256
+  # Optional residential proxy, needed if YouTube blocks the server IP (common on
+  # cloud hosts).
+  webshare_proxy_username: ""
+  webshare_proxy_password: ""
+  # Generic HTTP/SOCKS proxy URL, used only when the Webshare fields are empty.
+  http_proxy_url: ""
+
+# --------------------- Geocoding & Place Search (OSM) ------------------------
+geocoding:
+  # Backends. Defaults are the public OpenStreetMap APIs. To self-host, point
+  # these at your own deployments (and set min_request_interval_seconds to 0).
+  nominatim_url: "https://nominatim.openstreetmap.org"
+  overpass_url: "https://overpass-api.de/api/interpreter"
+  # Failover endpoints for transient timeout/429/502/503/504 responses. Clear it
+  # when self-hosting if queries must never leave your server. List or string.
+  overpass_fallback_urls: "https://overpass.openstreetmap.fr/api/interpreter"
+  # Nominatim's usage policy REQUIRES a descriptive User-Agent identifying your
+  # app (a generic browser UA is not allowed). Customize it, ideally with contact
+  # info.
+  user_agent: "openwebui-tools-mcp/1.0 (OpenStreetMap geocoding; +https://github.com/madelponte/mcp-server)"
+  # Optional contact address passed to Nominatim (recommended by the policy, so
+  # they can reach you before blocking heavy use).
+  nominatim_email: ""
+  # Preferred result language (sent as Accept-Language).
+  language: en
+  http_timeout_seconds: 20
+  # Also written into the Overpass query's [timeout:N] so the server stops its own
+  # work in time.
+  overpass_timeout_seconds: 30
+  # Minimum seconds between OpenStreetMap requests. Nominatim and Overpass share
+  # one throttle (the public APIs cap aggressive callers). 0 disables it when
+  # self-hosting.
+  min_request_interval_seconds: 1
+  # The max_* / default_* values are caps plus defaults: the model may request
+  # fewer per call, and anything larger is clamped so a response can't blow up its
+  # context window.
+  max_nearby_results: 20
+  default_nearby_results: 8
+  # Search radius in meters: the default when unspecified, and the cap.
+  default_radius_m: 1500
+  max_radius_m: 20000
+  # Every POI search also returns a "nearby towns" companion list to seed
+  # follow-up searches in neighbouring municipalities. max is also the default;
+  # the town radius is larger because satellite towns sit well outside a core.
+  max_nearby_towns: 10
+  nearby_towns_radius_m: 40000
+  # Max candidate places a place_details lookup returns (top match + alternatives).
+  max_place_matches: 5
+  # Safety cap on elements fetched from Overpass before sorting by distance and
+  # trimming to the requested count (bounds dense areas).
+  overpass_max_elements: 120
+  # Place data changes slowly, so a long TTL is safe and eases the rate limits.
+  cache_ttl_seconds: 86400
+  cache_max_entries: 256
+
+# ------------------------------- Email ---------------------------------------
+# Send-only tool. Defaults target Gmail, which requires an APP PASSWORD, not your
+# normal password: enable 2-Step Verification, create one at
+# https://myaccount.google.com/apppasswords, and put the 16-character value in
+# password below.
+email:
+  smtp_host: smtp.gmail.com
+  # 465 with SSL (use_ssl: true) or 587 with STARTTLS (use_ssl: false).
+  smtp_port: 465
+  use_ssl: true
+  # Your full Gmail address and 16-character App Password. Both are required for
+  # the tool to work.
+  username: ""
+  password: ""
+  # From address (defaults to username when blank). For Gmail it must be your own
+  # address or a verified alias. from_name is the optional display name.
+  from_address: ""
+  from_name: ""
+  timeout_seconds: 30
+  # Max recipients one send_email call will deliver to; extras are dropped and
+  # reported rather than sent. A guard against an unbounded fan-out.
+  max_recipients: 25
+  # Max local files per call, and max bytes each may be.
+  max_attachments: 5
+  max_attachment_bytes: 10485760
+  # Recipient allowlist (addresses and/or domains, e.g. you@example.com,
+  # example.com, @corp.com). When set, To/Cc/Bcc/Reply-To outside it are
+  # rejected. Blank allows ANY address — set this on any network-exposed server so
+  # a prompt-injected model cannot mail arbitrary people. List or string.
+  # allowed_recipients:
+  #   - you@example.com
+  #   - corp.com
+  allowed_recipients: ""
+  # Directory attachments may be read from. Blank disables attachments entirely,
+  # so a prompt-injected model cannot exfiltrate local files. Relative paths are
+  # resolved inside it; absolute paths and symlink escapes are rejected.
+  attachment_root: ""

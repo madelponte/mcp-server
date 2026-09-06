@@ -6,9 +6,11 @@ helper, or routes httpx through an in-memory ``MockTransport``. Async tool code
 is driven with :func:`run` (a thin ``asyncio.run`` wrapper) so no async pytest
 plugin is required.
 
-Settings are loaded from the repo ``.env`` like in production, so tests never
-assume a particular configured value — they read caps from the live ``cfg`` at
-runtime, or monkeypatch the specific attribute they depend on.
+Settings are loaded from the repo ``config.yaml`` when one exists, exactly as in
+production, so tests never assume a particular configured value — they read caps
+from the live ``cfg`` at runtime, or monkeypatch the specific attribute they
+depend on. Tests of the loading logic itself pass an explicit file and env
+mapping (see test_config.py) and never touch the deployment's own file.
 """
 
 import asyncio
@@ -41,7 +43,7 @@ def make_mock_async_client_cls(handler):
 
 @pytest.fixture(autouse=True)
 def _reset_shared_clients():
-    """Drop shared async clients and in-flight fetch maps between tests.
+    """Drop shared async clients and capacity limiters between tests.
 
     `web_fetch` reuses one `httpx.AsyncClient` per `verify` setting for keep-alive.
     Tests build that client lazily under a patched `httpx.AsyncClient` (a fresh
@@ -54,7 +56,6 @@ def _reset_shared_clients():
     from tools import wolfram_alpha
 
     web_fetch._fetch_clients.clear()
-    web_fetch._enrich_inflight.clear()
     web_fetch._capacity_limiters.clear()
     web_fetch._tika_sema = None
     web_fetch._tika_sema_total = None
@@ -63,7 +64,6 @@ def _reset_shared_clients():
     wolfram_alpha._http_clients.clear()
     yield
     web_fetch._fetch_clients.clear()
-    web_fetch._enrich_inflight.clear()
     web_fetch._capacity_limiters.clear()
     web_fetch._tika_sema = None
     web_fetch._tika_sema_total = None
@@ -92,8 +92,8 @@ def server():
     """The real MCP server with every tool enabled for tool-level tests.
 
     Availability itself is covered in test_server.py. Forcing the flags here
-    keeps the rest of the suite deterministic when a developer's local .env
-    intentionally disables one or more tools.
+    keeps the rest of the suite deterministic when a developer's local
+    config.yaml intentionally disables one or more tools.
     """
     from server import build_server, tool_settings
 

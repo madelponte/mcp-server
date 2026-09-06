@@ -1,6 +1,5 @@
-"""Tests for tools/web_fetch.py — block detection, Tika routing, SSRF guard."""
+"""Tests for tools/web_fetch.py — transport, Tika routing, SSRF guard."""
 
-import asyncio
 import json
 import socket
 
@@ -10,7 +9,6 @@ import pytest
 import tools.web_fetch as web_fetch
 from tools.cache import TTLCache
 from tools.web_fetch import (
-    _is_blocked_response,
     _chromium_network_error_code,
     _is_image_resource,
     _is_tika_document,
@@ -25,77 +23,6 @@ from tools.web_fetch import (
     SSRFError,
 )
 from conftest import run
-
-
-# --------------------------- block detection ---------------------------
-
-def test_429_is_always_blocked():
-    assert _is_blocked_response(429, "", {}) is True
-
-
-def test_cloudflare_server_header_with_block_status():
-    assert _is_blocked_response(503, "", {"server": "cloudflare"}) is True
-
-
-def test_datadome_header_with_block_status():
-    assert _is_blocked_response(403, "opaque", {"x-datadome": "protected"}) is True
-
-
-def test_block_status_with_body_marker():
-    assert _is_blocked_response(403, "<title>Just a moment...</title>", {}) is True
-
-
-def test_clean_403_without_markers_is_not_blocked():
-    assert _is_blocked_response(403, "<p>Plain forbidden page</p>", {}) is False
-
-
-def test_sec_automated_tool_403_is_blocked():
-    body = (
-        "<title>SEC.gov | Your Request Originates from an Undeclared Automated Tool</title>"
-        "<h1>Your Request Originates from an Undeclared Automated Tool</h1>"
-    )
-    assert _is_blocked_response(403, body, {}) is True
-
-
-def test_datadome_401_challenge_is_blocked():
-    # DataDome (e.g. Reuters) serves its interstitial as HTTP 401 with a
-    # captcha-delivery marker in the body and a datadome= cookie — both signals,
-    # and 401 is a block status, so it must be recognized rather than returned.
-    body = (
-        '<p id="cmsg">Please enable JS and disable any ad blocker</p>'
-        "<script>var dd={'host':'geo.captcha-delivery.com'}</script>"
-    )
-    headers = {"set-cookie": "datadome=AbC~xyz; Max-Age=31536000; Path=/; Secure"}
-    assert _is_blocked_response(401, body, headers) is True
-
-
-def test_plain_401_without_markers_is_not_blocked():
-    # A genuine auth-required 401 (no challenge marker/cookie) is NOT a bot wall —
-    # adding 401 to the block statuses must not turn every 401 into a block.
-    assert (
-        _is_blocked_response(401, '{"error":"unauthorized"}', {"www-authenticate": "Bearer"})
-        is False
-    )
-
-
-def test_cloudflare_managed_challenge_text_is_blocked():
-    # Cloudflare's managed-challenge interstitial sometimes arrives as a 403 with
-    # only this visible body text (no cf-* token / "just a moment" title). It must
-    # be recognized as a wall, not returned as content.
-    assert _is_blocked_response(403, "Enable JavaScript and cookies to continue", {}) is True
-
-
-def test_200_with_two_markers_is_blocked():
-    body = "cf-ray challenge-platform present here"
-    assert _is_blocked_response(200, body, {}) is True
-
-
-def test_200_with_one_marker_is_not_blocked():
-    assert _is_blocked_response(200, "just a moment, loading the page", {}) is False
-
-
-def test_clean_200_is_not_blocked():
-    assert _is_blocked_response(200, "<html><body>Real content</body></html>", {}) is False
 
 
 # --------------------------- browser navigation errors ---------------------------
@@ -555,42 +482,6 @@ def test_page_cache_keeps_entry_within_item_limit(monkeypatch):
     fetched = {"text": "123456", "bytes": None}
     web_fetch._cache_page("https://example.com/small", fetched)
     assert cache.get("https://example.com/small") is fetched
-
-
-# --------------------------- full fetch cache coordination ---------------------------
-
-def test_enrich_fetch_coalesces_concurrent_misses(monkeypatch):
-    calls = 0
-
-    async def fake_direct_enrich(url):
-        nonlocal calls
-        calls += 1
-        await asyncio.sleep(0.01)
-        return {
-            "url": url,
-            "status": 200,
-            "content_type": "text/html",
-            "text": "<html><title>ok</title></html>",
-            "bytes": None,
-            "via": "direct",
-            "blocked_detected": False,
-        }
-
-    async def scenario():
-        return await asyncio.gather(
-            web_fetch._enrich_fetch("https://example.com/page"),
-            web_fetch._enrich_fetch("https://example.com/page"),
-            web_fetch._enrich_fetch("https://example.com/page"),
-        )
-
-    monkeypatch.setattr(web_fetch, "_page_cache", TTLCache(60, 8))
-    web_fetch._enrich_inflight.clear()
-    monkeypatch.setattr(web_fetch, "_direct_enrich_fetch", fake_direct_enrich)
-
-    results = run(scenario())
-    assert calls == 1
-    assert [r["url"] for r in results] == ["https://example.com/page"] * 3
-    assert web_fetch._enrich_inflight == {}
 
 
 # --------------------------- allowlist parsing ---------------------------
