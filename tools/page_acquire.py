@@ -366,8 +366,8 @@ async def _acquire_page(url: str) -> dict:
     """Return one accepted raw fetch, preferring browser rendering for HTML."""
     cached = _page_cache.get(url)
     if cached is not None:
-        # Search enrichment may cache direct HTML. It is useful to enrichment but
-        # must not bypass fetch_page's browser-first policy.
+        # If rendering has been enabled since a direct HTML artifact was cached,
+        # honor the browser-first policy rather than reusing that artifact.
         ctype = (cached.get("content_type") or "").lower()
         direct_html = cached.get("via") == "direct" and "html" in ctype
         if not (direct_html and cfg.flaresolverr_url):
@@ -515,8 +515,19 @@ async def acquire_page(url: str) -> dict:
     if task is None:
         task = asyncio.create_task(_acquire_page(url))
         _acquire_inflight[url] = task
-    try:
-        return await asyncio.shield(task)
-    finally:
-        if _acquire_inflight.get(url) is task:
-            _acquire_inflight.pop(url, None)
+
+        def completed(done: asyncio.Task) -> None:
+            # A cancelled waiter must not evict work still serving other callers.
+            if _acquire_inflight.get(url) is done:
+                _acquire_inflight.pop(url, None)
+            # Retrieve failures even if every waiter has gone away. This does not
+            # prevent remaining waiters from receiving the same exception.
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+    # wait() does not propagate waiter cancellation to the shared task. Unlike
+    # shield() on Python 3.14, it does not independently log a later failure
+    # after a waiter leaves; the completion callback above owns that cleanup.
+    await asyncio.wait({task})
+    return task.result()

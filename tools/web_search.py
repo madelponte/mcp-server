@@ -3,12 +3,8 @@ Agentic Web Search MCP tool.
 
 Exposes `search_web`, backed by Brave's LLM Context API. Brave returns
 relevance-ranked page excerpts (including text, tables, code, and serialized
-structured data) ready for model consumption. Results can optionally be
-enriched with heading outlines so the model can decide what to read with the
-companion `fetch_page` tool.
-
-The direct-only enrichment transport lives in `tools/web_fetch.py`; HTML
-metadata extraction lives in `tools/web_extract.py`.
+structured data) and source metadata ready for model consumption. Use the
+companion `fetch_page` tool in structured mode for page outlines.
 """
 
 import asyncio
@@ -29,8 +25,6 @@ from pydantic import Field
 from config import web_search_settings as cfg, server_settings
 from .serialize import to_json, log_call, log_result, redact_secrets
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
-from .web_fetch import _enrich_fetch, _is_tika_document
-from .web_extract import _structured_from_html
 
 log = logging.getLogger(__name__)
 
@@ -112,10 +106,9 @@ def _search_web_desc(prefix: str) -> str:
         "excerpts extracted from source pages, including text, tables, code, "
         "and occasionally JSON-serialized structured data.\n\n"
         "Each result includes url/title/snippets and optional source metadata. "
-        "Optional enrichment adds page headings, a description, and a compact "
-        "table of contents. Enriched headings include stable anchors and "
-        "`citation_url` when the source provides a real fragment. Then use "
-        + prefix + "fetch_page to read a source in full.\n\n"
+        "Search does not fetch source pages separately. Use "
+        + prefix + 'fetch_page with mode="structured" for page headings and a '
+        "table of contents, or its default text mode to read a source in full.\n\n"
         "Query: 1-400 characters and at most 50 words. Prefer concise keywords. "
         "Combine Brave operators when useful: site:example.com (domain), "
         '"exact phrase", -exclude, foo OR bar (uppercase logical operator), '
@@ -131,8 +124,7 @@ def _search_web_desc(prefix: str) -> str:
         "site:youtube.com for videos).\n\n"
         "Returns JSON {query,provider,time_range,country,search_lang,safesearch?,"
         "context_threshold_mode?,max_tokens,results:[{url,title,snippets,"
-        "published_date?,description?,site_name?,page_title?,page_description?,"
-        "page_headings?,page_toc?}]}"
+        "published_date?,description?,site_name?}]}"
     )
 
 
@@ -141,13 +133,10 @@ def _clamp_count(
     maximum: int,
     *,
     minimum: int,
-    default: int | None = None,
 ) -> int:
     """Resolve a model-requested count against its configured maximum."""
     if requested is None:
-        if default is None:
-            return maximum
-        requested = default
+        return maximum
     try:
         requested = int(requested)
     except (TypeError, ValueError):
@@ -254,9 +243,9 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     """Return Brave/server-directed retry delay, if supplied.
 
     Brave documents X-RateLimit-Reset as comma-separated relative seconds for
-    each quota window. When Remaining is available, select a reset belonging to
-    an exhausted window; this avoids mistaking a month-long reset for the usual
-    one-second burst reset. Retry-After supports both delta seconds and HTTP
+    each quota window. When Remaining is available, wait for all exhausted
+    windows to reset; do not include a month-long reset unless that quota is
+    exhausted too. Retry-After supports both delta seconds and HTTP
     dates. The larger applicable hint wins so neither header is undercut.
     """
     hints: list[float] = []
@@ -283,7 +272,9 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
             for left, reset in zip(remaining, resets)
             if left <= 0
         ]
-        hints.append(min(exhausted_resets or resets))
+        # Every exhausted quota must reset before another request can succeed.
+        # Without exhaustion information, retain the shortest-window fallback.
+        hints.append(max(exhausted_resets) if exhausted_resets else min(resets))
 
     return max(hints) if hints else None
 
@@ -507,26 +498,6 @@ async def _brave_query(
     return results
 
 
-async def _enrich_result(url: str | None) -> dict | None:
-    """Fetch a URL just enough to extract structured page metadata."""
-    if not url:
-        return None
-    try:
-        fetched = await _enrich_fetch(url)
-    except Exception as exc:
-        return {"error": str(exc)}
-
-    if not fetched:
-        return None
-    content_type = (fetched.get("content_type") or "").lower()
-    if _is_tika_document(content_type, url):
-        return {"title": None, "description": None, "headings": [], "toc": None}
-    text = fetched.get("text")
-    if not text:
-        return None
-    return await anyio.to_thread.run_sync(_structured_from_html, text, url)
-
-
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         description=_search_web_desc(server_settings.tool_prefix),
@@ -554,14 +525,6 @@ def register(mcp: FastMCP) -> None:
                 "for the max."
             ),
         ] = None,
-        enrich_results: Annotated[
-            int | None,
-            Field(
-                description=f"Top N results to enrich with page headings/metadata, "
-                f"up to {cfg.max_enrich_results} (larger is clamped); default "
-                f"{cfg.default_enrich_results}, 0 disables enrichment."
-            ),
-        ] = None,
     ) -> str:
         """Search the web. Model-facing guidance is in the tool description.
 
@@ -585,7 +548,6 @@ def register(mcp: FastMCP) -> None:
             context_threshold_mode=context_threshold_mode,
             num_results=num_results,
             max_tokens=max_tokens,
-            enrich_results=enrich_results,
         )
         query = (query or "").strip()
         if not query:
@@ -661,40 +623,6 @@ def register(mcp: FastMCP) -> None:
             applied["safesearch"] = resolved_safesearch
         if resolved_threshold:
             applied["context_threshold_mode"] = resolved_threshold
-
-        if not results:
-            return log_result(
-                log, "search_web", to_json({"query": query, **applied, "results": []})
-            )
-
-        enrich_n = min(
-            _clamp_count(
-                enrich_results,
-                cfg.max_enrich_results,
-                minimum=0,
-                default=cfg.default_enrich_results,
-            ),
-            len(results),
-        )
-        if enrich_n > 0:
-            tasks = [_enrich_result(result.get("url")) for result in results[:enrich_n]]
-            enriched = await asyncio.gather(*tasks, return_exceptions=True)
-            for index, data in enumerate(enriched):
-                if isinstance(data, Exception):
-                    results[index]["page_meta_error"] = str(data)
-                    continue
-                if not data:
-                    continue
-                if data.get("error"):
-                    results[index]["page_meta_error"] = data["error"]
-                    continue
-                headings = (data.get("headings") or [])[: cfg.max_enrich_headings]
-                results[index]["page_title"] = data.get("title")
-                results[index]["page_description"] = data.get("description")
-                if headings:
-                    results[index]["page_headings"] = headings
-                if data.get("toc"):
-                    results[index]["page_toc"] = data["toc"][:20]
 
         return log_result(
             log,
