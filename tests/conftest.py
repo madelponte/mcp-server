@@ -6,9 +6,11 @@ helper, or routes httpx through an in-memory ``MockTransport``. Async tool code
 is driven with :func:`run` (a thin ``asyncio.run`` wrapper) so no async pytest
 plugin is required.
 
-Settings are loaded from the repo ``.env`` like in production, so tests never
-assume a particular configured value — they read caps from the live ``cfg`` at
-runtime, or monkeypatch the specific attribute they depend on.
+Settings are loaded from the repo ``config.yaml`` when one exists, exactly as in
+production, so tests never assume a particular configured value — they read caps
+from the live ``cfg`` at runtime, or monkeypatch the specific attribute they
+depend on. Tests of the loading logic itself pass an explicit file and env
+mapping (see test_config.py) and never touch the deployment's own file.
 """
 
 import asyncio
@@ -90,8 +92,8 @@ def server():
     """The real MCP server with every tool enabled for tool-level tests.
 
     Availability itself is covered in test_server.py. Forcing the flags here
-    keeps the rest of the suite deterministic when a developer's local .env
-    intentionally disables one or more tools.
+    keeps the rest of the suite deterministic when a developer's local
+    config.yaml intentionally disables one or more tools.
     """
     from server import build_server, tool_settings
 

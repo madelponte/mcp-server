@@ -218,3 +218,14 @@ __marimo__/
 .streamlit/secrets.toml
 
 .claude/
+# ---------------------------------------------------------------------------
+# MCP server runtime configuration
+# config.yaml holds real credentials (provider API keys, the SMTP password, and
+# the bearer tokens that gate the HTTP transports) and is bind-mounted into the
+# container at runtime. Only config.example.yaml is committed.
+# ---------------------------------------------------------------------------
+config.yaml
+config.yml
+config.*.yaml
+config.*.yml
+!config.example.yaml

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Print a tool exactly as the model sees it (its MCP ``tools/list`` entry).
 
-Tool descriptions and per-argument descriptions are now built at registration
-time from ``config.py`` (e.g. the geocoding caps are interpolated into the text),
-so the source docstring no longer matches what the model receives. This script
+Tool descriptions and per-argument descriptions are built at registration time
+from ``config.py`` (e.g. the geocoding caps are interpolated into the text), so
+the source docstring no longer matches what the model receives. This script
 builds the real server via ``server.build_server()`` and dumps the serialized
-schema, so you can verify the rendered result — including how env vars change it.
+schema, so you can verify the rendered result — including how the config file
+changes it.
 
   Usage (from the repo root):
 
@@ -18,11 +19,11 @@ schema, so you can verify the rendered result — including how env vars change 
   # Full MCP schema as JSON (exact tools/list payload)
   .venv/bin/python scripts/show_tool.py find_nearby_places --json
 
-  # Caps come from config, so env vars change the output live
-  GEO_MAX_RADIUS_M=50000 .venv/bin/python scripts/show_tool.py find_nearby_places
+Because the caps come from configuration, point the script at a throwaway config
+file (or set an override variable) to confirm a cap is genuinely dynamic:
 
-Because the caps come from config, env vars change the output live:
-
+    printf 'geocoding:\n  max_radius_m: 50000\n' > /tmp/caps.yaml
+    MCP_CONFIG_FILE=/tmp/caps.yaml python scripts/show_tool.py find_nearby_places
     GEO_MAX_RADIUS_M=50000 python scripts/show_tool.py find_nearby_places
 """
 

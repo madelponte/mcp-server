@@ -3,8 +3,18 @@ services:
     image: ghcr.io/madelponte/mcp-server:latest
     container_name: mcp-tools
     restart: unless-stopped
-    env_file:
-      - .env
+    # Configuration lives in ./config.yaml (copy config.example.yaml and edit).
+    # Mounted read-only, so the file is the only thing the container needs and
+    # secrets never end up in an image or a `docker inspect` env dump. The file
+    # must be readable by the container's uid 10001 — on a Linux host, e.g.
+    #   sudo setfacl -m u:10001:r config.yaml   (or chmod 644 for a laxer setup)
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /app/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       - "8000:8000"
     depends_on:
@@ -13,7 +23,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Local support services for fetch_page. search_web uses Brave's hosted LLM
-  # Context API and requires WEB_SEARCH_BRAVE_API_KEY; it has no local backend.
+  # Context API and requires web_search.brave_api_key; it has no local backend.
   # ---------------------------------------------------------------------------
   tika:
     image: apache/tika:latest-full
