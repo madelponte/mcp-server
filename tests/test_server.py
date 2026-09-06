@@ -369,9 +369,10 @@ def test_lifespan_cleanup_hook_failure_does_not_block_shutdown():
 def test_http_auth_fails_closed_without_token(monkeypatch):
     import server as server_mod
 
+    monkeypatch.setattr(server_mod.server_settings, "auth_tokens", [])
     monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
     monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", False)
-    with pytest.raises(SystemExit, match="MCP_AUTH_TOKEN"):
+    with pytest.raises(SystemExit, match="No bearer token is configured"):
         server_mod.configure_http_auth(object())
 
 
@@ -379,6 +380,7 @@ def test_http_auth_allows_explicit_unauthenticated(monkeypatch):
     import server as server_mod
 
     sentinel = object()
+    monkeypatch.setattr(server_mod.server_settings, "auth_tokens", [])
     monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
     monkeypatch.setattr(server_mod.server_settings, "allow_unauthenticated", True)
     assert server_mod.configure_http_auth(sentinel) is sentinel
@@ -393,6 +395,23 @@ def test_http_auth_wraps_app_when_token_set(monkeypatch):
     wrapped = server_mod.configure_http_auth(sentinel)
     assert isinstance(wrapped, BearerAuthMiddleware)
     assert wrapped.app is sentinel
+
+
+def test_http_auth_installs_every_named_client(monkeypatch):
+    """Each configured token must reach the middleware with its name intact."""
+    import server as server_mod
+    from config import AuthToken
+
+    monkeypatch.setattr(server_mod.server_settings, "auth_token", "")
+    monkeypatch.setattr(
+        server_mod.server_settings,
+        "auth_tokens",
+        [AuthToken(name="open-webui", token="one"), AuthToken(name="agent", token="two")],
+    )
+    assert server_mod.configure_http_auth(object()).client_names == (
+        "open-webui",
+        "agent",
+    )
 
 
 @pytest.mark.parametrize(

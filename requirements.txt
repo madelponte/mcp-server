@@ -4,9 +4,12 @@ fastmcp>=4.0.0
 starlette>=1.6.0
 uvicorn>=0.52.4
 
-# Config / settings
+# Config / settings. The whole server is configured from one YAML file
+# (config.example.yaml); PyYAML parses it and pydantic validates every value at
+# startup. Explicit dependency on PyYAML: it currently arrives transitively via
+# fastmcp, and an unpinned accidental removal would break startup.
 pydantic>=2.13.5
-pydantic-settings>=2.15.0
+PyYAML>=6.0
 
 # Shared HTTP / async
 httpx>=0.28.1

@@ -1,16 +1,22 @@
 # Keep the build context (and the resulting image) lean, and never bake host /
 # dev / secret files into the published image. The server's deps come from
-# requirements.txt; runtime config is injected via `docker run --env-file`.
+# requirements.txt; runtime configuration is a YAML file bind-mounted into the
+# container: docker run -v "$PWD/config.yaml:/app/config.yaml:ro" ...
 
 # Virtualenvs — host-specific; deps are reinstalled from requirements.txt
 .venv/
 venv/
 ENV/
 
-# Secrets / local config — NEVER copy into the image (use --env-file at runtime)
+# Secrets / local config — NEVER copy into the image. config.yaml is mounted
+# read-only at runtime; only the documented example belongs in the image.
 .env
 .env.*
-!.env.example
+config.yaml
+config.yml
+config.*.yaml
+config.*.yml
+!config.example.yaml
 
 # Version control
 .git/

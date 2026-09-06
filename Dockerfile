@@ -16,12 +16,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.14-slim AS runtime
 
+# Configuration comes from one YAML file bind-mounted at /app/config.yaml (see
+# docker-compose.yml). Naming the path explicitly means a missing mount fails at
+# startup instead of silently booting on built-in defaults. Override
+# MCP_CONFIG_FILE to read the configuration from somewhere else.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH \
-    MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000 \
-    MCP_TRANSPORT=streamable-http
+    MCP_CONFIG_FILE=/app/config.yaml
 
 WORKDIR /app
 

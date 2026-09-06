@@ -5,7 +5,7 @@ import logging
 import pytest
 
 import auth
-from auth import BearerAuthMiddleware
+from auth import BearerAuthMiddleware, BearerToken
 from conftest import run
 
 TOKEN = "s3cret-token"
@@ -93,6 +93,69 @@ def test_correct_token_passes():
     run(mw(_http_scope(headers), receive, send))
     assert events[0]["status"] == 200
     assert events[1]["body"] == b"OK"
+
+
+MULTI = [
+    BearerToken(name="open-webui", token="token-one"),
+    BearerToken(name="claude-desktop", token="token-two"),
+]
+
+
+def test_every_configured_token_authenticates():
+    """One server, several clients: each named credential must be accepted."""
+    mw = BearerAuthMiddleware(_dummy_app, MULTI)
+    assert mw.client_names == ("open-webui", "claude-desktop")
+    for token in ("token-one", "token-two"):
+        events, send, receive = _collect_sends()
+        headers = [(b"authorization", f"Bearer {token}".encode())]
+        run(mw(_http_scope(headers), receive, send))
+        assert events[0]["status"] == 200, token
+
+
+def test_matched_client_name_is_recorded_on_the_scope():
+    """Downstream logging needs to know which credential made the call."""
+    mw = BearerAuthMiddleware(_dummy_app, MULTI)
+    for token, name in (("token-one", "open-webui"), ("token-two", "claude-desktop")):
+        scope = _http_scope([(b"authorization", f"Bearer {token}".encode())])
+        events, send, receive = _collect_sends()
+        run(mw(scope, receive, send))
+        assert scope["state"]["mcp_client"] == name
+
+
+def test_token_not_in_the_list_401():
+    mw = BearerAuthMiddleware(_dummy_app, MULTI)
+    events, send, receive = _collect_sends()
+    headers = [(b"authorization", b"Bearer token-three")]
+    run(mw(_http_scope(headers), receive, send))
+    assert events[0]["status"] == 401
+
+
+def test_blank_entries_are_dropped_not_installed():
+    """An empty configured secret must never match anything, including a request
+    that sends no token value."""
+    mw = BearerAuthMiddleware(_dummy_app, ["", "real-token", BearerToken(name="x", token="   ")])
+    assert mw.client_names == ("default",)
+    events, send, receive = _collect_sends()
+    run(mw(_http_scope([(b"authorization", b"Bearer ")]), receive, send))
+    assert events[0]["status"] == 401
+
+
+@pytest.mark.parametrize("tokens", [[], [""], ["  "], None])
+def test_no_usable_token_rejected_at_construction(tokens):
+    with pytest.raises(ValueError):
+        BearerAuthMiddleware(_dummy_app, tokens)
+
+
+def test_duplicate_secret_collapses_to_one_client_name():
+    """The same credential presented twice (legacy field plus an explicit entry)
+    must authenticate under exactly one name."""
+    mw = BearerAuthMiddleware(_dummy_app, ["shared", BearerToken(name="webui", token="shared")])
+    assert mw.client_names == ("default",)
+
+
+def test_non_ascii_token_names_the_offending_client():
+    with pytest.raises(ValueError, match="bad-client"):
+        BearerAuthMiddleware(_dummy_app, [BearerToken(name="bad-client", token="pässword")])
 
 
 def test_rejected_request_logs_a_warning_with_client_ip(caplog, monkeypatch):
