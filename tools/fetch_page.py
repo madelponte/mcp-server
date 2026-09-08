@@ -121,7 +121,7 @@ def _fetch_page_desc(prefix: str) -> str:
         "Returns JSON {url,format,provenance?,content,anchor?,citation_url?,query?,"
         "match_count?,match_metadata?,matching_toc?,sections?,truncated?,offset?,"
         "continuation_anchor?,next_offset?,"
-        "content_length?,note?} "
+        "content_length?,content_format?,note?} "
         "(format: "
         "\"youtube_transcript\"|"
         '"markdown"|"text"|"structured"|"section"|"document_text"|"image"|"json").'
@@ -1528,8 +1528,8 @@ async def _fetch_one(
     )
 
     # Document handling: PDF, Office, OpenDocument, RTF, EPUB, etc. are
-    # routed to Apache Tika and returned as plain text, regardless of the
-    # requested mode. Detected by content-type/extension or — for a document
+    # routed to Apache Tika 4 and returned as Markdown, regardless of the
+    # requested mode. Keep the document_text envelope for client compatibility. Detected by content-type/extension or — for a document
     # served with a generic/wrong content-type and no telling extension — by a
     # magic-byte sniff of the raw bytes.
     if (
@@ -1556,6 +1556,7 @@ async def _fetch_one(
                     cfg.tika_url,
                     timeout=cfg.tika_timeout_seconds,
                     ocr_strategy=cfg.tika_ocr_strategy,
+                    ocr_retry=cfg.tika_ocr_retry,
                     max_output_bytes=cfg.max_download_bytes,
                 )
             except Exception as exc:
@@ -1566,6 +1567,7 @@ async def _fetch_one(
             "url": fetch_url,
             **_provenance(url, fetch_url, status, ctype or "application/octet-stream", via),
             "format": "document_text",
+            "content_format": "markdown",
         }
         if query:
             qres = await _query_payload(

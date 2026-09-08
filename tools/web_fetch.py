@@ -17,6 +17,7 @@ import logging
 import re
 import socket
 import threading
+import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
@@ -371,56 +372,142 @@ def _charset_from_ctype(ctype: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _tika_parse(
+    data: bytes, tika_url: str, *, timeout: float, ocr_strategy: str,
+    max_output_bytes: int,
+) -> dict:
+    """One Tika 4 Markdown pass, with bounded 429 retries and streamed JSON.
+
+    JSON exposes failures that Tika can report with HTTP 200, and PDF native
+    character counts distinguish scanned pages from metadata-only Markdown.
+    The multipart config is a ParseContext map, NOT a server/parsers config.
+    """
+    deadline = time.monotonic() + timeout
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Tika extraction pass timed out.")
+        request_config = {
+            "pdf-parser": {"ocr": {"strategy": ocr_strategy.upper()}},
+            "tesseract-ocr-parser": {"skipOcr": ocr_strategy == "no_ocr"},
+            # Leave time for result transfer; the server may impose a lower cap.
+            "timeout-limits": {"totalTaskTimeoutMillis": max(1, int(remaining * 900))},
+        }
+        with httpx.stream(
+            "POST",
+            f"{tika_url.rstrip('/')}/tika/config/json/md",
+            files={
+                # No extension or asserted MIME type: Tika detects the bytes.
+                "file": ("document", data, None),
+                "config": (None, json.dumps(request_config), "application/json"),
+            },
+            timeout=remaining,
+        ) as resp:
+            if resp.status_code == 403:
+                raise RuntimeError(
+                    "Tika 4 requires server.allowPerRequestConfig=true "
+                    "for document extraction and OCR retry."
+                )
+            if resp.status_code == 429 and attempt < 2:
+                # Tika emits delay-seconds. Malformed values use a short backoff;
+                # never sleep beyond this pass's budget to honor a huge value.
+                retry_after = resp.headers.get("Retry-After", "1")
+                delay = int(retry_after) if retry_after.isdecimal() else 1
+                if delay >= deadline - time.monotonic():
+                    resp.raise_for_status()
+            else:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Tika extraction pass timed out.")
+                    total += len(chunk)
+                    if max_output_bytes and total > max_output_bytes:
+                        raise DownloadTooLargeError(
+                            "Tika extraction output exceeds the configured "
+                            f"{max_output_bytes}-byte download cap."
+                        )
+                    chunks.append(chunk)
+                metadata = json.loads(b"".join(chunks))
+                if not isinstance(metadata, dict) or "X-TIKA:content" in metadata:
+                    raise RuntimeError("Expected a Tika 4 JSON metadata object.")
+                failures = [
+                    key for key, value in metadata.items()
+                    if key.startswith("tk:exception:")
+                    and value not in (None, False, "false", "", [])
+                ]
+                if failures:
+                    raise RuntimeError(
+                        "Tika reported incomplete or failed extraction: " + ", ".join(failures)
+                    )
+                if not isinstance(metadata.get("tk:content", ""), str):
+                    raise RuntimeError("Tika returned a non-string tk:content field.")
+                return metadata
+        # Close the busy response before waiting; 503/parser errors are NOT retried.
+        time.sleep(delay)
+    raise RuntimeError("Tika worker remained busy.")  # defensive; final 429 raises above
+
+
+def _tika_has_text(metadata: dict, *, native_only: bool) -> bool:
+    """Ignore title/image-only output; native counts exclude PDF metadata titles."""
+    content = metadata.get("tk:content", "").strip()
+    if not content:
+        return False
+    if native_only and "pdf:chars-per-page" in metadata:
+        counts = metadata["pdf:chars-per-page"]
+        counts = counts if isinstance(counts, list) else [counts]
+        if counts and all(str(count).strip() == "0" for count in counts):
+            return False
+    # Markdown image placeholders and metadata titles are not OCR success.
+    visible = re.sub(r"!\[[^\]\n]*\]\([^\n)]*\)", "", content)
+    visible = " ".join(visible.split()).strip(" #*_`~|:>-\\")
+    titles = metadata.get("dc:title", [])
+    titles = titles if isinstance(titles, list) else [titles]
+    for title in titles:
+        if visible.replace("\\", "") == " ".join(str(title).split()):
+            return False
+    return bool(visible)
+
+
 def _tika_extract(
     data: bytes,
     tika_url: str,
     *,
     timeout: float = 90.0,
     ocr_strategy: str = "no_ocr",
+    ocr_retry: bool = True,
     max_output_bytes: int = 0,
 ) -> str:
-    """Extract plain text from a document byte stream via Apache Tika.
+    """Extract Markdown via Tika 4, retrying a textless no_ocr pass once.
 
-    No Content-Type is sent: Tika auto-detects the format from the bytes, so
-    this handles PDF, Office (doc/docx/xls/xlsx/ppt/pptx), OpenDocument, RTF,
-    EPUB, etc. with one path.
-
-    `ocr_strategy` maps to Tika's X-Tika-PDFOcrStrategy header. The default
-    "no_ocr" extracts only embedded text, which is fast and avoids OCR of
-    image-heavy PDFs blowing past the timeout. Set it to "auto" or
-    "ocr_and_text_extraction" if you actually need scanned-image OCR.
+    Both passes use Tika's native parsers/Tesseract, never a VLM. Explicit OCR
+    strategies run once. A mixed PDF with some native text does not trigger the
+    fallback; use 'auto' for per-page OCR in such documents. HTTP/parse failures
+    and output-limit violations propagate instead of being retried as OCR.
     """
-    headers = {"Accept": "text/plain"}
-    if ocr_strategy:
-        headers["X-Tika-PDFOcrStrategy"] = ocr_strategy
-    chunks: list[bytes] = []
-    total = 0
+    if ocr_strategy not in {"no_ocr", "auto", "ocr_only", "ocr_and_text_extraction"}:
+        raise ValueError("Unsupported Tika OCR strategy.")
     sema = _tika_semaphore()
-    sema.acquire()
+    if not sema.acquire(timeout=timeout):
+        raise TimeoutError("Timed out waiting for local Tika extraction capacity.")
     try:
-        with httpx.stream(
-            "PUT",
-            f"{tika_url.rstrip('/')}/tika",
-            content=data,
-            headers=headers,
-            timeout=timeout,
-        ) as resp:
-            resp.raise_for_status()
-            for chunk in resp.iter_bytes():
-                total += len(chunk)
-                if max_output_bytes and total > max_output_bytes:
-                    raise DownloadTooLargeError(
-                        "Tika extraction output exceeds the configured "
-                        f"{max_output_bytes}-byte download cap."
-                    )
-                chunks.append(chunk)
-            encoding = resp.encoding or "utf-8"
+        strategies = [ocr_strategy]
+        if ocr_retry and ocr_strategy == "no_ocr":
+            strategies.append("ocr_and_text_extraction")
+        for strategy in strategies:
+            metadata = _tika_parse(
+                data, tika_url, timeout=timeout, ocr_strategy=strategy,
+                max_output_bytes=max_output_bytes,
+            )
+            if _tika_has_text(metadata, native_only=strategy == "no_ocr"):
+                return metadata["tk:content"].strip()
+            if strategy == "no_ocr" and len(strategies) > 1:
+                log.info("Tika found no native document text; retrying once with Tesseract OCR")
+        suffix = " after OCR retry" if len(strategies) > 1 else ""
+        raise RuntimeError(f"Document contained no extractable text{suffix}.")
     finally:
         sema.release()
-    text = b"".join(chunks).decode(encoding, errors="replace").strip()
-    if not text:
-        raise RuntimeError("Document contained no extractable text.")
-    return text
 
 
 # ---------------------------------------------------------------------------

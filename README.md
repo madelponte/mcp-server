@@ -486,8 +486,9 @@ variable) still work and appear in the log as a client named `default`; prefer
 The compose file starts the server plus the local services used by `fetch_page`:
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) (Cloudflare
 fallback) and [Apache Tika](https://tika.apache.org/) (document text extraction).
-The supplied Compose file uses published images with `latest` tags; pin tags or
-digests yourself if you need reproducible deployments. `search_web` uses Brave's hosted
+Tika is pinned to `apache/tika:4.0.0-1-full`; the other supplied services use
+published images with `latest` tags. Pin those tags/digests too if you need
+reproducible deployments. `search_web` uses Brave's hosted
 API and requires `web_search.brave_api_key`. HTTP mode also requires at least one
 `server.auth_tokens` entry. The container reads its configuration from
 `./config.yaml`, bind-mounted read-only at `/app/config.yaml`:
@@ -518,6 +519,55 @@ If you don't need `fetch_page`, delete the `flaresolverr` / `tika` services (and
 the `depends_on` block) from `docker-compose.yml`. The stock, Wolfram,
 geocoding, and email tools have no local-service dependencies, though they may
 need API keys, SMTP credentials, or internet access.
+
+### Tika 4 document extraction
+
+The supplied `tika-config.json` runs **one parser worker** with a 2 GiB heap
+inside a 4 GiB container limit. It keeps the standard parsers and Tesseract OCR;
+no VLM, Ollama, or other model backend is configured. Tika must remain on a
+trusted private network: `server.allowPerRequestConfig` is enabled so the MCP
+client can select an OCR strategy per request. `/pipes` and `/async` remain off.
+
+`fetch_page` posts multipart `file` + JSON `config` to
+`/tika/config/json/md` and reads Tika 4's `tk:content`. The JSON envelope also
+exposes parser failures and native PDF character counts. Returned documents
+keep `format: "document_text"` for compatibility and add
+`content_format: "markdown"`; Markdown headings/lists/tables are preserved.
+Document query/offset still work, but document outline/section extraction is
+not implemented.
+
+Default behavior (`web_search` settings):
+
+1. `tika_ocr_strategy: no_ocr`: extract native text, disabling Tesseract even
+   for embedded images on the first pass.
+2. `tika_ocr_retry: true`: when there is no usable text, retry **once** with
+   `OCR_AND_TEXT_EXTRACTION` and Tesseract enabled. A scanned PDF's metadata
+   title does not count as native page text or successful OCR.
+3. If OCR still finds no text, raise a tool error. HTTP/parser failures,
+   truncated extraction, and output-cap violations are errors, not OCR retries.
+
+Set `tika_ocr_retry: false` (or `WEB_SEARCH_TIKA_OCR_RETRY=false`) to keep
+`no_ocr` strictly text-only. For mixed PDFs with both text and scanned pages,
+choose `tika_ocr_strategy: auto` instead: the empty-document retry intentionally
+does not run when some native page text exists. Explicit OCR strategies run
+once. Standalone image URLs retain their existing metadata-only tool behavior.
+
+`max_concurrent_tika` defaults to 1, matching the worker count. A busy Tika
+worker (HTTP 429) gets at most two retries honoring delay-seconds `Retry-After`
+within the pass budget; worker failures (503) are not automatically retried.
+Each pass has its own `tika_timeout_seconds` budget (default 90 seconds), and
+local capacity wait is also bounded by that setting. The bundled server config
+caps parsing at 75 seconds per pass. Large scans may need both limits raised,
+along with the calling MCP client's tool deadline. The streamed JSON response,
+including metadata, obeys `max_download_bytes`.
+
+**Migration:** deploy the updated MCP image, Tika 4 image, and JSON config
+together. This client no longer supports Tika 3 or its removed OCR headers.
+If sharing Tika with Open WebUI, use a build supporting `TIKA_SERVER_VERSION=4`
+and select version 4 in its effective configuration. Ordinary requests without
+MCP's overrides use server-side `AUTO` OCR, preserving scanned-upload support
+for Open WebUI. Its built-in Tika loader still requests plain text; the
+Markdown behavior described here is for MCP.
 
 ## Run with Docker (server only)
 

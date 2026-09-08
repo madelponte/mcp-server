@@ -1,0 +1,20 @@
+{
+  "server": {
+    "allowPerRequestConfig": true,
+    "allowPipes": false
+  },
+  "pipes": {
+    "numClients": 1,
+    "forkedJvmArgs": ["-Xmx2g"]
+  },
+  "parse-context": {
+    "timeout-limits": {
+      "totalTaskTimeoutMillis": 75000
+    }
+  },
+  "parsers": [
+    {"default-parser": {}},
+    {"pdf-parser": {"ocr": {"strategy": "AUTO"}}},
+    {"tesseract-ocr-parser": {"skipOcr": false}}
+  ]
+}

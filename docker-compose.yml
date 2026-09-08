@@ -26,8 +26,20 @@ services:
   # Context API and requires web_search.brave_api_key; it has no local backend.
   # ---------------------------------------------------------------------------
   tika:
-    image: apache/tika:latest-full
+    image: apache/tika:4.0.0-1-full
     container_name: tika
+    command: ["-c", "/tika-config.json"]
+    # Parent JVM + one 2 GiB worker + native Tesseract overhead.
+    mem_limit: 4g
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./tika-config.json
+        target: /tika-config.json
+        read_only: true
+        bind:
+          create_host_path: false
     restart: unless-stopped
 
   flaresolverr:
