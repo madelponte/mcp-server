@@ -591,6 +591,21 @@ def test_concurrent_fetch_caps_reject_zero():
     assert settings.max_concurrent_tika == 1
 
 
+def test_tika_ocr_config_is_validated_and_env_overridable(tmp_path):
+    settings = WebSearchSettings()
+    assert settings.tika_ocr_strategy == "no_ocr"
+    assert settings.tika_ocr_retry is True
+    assert settings.max_concurrent_tika == 1
+    with pytest.raises(ValidationError):
+        WebSearchSettings(tika_ocr_strategy="typo")
+    with pytest.raises(ValidationError):
+        WebSearchSettings(tika_timeout_seconds=0)
+    path = tmp_path / "config.yaml"
+    path.write_text("web_search:\n  tika_ocr_retry: true\n")
+    loaded = config.load_config(path=path, env={"WEB_SEARCH_TIKA_OCR_RETRY": "false"})
+    assert loaded.web_search.tika_ocr_retry is False
+
+
 def test_email_allowlist_and_attachment_root_default_empty():
     settings = EmailSettings()
     assert settings.allowed_recipients == ""

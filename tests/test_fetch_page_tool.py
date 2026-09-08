@@ -355,10 +355,19 @@ def test_query_timeout_surfaces_as_tool_error(monkeypatch, tool_fns):
 
 def test_document_routed_to_tika(monkeypatch, tool_fns):
     _patch_fetch(monkeypatch, _fetched(content_type="application/pdf", body=b"%PDF-1.4..."))
-    monkeypatch.setattr(fp, "_tika_extract", lambda data, url, **kw: "Extracted PDF text.")
+    monkeypatch.setattr(fp.cfg, "tika_ocr_strategy", "no_ocr")
+    monkeypatch.setattr(fp.cfg, "tika_ocr_retry", True)
+
+    def extract(data, url, **kw):
+        assert kw["ocr_strategy"] == "no_ocr"
+        assert kw["ocr_retry"] is True
+        return "# Extracted PDF\n\n- Text"
+
+    monkeypatch.setattr(fp, "_tika_extract", extract)
     out = json.loads(run(tool_fns["fetch_page"](url="https://example.com/report.pdf")))
     assert out["format"] == "document_text"
-    assert out["content"] == "Extracted PDF text."
+    assert out["content_format"] == "markdown"
+    assert out["content"] == "# Extracted PDF\n\n- Text"
 
 
 def test_document_query_matching_toc_uses_line_ranges(monkeypatch, tool_fns):

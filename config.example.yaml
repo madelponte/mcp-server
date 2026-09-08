@@ -171,15 +171,19 @@ web_search:
   # stampede FlareSolverr, Tika, Firecrawl, or the direct-fetch pool.
   max_concurrent_direct_fetches: 8
   max_concurrent_flaresolverr: 2
-  max_concurrent_tika: 2
+  max_concurrent_tika: 1
   max_concurrent_firecrawl: 2
 
   # --- fetch_page: document extraction -------------------------------------
-  # Apache Tika handles PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB.
+  # Tika 4 returns Markdown for PDF, Word, Excel, PowerPoint, OpenDocument,
+  # RTF and EPUB. Requires server.allowPerRequestConfig: true (tika-config.json).
   tika_url: "http://tika:9998"
   tika_timeout_seconds: 90
-  # no_ocr (fast, embedded text only) | auto | ocr_and_text_extraction | ocr_only
   tika_ocr_strategy: no_ocr
+  # Retry a textless no_ocr pass ONCE with Tesseract OCR + text extraction.
+  # Includes PDF title-only output, but not HTTP/parser errors or partially
+  # text-bearing PDFs. False makes no_ocr strictly text-only.
+  tika_ocr_retry: true
 
   # --- fetch_page: transport, limits, and caching ---------------------------
   http_timeout_seconds: 25
