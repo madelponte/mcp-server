@@ -439,6 +439,7 @@ def test_firecrawl_rendered_body_obeys_download_cap(patch_httpx):
 
 def test_tika_output_obeys_download_cap(monkeypatch):
     class Response:
+        status_code = 200
         encoding = "utf-8"
 
         def raise_for_status(self):

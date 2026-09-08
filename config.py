@@ -554,7 +554,7 @@ class WebSearchSettings(BaseSection):
         description="Maximum in-flight FlareSolverr renders."
     )
     max_concurrent_tika: int = Field(
-        2, ge=1,
+        1, ge=1,
         description="Maximum in-flight Apache Tika extractions."
     )
     max_concurrent_firecrawl: int = Field(
@@ -564,17 +564,31 @@ class WebSearchSettings(BaseSection):
 
     tika_url: str = Field(
         "http://tika:9998",
-        description="Base URL of an Apache Tika server used for document text extraction.",
+        description="Base URL of a Tika 4 server with allowPerRequestConfig enabled.",
     )
     tika_timeout_seconds: float = Field(
-        90.0, gt=0, description="Timeout for a single Tika extraction request, in seconds."
+        90.0, gt=0,
+        description=(
+            "Timeout per Tika extraction pass (including busy retries), in seconds. "
+            "The optional OCR pass gets a fresh budget; local capacity wait is also bounded."
+        ),
     )
-    tika_ocr_strategy: str = Field(
+    tika_ocr_strategy: Literal[
+        "no_ocr", "auto", "ocr_and_text_extraction", "ocr_only"
+    ] = Field(
         "no_ocr",
         description=(
-            "Tika PDF OCR strategy (X-Tika-PDFOcrStrategy): 'no_ocr' extracts only "
-            "embedded text and is fast; 'auto'/'ocr_and_text_extraction'/'ocr_only' "
-            "enable OCR of images but are much slower."
+            "Initial Tika PDF OCR strategy, sent as Tika 4 multipart JSON. "
+            "'no_ocr' also disables embedded-image Tesseract OCR on the first pass. "
+            "'auto'/'ocr_and_text_extraction'/'ocr_only' enable OCR immediately."
+        ),
+    )
+    tika_ocr_retry: bool = Field(
+        True,
+        description=(
+            "Retry a no_ocr extraction once with Tesseract when no usable text was "
+            "found (including PDF title-only output with zero native characters). "
+            "Does not retry parser failures or partially text-bearing documents."
         ),
     )
 
