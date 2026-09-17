@@ -163,6 +163,85 @@ def test_search_web_schema_exposes_brave_caps(server):
     assert "page_toc" not in description
 
 
+def test_search_web_description_explains_evidence_limits(server):
+    desc = _tool_by_name(server, "search_web").description
+    for guidance in (
+        "Answer directly from excerpts",
+        "cite the result's URL",
+        "not guaranteed hard constraints",
+        "not exact matching",
+        "not the date of events discussed",
+        "not proof that something does not exist",
+        "not independent corroboration",
+        'context_threshold_mode="lenient"',
+        "page_date",
+        "date_source",
+        "1-600 characters",
+        "75 words",
+    ):
+        assert guidance in desc
+    assert "published_date" not in desc
+
+
+@pytest.mark.parametrize(
+    ("configured_safesearch", "configured_threshold", "safe_default", "threshold_default"),
+    [
+        ("moderate", "lenient", "moderate", "lenient"),
+        ("", "", "Brave endpoint default", "Brave calibrated default"),
+    ],
+)
+def test_search_web_schema_and_calls_use_configured_defaults(
+    monkeypatch, configured_safesearch, configured_threshold, safe_default, threshold_default
+):
+    import json
+    import server as server_mod
+    import tools.web_search as ws
+
+    monkeypatch.setattr(server_mod.tool_settings, "search_web_enabled", True)
+    monkeypatch.setattr(ws.cfg, "brave_api_key", "test-key")
+    monkeypatch.setattr(ws.cfg, "brave_api_url", "https://api.example/context")
+    monkeypatch.setattr(ws.cfg, "brave_country", "ca")
+    monkeypatch.setattr(ws.cfg, "brave_search_lang", "FR")
+    monkeypatch.setattr(ws.cfg, "brave_freshness", "pw")
+    monkeypatch.setattr(ws.cfg, "brave_safesearch", configured_safesearch)
+    monkeypatch.setattr(ws.cfg, "brave_context_threshold_mode", configured_threshold)
+    tool = _tool_by_name(server_mod.build_server(), "search_web")
+    # Inspect the actual serialized tools/list schema, not the source annotations.
+    props = tool.to_mcp_tool().model_dump(by_alias=True)["inputSchema"]["properties"]
+    for parameter, default in {
+        "country": "CA",
+        "search_lang": "fr",
+        "time_range": "week",
+        "safesearch": safe_default,
+        "context_threshold_mode": threshold_default,
+    }.items():
+        assert f"Omit for configured default: {default}." in props[parameter]["description"]
+    for parameter, choices in {
+        "safesearch": ["off", "moderate", "strict"],
+        "context_threshold_mode": ["strict", "balanced", "lenient", "disabled"],
+    }.items():
+        assert props[parameter]["anyOf"] == [
+            {"enum": choices, "type": "string"}, {"type": "null"}
+        ]
+    assert "600 characters" in props["query"]["description"]
+    assert "75 words" in props["query"]["description"]
+
+    seen = {}
+
+    async def fake_query(**kwargs):
+        seen.update(kwargs)
+        return []
+
+    monkeypatch.setattr(ws, "_brave_query", fake_query)
+    out = json.loads(run(tool.fn(query="test")))
+    assert (seen["country"], seen["search_lang"], seen["freshness"]) == ("CA", "fr", "pw")
+    assert seen["safesearch"] == configured_safesearch
+    assert seen["context_threshold_mode"] == configured_threshold
+    assert out["time_range"] == "week"
+    assert out.get("safesearch", "") == configured_safesearch
+    assert out.get("context_threshold_mode", "") == configured_threshold
+
+
 def _tool_by_name(server, name):
     return next(t for t in _list_tools(server) if t.name == name)
 

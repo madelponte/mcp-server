@@ -14,7 +14,8 @@ from email.utils import parsedate_to_datetime
 import logging
 import re
 import time
-from typing import Annotated
+from typing import Annotated, Literal
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 import anyio
 import httpx
@@ -73,6 +74,8 @@ _TIME_RANGE_TO_FRESHNESS = {
     "month": "pm",
     "year": "py",
 }
+_MAX_QUERY_CHARS = 600
+_MAX_QUERY_WORDS = 75
 _BRAVE_SAFESEARCH = {"off", "moderate", "strict"}
 _BRAVE_THRESHOLD_MODES = {"strict", "balanced", "lenient", "disabled"}
 _DATE_RANGE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\s*to\s*(\d{4}-\d{2}-\d{2})$")
@@ -106,25 +109,37 @@ def _search_web_desc(prefix: str) -> str:
         "excerpts extracted from source pages, including text, tables, code, "
         "and occasionally JSON-serialized structured data.\n\n"
         "Each result includes url/title/snippets and optional source metadata. "
-        "Search does not fetch source pages separately. Use "
-        + prefix + 'fetch_page with mode="structured" for page headings and a '
-        "table of contents, or its default text mode to read a source in full.\n\n"
-        "Query: 1-400 characters and at most 50 words. Prefer concise keywords. "
+        "Answer directly from excerpts when they provide sufficient evidence; "
+        "cite the result's URL. Search does not fetch source pages separately. "
+        "Use " + prefix + "fetch_page when context, precise wording, completeness, "
+        "or freshness needs verification: mode=\"structured\" gives page headings "
+        "and a table of contents; default text mode reads the source.\n\n"
+        f"Query: 1-{_MAX_QUERY_CHARS} characters and at most {_MAX_QUERY_WORDS} words. "
+        "Prefer concise keywords. "
         "Combine Brave operators when useful: site:example.com (domain), "
         '"exact phrase", -exclude, foo OR bar (uppercase logical operator), '
         "filetype:pdf, intitle:word, inbody:word, lang:en, or loc:us. Operators "
-        "are experimental and very restrictive combinations may return nothing.\n"
+        "and quoted phrases are experimental, not guaranteed hard constraints. "
+        "Check that evidence supports the requested entity or phrase; strict "
+        "controls relevance filtering, not exact matching.\n"
         "time_range: day/week/month/year/all, or an inclusive custom range "
-        "YYYY-MM-DD to YYYY-MM-DD. country and search_lang influence result "
-        "localization. safesearch: off/moderate/strict. context_threshold_mode: "
-        "strict/balanced/lenient/disabled; omit it to use Brave's calibrated "
-        "default. max_tokens controls the approximate total excerpt budget.\n\n"
+        "YYYY-MM-DD to YYYY-MM-DD. It filters page freshness (publication or "
+        "modification), not the date of events discussed. page_date is "
+        "provider-reported (date_source: brave); its meaning is not guaranteed "
+        "to be publication time. country and search_lang influence result "
+        "localization, not hard geographic or language restrictions. Omitted "
+        "filters use the configured defaults shown in parameter descriptions. "
+        "max_tokens controls the approximate total excerpt budget.\n\n"
+        "If evidence is sparse, broaden the query, relax time_range, or try "
+        "context_threshold_mode=\"lenient\". Empty results mean no usable context "
+        "was returned, not proof that something does not exist. Versions of a "
+        "page or syndicated copies are not independent corroboration.\n\n"
         "Brave LLM Context does not support result-page pagination or search "
         "categories. Put constraints in the query instead (for example, "
         "site:youtube.com for videos).\n\n"
         "Returns JSON {query,provider,time_range,country,search_lang,safesearch?,"
         "context_threshold_mode?,max_tokens,results:[{url,title,snippets,"
-        "published_date?,description?,site_name?}]}"
+        "page_date?,date_source?,description?,site_name?}]}"
     )
 
 
@@ -359,7 +374,8 @@ async def _post_brave_with_retry(
     raise RuntimeError("Brave retry loop exited unexpectedly.")
 
 
-def _published_date(source: dict) -> str | None:
+def _page_date(source: dict) -> str | None:
+    """Return Brave's reported page date without assuming publication semantics."""
     age = source.get("age")
     if not isinstance(age, list):
         return None
@@ -369,6 +385,28 @@ def _published_date(source: dict) -> str | None:
         if len(age) > index and isinstance(age[index], str) and age[index].strip():
             return age[index].strip()
     return None
+
+
+def _result_url_key(url: str) -> str:
+    """Conservative dedup key only; never rewrite the returned citation URL.
+
+    Drop known tracking parameters and Python docs' presentation-only highlight.
+    Preserve fragments (including hash routes), versions, query order, encoding,
+    and unknown parameters: these may identify genuinely different resources.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    kept = []
+    for part in parts.query.split("&"):
+        name = unquote_plus(part.split("=", 1)[0]).lower()
+        if name.startswith("utm_") or name in {"gclid", "dclid", "fbclid", "msclkid"}:
+            continue
+        if parts.hostname == "docs.python.org" and name == "highlight":
+            continue
+        kept.append(part)
+    return urlunsplit(parts._replace(query="&".join(kept)))
 
 
 async def _brave_query(
@@ -466,50 +504,113 @@ async def _brave_query(
         raise RuntimeError("Brave LLM Context returned a non-object sources value.")
 
     results: list[dict] = []
-    seen_urls: set[str] = set()
+    by_url: dict[str, dict] = {}
     for raw in generic:
         if not isinstance(raw, dict):
             continue
         url = raw.get("url")
-        if not isinstance(url, str) or not url.strip() or url in seen_urls:
+        if not isinstance(url, str) or not url.strip():
             continue
-        seen_urls.add(url)
+        url = url.strip()
+        key = _result_url_key(url)
         source = sources.get(url)
         source = source if isinstance(source, dict) else {}
         snippets = raw.get("snippets") or []
         if not isinstance(snippets, list):
             snippets = []
-        clean_snippets = [item for item in snippets if isinstance(item, str) and item]
+        clean_snippets = list(dict.fromkeys(
+            snippet for snippet in snippets
+            if isinstance(snippet, str) and snippet.strip()
+        ))
+        if key in by_url:
+            existing = by_url[key]
+            existing["snippets"] = list(dict.fromkeys(
+                existing["snippets"] + clean_snippets
+            ))
+            continue
+        if len(results) >= num_results:
+            # Still scan later records for extra snippets belonging to kept URLs.
+            continue
         item = {
             "url": url,
             "title": raw.get("title") or source.get("title"),
             "snippets": clean_snippets,
         }
-        published = _published_date(source)
-        if published:
-            item["published_date"] = published
+        page_date = _page_date(source)
+        if page_date:
+            item["page_date"] = page_date
+            item["date_source"] = "brave"
         if source.get("description"):
             item["description"] = source["description"]
         if source.get("site_name"):
             item["site_name"] = source["site_name"]
         results.append(item)
-        if len(results) >= num_results:
-            break
+        by_url[key] = item
     return results
 
 
 def register(mcp: FastMCP) -> None:
+    default_safesearch = _resolve_optional_choice(
+        None, cfg.brave_safesearch, _BRAVE_SAFESEARCH, "safesearch"
+    ) or "Brave endpoint default"
+    default_threshold = _resolve_optional_choice(
+        None, cfg.brave_context_threshold_mode, _BRAVE_THRESHOLD_MODES,
+        "context_threshold_mode",
+    ) or "Brave calibrated default"
+
     @mcp.tool(
         description=_search_web_desc(server_settings.tool_prefix),
         annotations=READ_ONLY_EXTERNAL_TOOL,
     )
     async def search_web(
-        query: str,
-        time_range: str | None = None,
-        country: str | None = None,
-        search_lang: str | None = None,
-        safesearch: str | None = None,
-        context_threshold_mode: str | None = None,
+        query: Annotated[
+            str,
+            Field(
+                description=f"Concise keywords, 1-{_MAX_QUERY_CHARS} characters and "
+                f"at most {_MAX_QUERY_WORDS} words; supports experimental operators "
+                'site:, "exact phrase", -exclude, foo OR bar, filetype:, intitle:, '
+                "inbody:, lang:, loc:. These are not guaranteed hard constraints."
+            ),
+        ],
+        time_range: Annotated[
+            str | None,
+            Field(
+                description="Page freshness, not event dates: day/week/month/year/all "
+                "or inclusive YYYY-MM-DD to YYYY-MM-DD. Omit for configured default: "
+                f"{_resolve_time_range(None, cfg.brave_freshness)[0]}."
+            ),
+        ] = None,
+        country: Annotated[
+            str | None,
+            Field(
+                description="Two-letter country preference, e.g. US or GB; not a "
+                "hard geographic restriction. Omit for configured default: "
+                f"{_resolve_country(None, cfg.brave_country)}."
+            ),
+        ] = None,
+        search_lang: Annotated[
+            str | None,
+            Field(
+                description="Result language preference, e.g. en or zh-hans. "
+                "Omit for configured default: "
+                f"{_resolve_search_lang(None, cfg.brave_search_lang)}."
+            ),
+        ] = None,
+        safesearch: Annotated[
+            Literal["off", "moderate", "strict"] | None,
+            Field(
+                description="Adult-content filter. Omit for configured default: "
+                f"{default_safesearch}."
+            ),
+        ] = None,
+        context_threshold_mode: Annotated[
+            Literal["strict", "balanced", "lenient", "disabled"] | None,
+            Field(
+                description="Relevance filter: strict favors precision, lenient "
+                "favors coverage, disabled removes threshold filtering. Not exact "
+                f"matching. Omit for configured default: {default_threshold}."
+            ),
+        ] = None,
         num_results: Annotated[
             int | None,
             Field(
@@ -526,17 +627,7 @@ def register(mcp: FastMCP) -> None:
             ),
         ] = None,
     ) -> str:
-        """Search the web. Model-facing guidance is in the tool description.
-
-        :param query: Concise keywords; supports Brave operators such as site:,
-            "exact phrase", -exclude, foo OR bar, filetype:, intitle:, inbody:, lang:, loc:.
-        :param time_range: Recency (day/week/month/year/all) or inclusive YYYY-MM-DD to YYYY-MM-DD.
-        :param country: Two-letter result country code, such as US or GB.
-        :param search_lang: Result language code, such as en or zh-hans.
-        :param safesearch: Adult-content filter: off, moderate, strict, or omitted.
-        :param context_threshold_mode: Relevance filter: strict, balanced, lenient,
-            disabled, or omitted for Brave's default.
-        """
+        """Search the web. Model-facing guidance is in the tool description."""
         log_call(
             log,
             "search_web",
@@ -552,10 +643,10 @@ def register(mcp: FastMCP) -> None:
         query = (query or "").strip()
         if not query:
             raise ToolError("Empty query.")
-        if len(query) > 400:
-            raise ToolError("Query exceeds Brave's 400-character limit.")
-        if len(query.split()) > 50:
-            raise ToolError("Query exceeds Brave's 50-word limit.")
+        if len(query) > _MAX_QUERY_CHARS:
+            raise ToolError(f"Query exceeds Brave's {_MAX_QUERY_CHARS}-character limit.")
+        if len(query.split()) > _MAX_QUERY_WORDS:
+            raise ToolError(f"Query exceeds Brave's {_MAX_QUERY_WORDS}-word limit.")
 
         api_key = cfg.brave_api_key.strip()
         if not api_key:
