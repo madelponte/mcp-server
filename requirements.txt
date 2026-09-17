@@ -1,15 +1,15 @@
 # MCP server framework (FastMCP v4 + streamable-http transport).
 # fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
-fastmcp>=4.0.3
+fastmcp>=4.0.5
 starlette>=1.6.0
-uvicorn>=0.52.4
+uvicorn>=0.53.0
 
 # Config / settings. The whole server is configured from one YAML file
 # (config.example.yaml); PyYAML parses it and pydantic validates every value at
 # startup. Explicit dependency on PyYAML: it currently arrives transitively via
 # fastmcp, and an unpinned accidental removal would break startup.
 pydantic>=2.13.5
-PyYAML>=6.0
+PyYAML>=6.0.3
 
 # Shared HTTP / async
 httpx>=0.28.1
