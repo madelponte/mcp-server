@@ -43,18 +43,37 @@ overwhelm a model's context window. Omitting a value uses the cap.
 which returns relevance-ranked excerpts extracted from source pages for direct
 model consumption. Excerpts may contain text, tables, code, or JSON-serialized
 structured data. Each result carries a URL, title, `snippets` list, optional
-published date, description, and site name. The top-level `provider` is
-`brave_llm_context`.
+`page_date` with `date_source: "brave"`, description, and site name. The date is
+provider-reported and may represent publication or modification; it is not a
+verified publication timestamp. The top-level `provider` is `brave_llm_context`.
+Queries accept 1–600 characters and at most 75 words.
 
 `time_range` accepts `day`/`week`/`month`/`year`/`all` or an inclusive custom
-`YYYY-MM-DD to YYYY-MM-DD` range. `country`, `search_lang`, `safesearch`
-(`off`/`moderate`/`strict`), and `context_threshold_mode`
-(`strict`/`balanced`/`lenient`/`disabled`) map directly to Brave options.
+`YYYY-MM-DD to YYYY-MM-DD` range. This filters page freshness, **not event dates**.
+`country`, `search_lang`, `safesearch` (`off`/`moderate`/`strict`), and
+`context_threshold_mode` (`strict`/`balanced`/`lenient`/`disabled`) map directly to
+Brave options. Omitted filters use the server-configured defaults advertised in
+the parameter descriptions; blank optional filter settings defer to Brave.
+Country and language are preferences, not guaranteed hard restrictions.
 `num_results` controls the source-URL count and `max_tokens` controls the
 approximate total excerpt budget; both are clamped to configured server caps.
 Search uses only Brave's excerpts and metadata; it does not fetch source pages.
+Answer directly from sufficient excerpts and cite the result's URL. Fetch a page
+when context, precise wording, completeness, or freshness needs verification.
 Call `fetch_page(url, mode="structured")` when you need a page outline, then use
 `section=` to read a specific section.
+
+Repeated URLs have their unique snippets merged in provider order. Deduplication
+ignores known tracking parameters (`utm_*`, `gclid`, `dclid`, `fbclid`, `msclkid`)
+and `highlight` on `docs.python.org`, retaining the first result's original
+citation URL and metadata. Meaningful parameters, fragments, and versioned paths
+remain distinct. Deduplication may return fewer URLs than requested; it does not
+issue extra searches. Versions and syndicated copies are not independent
+corroboration.
+
+Output migration: `page_date` replaces `published_date` to avoid claiming a
+publication date that Brave does not guarantee. `date_source` is present only
+when a page date is available.
 
 Migration note: `enrich_results` and the settings
 `web_search.max_enrich_results`, `web_search.default_enrich_results`, and
@@ -68,7 +87,11 @@ Put those constraints in the query instead—for example `site:youtube.com` for
 videos, which `fetch_page` can then read as transcripts. Brave supports operators
 such as `site:`, `filetype:`, `intitle:`, `inbody:`, `lang:`, `loc:`, quoted
 phrases, exclusion with `-`, and uppercase `AND`/`OR`/`NOT`; operators are
-experimental and overly restrictive combinations may return no results.
+experimental and **not guaranteed hard constraints**, even for quoted phrases.
+Check whether the evidence actually supports the requested entity or phrase;
+`strict` filters relevance, not exact matches. If evidence is sparse, broaden the
+query, relax freshness, or try `lenient`. Empty results mean no usable context
+was returned, not proof that something does not exist.
 
 `fetch_page(url, mode="text", section=None, query=None, max_matches=None, context_lines=None, include_match_toc=false, offset=None)` — Fetch the contents
 of a single page (or a URL returned by `search_web`). Reads one URL per call —
