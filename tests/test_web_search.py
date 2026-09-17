@@ -250,7 +250,8 @@ def test_brave_query_posts_native_context_parameters_and_parses_sources(patch_ht
         "url": "https://a.example/page",
         "title": "A title",
         "snippets": ["First excerpt", '{"table":[1,2]}'],
-        "published_date": "2025-01-15T13:45:02Z",
+        "page_date": "2025-01-15T13:45:02Z",
+        "date_source": "brave",
         "description": "Page description",
         "site_name": "Example A",
     }
@@ -312,6 +313,107 @@ def test_brave_query_limits_and_deduplicates_results(patch_httpx):
     patch_httpx(lambda request: httpx.Response(200, json=payload))
     out = run(_brave_query(**_query_kwargs(num_results=1)))
     assert [item["url"] for item in out] == ["https://a.example/page"]
+
+
+@pytest.mark.parametrize(
+    ("age", "expected"),
+    [
+        (["Wednesday, January 15, 2025", "2025-01-15", "392 days ago",
+          "2025-01-15T13:45:02Z"], "2025-01-15T13:45:02Z"),
+        (["Wednesday, January 15, 2025", "2025-01-15"], "2025-01-15"),
+        (["Wednesday, January 15, 2025"], "Wednesday, January 15, 2025"),
+        ([None, " ", "392 days ago", None], None),
+        ([], None),
+        (None, None),
+        ("2025-01-15", None),
+    ],
+)
+def test_brave_page_date_is_optional_provider_metadata(patch_httpx, age, expected):
+    payload = _brave_response()
+    payload["sources"]["https://a.example/page"]["age"] = age
+    patch_httpx(lambda request: httpx.Response(200, json=payload))
+    result = run(_brave_query(**_query_kwargs()))[0]
+    assert "published_date" not in result
+    if expected:
+        assert result["page_date"] == expected
+        assert result["date_source"] == "brave"
+    else:
+        assert "page_date" not in result
+        assert "date_source" not in result
+
+
+@pytest.mark.parametrize(
+    ("variant", "base"),
+    [
+        ("https://example.com/page?utm_source=test&fbclid=123", "https://example.com/page"),
+        ("https://example.com/page?id=1&gclid=123&dclid=456&msclkid=789",
+         "https://example.com/page?id=1"),
+        ("https://example.com/page?utm_campaign=test&q=a%20b&q=c",
+         "https://example.com/page?q=a%20b&q=c"),
+        ("https://docs.python.org/3/library/asyncio-task.html?highlight=create_task",
+         "https://docs.python.org/3/library/asyncio-task.html"),
+    ],
+)
+def test_result_url_key_ignores_only_known_noise(variant, base):
+    assert ws._result_url_key(variant) == ws._result_url_key(base)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/page?id=1",
+        "https://example.com/page?id=2",
+        "https://example.com/page?highlight=meaningful",
+        "https://example.com/page?version=3.14",
+        "https://example.com/page?lang=fr",
+        "https://example.com/page?page=2",
+        "https://example.com/page#route",
+        "https://example.com/page?q=a%20b&q=c",
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://docs.python.org/3.14/library/asyncio-task.html",
+        "https://docs.python.org/3.13/library/asyncio-task.html",
+    ],
+)
+def test_result_url_key_preserves_meaningful_distinctions(url):
+    assert ws._result_url_key(url) == url
+
+
+def test_brave_query_merges_nonadjacent_duplicates_even_after_cap(patch_httpx):
+    first_url = "https://docs.python.org/3/library/asyncio-task.html?highlight=task"
+    base_url = "https://docs.python.org/3/library/asyncio-task.html"
+    code = "    indented_code()\n"
+    payload = {
+        "grounding": {"generic": [
+            {"url": first_url, "title": "First title", "snippets": ["A", "A", code]},
+            {"url": "https://other.example/", "title": "Other", "snippets": ["B"]},
+            {"url": base_url, "title": "Variant", "snippets": ["A", "C", " ", None]},
+            {"url": first_url, "title": "Duplicate", "snippets": ["D", code]},
+        ]},
+        "sources": {first_url: {"age": ["January 15, 2025", "2025-01-15"]}},
+    }
+    patch_httpx(lambda request: httpx.Response(200, json=payload))
+    out = run(_brave_query(**_query_kwargs(num_results=1)))
+    assert len(out) == 1
+    assert out[0]["url"] == first_url  # Retain the original citation URL and metadata.
+    assert out[0]["title"] == "First title"
+    assert out[0]["page_date"] == "2025-01-15"
+    assert out[0]["snippets"] == ["A", code, "C", "D"]
+
+
+def test_brave_query_dedup_keeps_versions_and_other_sources(patch_httpx):
+    urls = [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://docs.python.org/3/library/asyncio-task.html?highlight=task",
+        "https://docs.python.org/3.14/library/asyncio-task.html",
+        "https://other.example/page",
+    ]
+    payload = {"grounding": {"generic": [
+        {"url": url, "title": "Same title", "snippets": ["Shared excerpt"]}
+        for url in urls
+    ]}}
+    patch_httpx(lambda request: httpx.Response(200, json=payload))
+    out = run(_brave_query(**_query_kwargs(num_results=3)))
+    assert [item["url"] for item in out] == [urls[0], urls[2], urls[3]]
 
 
 def test_brave_query_retries_429_using_exhausted_rate_window_reset(
@@ -522,10 +624,24 @@ def test_search_web_empty_or_oversized_query_raises(tool_fns):
     fn = tool_fns["search_web"]
     with pytest.raises(ToolError):
         run(fn(query="  "))
-    with pytest.raises(ToolError, match="400-character"):
-        run(fn(query="x" * 401))
-    with pytest.raises(ToolError, match="50-word"):
-        run(fn(query=" ".join(["x"] * 51)))
+    with pytest.raises(ToolError, match="600-character"):
+        run(fn(query="x" * 601))
+    with pytest.raises(ToolError, match="75-word"):
+        run(fn(query=" ".join(["x"] * 76)))
+
+
+@pytest.mark.parametrize("query", ["x" * 600, " ".join(["word"] * 75)])
+def test_search_web_accepts_new_query_boundaries(monkeypatch, tool_fns, query):
+    seen = []
+
+    async def fake_query(**kwargs):
+        seen.append(kwargs["query"])
+        return []
+
+    monkeypatch.setattr(ws, "_brave_query", fake_query)
+    out = json.loads(run(tool_fns["search_web"](query=query)))
+    assert seen == [query]
+    assert out["query"] == query
 
 
 def test_search_web_requires_brave_key(monkeypatch, tool_fns):
@@ -619,7 +735,12 @@ def test_search_web_only_calls_brave_and_returns_provider_metadata(
     assert calls == [ws.cfg.brave_api_url]
     assert out["results"][0]["description"] == "Page description"
     assert out["results"][0]["site_name"] == "Example A"
-    assert not any(key.startswith("page_") for result in out["results"] for key in result)
+    assert out["results"][0]["page_date"] == "2025-01-15T13:45:02Z"
+    assert out["results"][0]["date_source"] == "brave"
+    assert not any(
+        key.startswith("page_") and key != "page_date"
+        for result in out["results"] for key in result
+    )
 
 
 def test_search_web_valid_empty_result_is_not_error(monkeypatch, tool_fns):
