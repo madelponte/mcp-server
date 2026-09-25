@@ -47,6 +47,12 @@ def build_server() -> FastMCP:
         else getattr(logging, server_settings.log_level.upper(), logging.INFO)
     )
     logging.basicConfig(level=level)
+    # httpx logs every request URL at INFO, and some providers (Wolfram's AppID)
+    # authenticate through the query string, which would put the secret in the
+    # log. Keep these loggers at WARNING unless debugging, and even then the
+    # tools pass no secrets on URLs they log themselves.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     log.info(
         "Configuration source: %s",
         CONFIG_PATH if CONFIG_PATH is not None else "built-in defaults plus environment overrides (no config file found)",

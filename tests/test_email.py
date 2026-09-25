@@ -414,3 +414,31 @@ def test_connection_error_raises_toolerror(monkeypatch, tool_fns):
     with pytest.raises(ToolError) as exc:
         run(fn(recipients=["a@b.com"], subject="hi", body="yo"))
     assert "smtp server" in str(exc.value).lower()
+
+
+def test_smtp_send_uses_verifying_tls_context(monkeypatch):
+    import ssl
+    import smtplib
+    from email.message import EmailMessage
+    from tools import email as email_tool
+
+    seen = {}
+
+    class FakeSMTP:
+        def __init__(self, *a, context=None, **k):
+            seen.setdefault("contexts", []).append(context)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def ehlo(self): pass
+        def starttls(self, context=None): seen.setdefault("contexts", []).append(context)
+        def login(self, *a): pass
+        def send_message(self, msg, to_addrs=None): return {}
+
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", FakeSMTP)
+    for use_ssl in (True, False):
+        seen.clear()
+        monkeypatch.setattr(email_tool.cfg, "use_ssl", use_ssl)
+        email_tool._send(EmailMessage(), ["a@b.co"])
+        ctx = seen["contexts"][-1]
+        assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname

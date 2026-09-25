@@ -522,3 +522,11 @@ def test_close_clients_closes_every_client_and_clears_pool(module_name, pool_att
     run(mod.close_clients())
     assert fake.closed
     assert pool == {}
+
+
+def test_build_server_quiets_httpx_request_logging():
+    import logging
+    import server
+
+    server.build_server()
+    assert logging.getLogger("httpx").level >= logging.WARNING
