@@ -15,6 +15,7 @@ import logging
 import mimetypes
 import re
 import smtplib
+import ssl
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
@@ -299,10 +300,17 @@ def _prepare_message(
 
 
 def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
-    """Blocking SMTP send. Runs in a worker thread (see send_email)."""
+    """Blocking SMTP send. Runs in a worker thread (see send_email).
+
+    An explicit default context is required: smtplib's fallback context does not
+    verify the server certificate or hostname, which would expose the SMTP
+    credentials to a man-in-the-middle.
+    """
+    context = ssl.create_default_context()
     if cfg.use_ssl:
         with smtplib.SMTP_SSL(
-            cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds
+            cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds,
+            context=context,
         ) as server:
             server.login(cfg.username, cfg.password)
             return server.send_message(msg, to_addrs=envelope_recipients)
@@ -311,7 +319,7 @@ def _send(msg: EmailMessage, envelope_recipients: list[str]) -> dict:
             cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds
         ) as server:
             server.ehlo()
-            server.starttls()
+            server.starttls(context=context)
             server.ehlo()
             server.login(cfg.username, cfg.password)
             return server.send_message(msg, to_addrs=envelope_recipients)

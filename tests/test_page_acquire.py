@@ -60,7 +60,11 @@ def test_cancelled_waiter_does_not_evict_shared_acquisition(monkeypatch, fails):
 
         monkeypatch.setattr(pa, "_acquire_page", acquire)
         first = asyncio.create_task(pa.acquire_page(url))
+        # A second waiter keeps the shared task alive when the first leaves;
+        # the last waiter leaving cancels it (see the dedicated test below).
+        keeper = asyncio.create_task(pa.acquire_page(url))
         await started.wait()
+        await asyncio.sleep(0)
         underlying = pa._acquire_inflight[url]
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -72,7 +76,7 @@ def test_cancelled_waiter_does_not_evict_shared_acquisition(monkeypatch, fails):
         third = asyncio.create_task(pa.acquire_page(url))
         await asyncio.sleep(0)
         release.set()
-        results = await asyncio.gather(second, third, return_exceptions=True)
+        results = await asyncio.gather(second, third, keeper, return_exceptions=True)
         assert calls == 1
         if fails:
             assert all(isinstance(result, RuntimeError) for result in results)
@@ -592,3 +596,49 @@ def test_http_errors_do_not_open_host_browser_circuit(monkeypatch):
         "https://example.com/b",
         "https://example.com/c",
     ]
+
+
+def test_last_waiter_cancel_cancels_shared_acquisition(monkeypatch):
+    import asyncio
+    from tools import page_acquire
+
+    state = {"cancelled": False}
+
+    async def slow(url):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    monkeypatch.setattr(page_acquire, "_acquire_page", slow)
+
+    async def scenario():
+        w1 = asyncio.create_task(page_acquire.acquire_page("https://e.test/a"))
+        w2 = asyncio.create_task(page_acquire.acquire_page("https://e.test/a"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        w1.cancel()
+        await asyncio.sleep(0.01)
+        assert not state["cancelled"]  # w2 still waiting
+        w2.cancel()
+        await asyncio.sleep(0.01)
+        assert state["cancelled"]
+        assert "https://e.test/a" not in page_acquire._acquire_inflight
+        assert "https://e.test/a" not in page_acquire._acquire_waiters
+
+    asyncio.run(scenario())
+
+
+def test_host_failure_table_is_bounded(monkeypatch):
+    from tools import page_acquire
+
+    page_acquire._host_failures.clear()
+    page_acquire._open_circuits.clear()
+    monkeypatch.setattr(page_acquire, "_MAX_TRACKED_HOSTS", 10)
+    monkeypatch.setattr(page_acquire.cfg, "circuit_breaker_enabled", True)
+    for i in range(50):
+        page_acquire._record_browser_failure(f"https://h{i}.test/x")
+    assert len(page_acquire._host_failures) <= 10
+    page_acquire._host_failures.clear()
+    page_acquire._open_circuits.clear()
