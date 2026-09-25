@@ -1,0 +1,7 @@
+# Development / test dependencies (not needed to run the server).
+# Install with: pip install -r requirements-dev.txt
+-r requirements.in
+
+# Test runner. The suite is offline (httpx MockTransport + monkeypatching) and
+# drives async code with asyncio.run, so no async pytest plugin is required.
+pytest>=9.1.1

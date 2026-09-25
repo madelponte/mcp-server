@@ -1296,6 +1296,27 @@ def _unsupported_media_error(
     )
 
 
+def _redact_backend_secrets(text: Any, *extra_secrets: str) -> str:
+    """Redact backend credentials (API keys and URL-embedded passwords)."""
+    passwords = tuple(
+        urlparse(endpoint).password or ""
+        for endpoint in (
+            cfg.flaresolverr_url,
+            cfg.firecrawl_api_url,
+            cfg.tika_url,
+            cfg.classifier_api_url,
+        )
+        if endpoint
+    )
+    return redact_secrets(
+        text,
+        *extra_secrets,
+        cfg.firecrawl_api_key,
+        cfg.classifier_api_key,
+        *passwords,
+    )
+
+
 async def _fetch_one(
     url: str,
     mode: str = "text",
@@ -1381,22 +1402,8 @@ async def _fetch_one(
         try:
             fetched, compact, reddit_source, reddit_trace = await _acquire_reddit(url)
         except Exception as exc:
-            backend_passwords = tuple(
-                urlparse(endpoint).password or ""
-                for endpoint in (
-                    cfg.flaresolverr_url,
-                    cfg.firecrawl_api_url,
-                    cfg.tika_url,
-                    cfg.classifier_api_url,
-                )
-                if endpoint
-            )
-            detail = redact_secrets(
-                exc,
-                cfg.reddit_client_secret,
-                cfg.firecrawl_api_key,
-                cfg.classifier_api_key,
-                *backend_passwords,
+            detail = _redact_backend_secrets(
+                exc, cfg.reddit_client_secret
             )
             raise ToolError(f"Fetch failed for {url}: {detail}")
 
@@ -1448,22 +1455,9 @@ async def _fetch_one(
                 )
             payload["note"] = _join_note(payload.get("note"), rate_limit_note)
         if debug_enabled():
-            backend_passwords = tuple(
-                urlparse(endpoint).password or ""
-                for endpoint in (
-                    cfg.flaresolverr_url,
-                    cfg.firecrawl_api_url,
-                    cfg.tika_url,
-                    cfg.classifier_api_url,
-                )
-                if endpoint
-            )
-            trace_note = redact_secrets(
+            trace_note = _redact_backend_secrets(
                 "Reddit fallback trace: " + "; ".join(reddit_trace) + ".",
                 cfg.reddit_client_secret,
-                cfg.firecrawl_api_key,
-                cfg.classifier_api_key,
-                *backend_passwords,
             )
             payload["note"] = _join_note(payload.get("note"), trace_note)
         return payload
@@ -1480,22 +1474,7 @@ async def _fetch_one(
         primary_exc = exc
 
     if primary_exc is not None:
-        backend_passwords = tuple(
-            urlparse(endpoint).password or ""
-            for endpoint in (
-                cfg.flaresolverr_url,
-                cfg.firecrawl_api_url,
-                cfg.tika_url,
-                cfg.classifier_api_url,
-            )
-            if endpoint
-        )
-        detail = redact_secrets(
-            primary_exc,
-            cfg.firecrawl_api_key,
-            cfg.classifier_api_key,
-            *backend_passwords,
-        )
+        detail = _redact_backend_secrets(primary_exc)
         detail = detail.strip() or type(primary_exc).__name__
         raise ToolError(f"Fetch failed for {fetch_url}: {detail}")
 

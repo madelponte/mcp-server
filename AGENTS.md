@@ -35,6 +35,17 @@ docker build -t openwebui-tools-mcp .
 docker run --rm -p 8000:8000 -v "$PWD/config.yaml:/app/config.yaml:ro" openwebui-tools-mcp
 ```
 
+### Dependencies
+
+`requirements.in` / `requirements-dev.in` hold the direct dependencies (edit these); `requirements.txt` / `requirements-dev.txt` are **generated, fully pinned, hash-verified lockfiles** that the Dockerfile and CI install. Never edit the `.txt` files by hand. To add/bump a dependency or refresh everything to the latest releases:
+
+```bash
+uv pip compile requirements.in --universal --python-version 3.13 --generate-hashes --upgrade -o requirements.txt
+uv pip compile requirements-dev.in --universal --python-version 3.13 --generate-hashes --upgrade -o requirements-dev.txt
+```
+
+Drop `--upgrade` to re-lock without moving versions already pinned. Run the test suite (3.13 and 3.14) after a refresh.
+
 ### Tests
 
 ```bash
