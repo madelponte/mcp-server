@@ -51,6 +51,12 @@ _AUTHORITATIVE_HTML_ERROR_STATUSES = frozenset({404, 410, 451})
 _host_failures: dict[str, dict[str, float]] = defaultdict(dict)
 _open_circuits: dict[str, float] = {}
 _acquire_inflight: dict[str, asyncio.Task] = {}
+_acquire_waiters: dict[str, int] = {}
+
+# Hosts are model-supplied, so the circuit-breaker tables must not grow without
+# bound: past this many tracked hosts, expired entries are swept and, if that is
+# not enough, the oldest-tracked hosts are dropped.
+_MAX_TRACKED_HOSTS = 1024
 
 
 def _host(url: str) -> str:
@@ -71,6 +77,22 @@ def _prune_host(host: str, now: float) -> None:
         _open_circuits.pop(host, None)
 
 
+def _bound_host_tables(now: float) -> None:
+    """Keep the per-host circuit tables under ``_MAX_TRACKED_HOSTS`` entries."""
+    if len(_host_failures) <= _MAX_TRACKED_HOSTS:
+        return
+    for host in list(_host_failures):
+        _prune_host(host, now)
+    for host, expiry in list(_open_circuits.items()):
+        if expiry <= now:
+            _open_circuits.pop(host, None)
+    # Dicts preserve insertion order, so the front holds the oldest hosts.
+    while len(_host_failures) > _MAX_TRACKED_HOSTS:
+        oldest = next(iter(_host_failures))
+        _host_failures.pop(oldest, None)
+        _open_circuits.pop(oldest, None)
+
+
 def _circuit_open(url: str) -> bool:
     if not cfg.circuit_breaker_enabled or not cfg.firecrawl_api_key.strip():
         return False
@@ -87,6 +109,7 @@ def _record_browser_failure(url: str) -> None:
     now = time.monotonic()
     _prune_host(host, now)
     _host_failures[host][url] = now
+    _bound_host_tables(now)
     threshold = max(1, cfg.circuit_breaker_failure_threshold)
     if len(_host_failures[host]) >= threshold:
         _open_circuits[host] = now + max(0, cfg.circuit_breaker_ttl_seconds)
@@ -510,7 +533,12 @@ async def _acquire_page(url: str) -> dict:
 
 
 async def acquire_page(url: str) -> dict:
-    """Coalesce concurrent acquisition of one URL around the browser-first core."""
+    """Coalesce concurrent acquisition of one URL around the browser-first core.
+
+    The shared task is cancelled when its last waiter goes away (client
+    disconnect or MCP deadline), so an abandoned render does not keep holding a
+    FlareSolverr/Firecrawl slot until it finishes on its own.
+    """
     task = _acquire_inflight.get(url)
     if task is None:
         task = asyncio.create_task(_acquire_page(url))
@@ -526,8 +554,22 @@ async def acquire_page(url: str) -> dict:
                 done.exception()
 
         task.add_done_callback(completed)
-    # wait() does not propagate waiter cancellation to the shared task. Unlike
-    # shield() on Python 3.14, it does not independently log a later failure
-    # after a waiter leaves; the completion callback above owns that cleanup.
-    await asyncio.wait({task})
+    _acquire_waiters[url] = _acquire_waiters.get(url, 0) + 1
+    try:
+        # wait() does not propagate waiter cancellation to the shared task, so
+        # the last waiter cancels it explicitly in the handler below.
+        await asyncio.wait({task})
+    except asyncio.CancelledError:
+        if _acquire_waiters.get(url, 0) <= 1 and not task.done():
+            task.cancel()
+            # Later callers must start fresh rather than join a cancelled task.
+            if _acquire_inflight.get(url) is task:
+                _acquire_inflight.pop(url, None)
+        raise
+    finally:
+        remaining = _acquire_waiters.get(url, 0) - 1
+        if remaining > 0:
+            _acquire_waiters[url] = remaining
+        else:
+            _acquire_waiters.pop(url, None)
     return task.result()
