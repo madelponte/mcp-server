@@ -1,49 +1,7 @@
-"""
-Central configuration for the MCP server.
-The server is configured by a single YAML file — bind-mounted into the container
-at ``/app/config.yaml`` (see ``docker-compose.yml``), or picked up next to this
-module when running from source — instead of a pile of environment variables.
-Every setting lives under a named section whose keys are the field names below:
+"""YAML configuration models and loading for the MCP server.
 
-    tools:                      # which MCP tools get registered
-      search_web_enabled: true
-    server:                     # transport, logging, bearer auth
-      port: 8000
-      auth_tokens:              # any number of named client credentials
-        - name: open-webui
-          token: "..."
-        - name: claude-desktop
-          token: "..."
-    web_search:                 # search_web / fetch_page
-      brave_api_key: "..."
-    stock: {}    wolfram: {}    youtube: {}    geocoding: {}    email: {}
-
-Resolution order for any value is **process environment variable → YAML file →
-field default**. Each section keeps the environment prefix it used before
-(``MCP_``, ``WEB_SEARCH_``, ``STOCK_``, ``WOLFRAM_``, ``YOUTUBE_``, ``GEO_``,
-``EMAIL_``; the ``tools`` flags have none) with the variable name being that
-prefix plus the uppercased key — so an existing ``WEB_SEARCH_BRAVE_API_KEY``
-still works and can keep a secret out of the mounted file. An environment
-variable set to a blank value counts as unset, so a stale ``FOO=`` left in a
-shell or image layer cannot wipe a configured YAML value.
-
-The file is located, first match wins:
-
-1. ``MCP_CONFIG_FILE`` — when set, the file **must** exist. A typo in an
-   explicitly requested path is a startup error, never a silent fallback to
-   defaults.
-2. ``config.yaml`` / ``config.yml`` next to this module (the repo root, and
-   ``/app`` inside the image).
-3. ``/etc/mcp-server/config.yaml``.
-
-Finding no file at all is not an error: every field has a default and the HTTP
-transport still refuses to start without a bearer token. Configured values are
-validated by pydantic at startup; range constraints (``ge=``/``gt=``/``le=``)
-make a misconfigured cap — e.g. a negative download cap that would abort every
-fetch — fail fast with a :class:`ConfigError` naming the section and key
-instead of silently changing runtime behavior. Unknown keys are logged as
-warnings and ignored, so a config file written for an older release still
-starts a newer server.
+Values resolve in environment → YAML → field-default order. See
+``config.example.yaml`` for all settings and file-discovery details.
 """
 
 from __future__ import annotations
@@ -88,26 +46,11 @@ DEFAULT_UA = (
 
 
 class ConfigError(RuntimeError):
-    """A missing explicitly-named config file, malformed YAML, or bad value.
-
-    Raised while loading configuration, i.e. at import time, so a broken
-    deployment fails at startup instead of mid-request.
-    """
+    """Configuration discovery, parsing, or validation failed."""
 
 
 class BaseSection(BaseModel):
-    """One top-level YAML section (``server:``, ``web_search:``, …).
-
-    Field names are the YAML keys. ``_env_prefix`` records the environment
-    prefix that keeps the pre-YAML variable names working as overrides, and
-    ``_list_join_fields`` lists keys that may be written as a YAML list even
-    though the consuming code parses a comma-separated string.
-
-    Unknown keys are ignored by pydantic but reported by
-    :func:`_warn_unknown_keys` while the file is read: a typo should be visible
-    in the log without bricking a server that was upgraded past a setting the
-    file still mentions.
-    """
+    """Base for one top-level YAML settings section."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -132,12 +75,7 @@ class BaseSection(BaseModel):
 
 
 class AuthToken(BaseModel):
-    """A named bearer credential accepted by the HTTP transports.
-
-    Unlike the settings sections, an unrecognized key here is a hard error: a
-    misspelled field would silently drop a client's credential, and auth is not
-    the place to accept a best guess.
-    """
+    """A named HTTP bearer credential."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -183,13 +121,7 @@ class AuthToken(BaseModel):
 
 
 class ToolSettings(BaseSection):
-    """Startup availability flags for the registered MCP tools (``tools:``).
-
-    These fields deliberately carry no environment prefix: each already contains
-    the complete public tool name, so the override variables stay
-    ``SEARCH_WEB_ENABLED``, ``GET_COMPANY_DATA_ENABLED``, and so on.
-    Disabled tools are omitted from MCP registration entirely.
-    """
+    """Tool registration flags (``tools:``)."""
 
     _env_prefix = ""
 
@@ -304,14 +236,7 @@ class ServerSettings(BaseSection):
         return AuthToken(token=value).token if value.strip() else ""
 
     def token_entries(self) -> list[AuthToken]:
-        """Every accepted credential: the named list plus the legacy field.
-
-        Computed on demand rather than stored, so a value changed after
-        construction (a test monkeypatch, for example) is still reflected here.
-        Identical token values are collapsed, which is what makes the legacy
-        ``auth_token``/``MCP_AUTH_TOKEN`` field harmless when a file also lists
-        the same credential explicitly.
-        """
+        """Return named and legacy credentials, deduplicated by token value."""
         entries = list(self.auth_tokens)
         legacy = (self.auth_token or "").strip()
         if legacy and legacy not in {entry.token for entry in entries}:
@@ -348,11 +273,7 @@ class ServerSettings(BaseSection):
 
 
 class WebSearchSettings(BaseSection):
-    """Valves for the Agentic Web Search tools (``web_search:``).
-
-    The section name predates the split tooling: it covers ``fetch_page`` as
-    well as ``search_web``.
-    """
+    """Web search and page-fetch settings (``web_search:``)."""
 
     _env_prefix = "WEB_SEARCH_"
     _list_join_fields = frozenset({"ssrf_allowlist"})
@@ -447,7 +368,6 @@ class WebSearchSettings(BaseSection):
         description="Initial Brave retry delay; later retries double it.",
     )
 
-    # A maximum, not a fixed amount: search_web can request fewer source URLs.
     max_num_results: int = Field(
         5,
         ge=1,
@@ -700,11 +620,6 @@ class WebSearchSettings(BaseSection):
         25, ge=1, description="Max headings in fetch_page structured/section responses."
     )
 
-    # `fetch_page`'s optional `query` does server-side extractive filtering:
-    # it returns only the segments (paragraphs / transcript caption lines) that
-    # lexically match the query, each with this many neighbouring segments of
-    # context on either side. A larger context reads more naturally but costs
-    # more of the model's context window.
     query_context_segments: int = Field(
         2, ge=0,
         description=(
@@ -719,8 +634,6 @@ class WebSearchSettings(BaseSection):
             "query match; larger model requests are clamped."
         ),
     )
-    # MAXIMUM, not a fixed amount: a context-budget cap on how many distinct
-    # match windows a single filtered fetch_page response may contain.
     max_query_matches: int = Field(
         10, ge=1,
         description=(
@@ -752,10 +665,6 @@ class StockSettings(BaseSection):
     request_timeout: int = Field(15, gt=0, description="HTTP request timeout in seconds.")
     cache_ttl_seconds: int = Field(60, ge=0, description="Cache responses this long (0 disables).")
 
-    # The following are MAXIMUMS, not fixed amounts. `get_company_data` lets the
-    # model request a smaller range per call; anything above these caps is
-    # clamped down so an oversized response can't overwhelm the model's context
-    # window. When the model doesn't specify, the cap is used (the prior behavior).
     max_symbols: int = Field(
         2, ge=1,
         description=(
@@ -781,9 +690,6 @@ class StockSettings(BaseSection):
     max_history_bars: int = Field(
         30, ge=1, description="Maximum daily OHLC price-history bars returned."
     )
-    # Caps for the peers / dividends / ownership sections. These are pure
-    # server-side safety caps (not model-tunable params): they bound the
-    # response size for sections whose natural length is open-ended.
     max_peers: int = Field(
         15, ge=1, description="Maximum peer tickers returned by the 'peers' section."
     )
@@ -868,15 +774,10 @@ class GeocodingSettings(BaseSection):
     _env_prefix = "GEO_"
     _list_join_fields = frozenset({"overpass_fallback_urls"})
 
-    # Geocoding backend. Defaults to OpenStreetMap's public Nominatim instance;
-    # point this at your own deployment to self-host (and then set
-    # min_request_interval_seconds to 0 to drop the public-API throttle).
     nominatim_url: str = Field(
         "https://nominatim.openstreetmap.org",
         description="Base URL of a Nominatim instance (no trailing /search).",
     )
-    # Point-of-interest backend. Defaults to the public Overpass API; can be
-    # pointed at a self-hosted Overpass instance.
     overpass_url: str = Field(
         "https://overpass-api.de/api/interpreter",
         description="Full URL of the primary Overpass API interpreter endpoint.",
@@ -890,9 +791,6 @@ class GeocodingSettings(BaseSection):
         ),
     )
 
-    # Nominatim's usage policy REQUIRES a descriptive User-Agent that identifies
-    # the application (ideally with contact info). The shared browser-style UA
-    # used elsewhere is NOT acceptable here — set this to identify your deployment.
     user_agent: str = Field(
         "openwebui-tools-mcp/1.0 (OpenStreetMap geocoding; "
         "+https://github.com/madelponte/mcp-server)",
@@ -923,9 +821,6 @@ class GeocodingSettings(BaseSection):
             "Overpass query's [timeout:N] so the server stops its own work in time."
         ),
     )
-    # One throttle covers both OpenStreetMap backends: Nominatim's public API
-    # allows at most one request per second, while Overpass rejects bursts with
-    # 429/504 responses. Set the interval to 0 when self-hosting.
     min_request_interval_seconds: float = Field(
         1.0, ge=0,
         description=(
@@ -935,9 +830,6 @@ class GeocodingSettings(BaseSection):
         ),
     )
 
-    # The following are MAXIMUMS, not fixed amounts. The tool lets the model
-    # request fewer per call; anything larger is clamped so an oversized response
-    # can't overwhelm the model's context window. Omitting the value uses the cap.
     max_nearby_results: int = Field(
         20, ge=1, description="Maximum nearby places returned per query."
     )
@@ -952,9 +844,6 @@ class GeocodingSettings(BaseSection):
         20000, ge=1, description="Maximum search radius (meters) for a nearby query."
     )
 
-    # Every POI search includes a nearby-towns companion list (city/town/village
-    # around the center) to seed follow-up searches in neighboring municipalities.
-    # MAX is also the default, so omitting the count returns up to this many.
     max_nearby_towns: int = Field(
         10, ge=1,
         description=(
@@ -1001,13 +890,7 @@ class GeocodingSettings(BaseSection):
 
 
 class EmailSettings(BaseSection):
-    """Valves for the Email (send-only) tool (``email:``).
-
-    Defaults target Gmail. Gmail no longer accepts your normal account
-    password over SMTP — you must create an **App Password** (Google Account →
-    Security → 2-Step Verification → App passwords) and put that 16-character
-    value in ``email.password``, with your full address in ``email.username``.
-    """
+    """Send-only SMTP settings (``email:``)."""
 
     _env_prefix = "EMAIL_"
     _list_join_fields = frozenset({"allowed_recipients"})
@@ -1060,9 +943,6 @@ class EmailSettings(BaseSection):
     timeout_seconds: float = Field(
         30.0, gt=0, description="Timeout for connecting to and talking to the SMTP server, in seconds."
     )
-    # MAXIMUM, not a fixed amount: a guard against a single call fanning out to an
-    # unbounded recipient list. Recipients past this cap are dropped (and named in
-    # the result) rather than silently sent to.
     max_recipients: int = Field(
         25, ge=1,
         description=(
@@ -1124,11 +1004,7 @@ SECTIONS: dict[str, type[BaseSection]] = {
 
 
 class AppConfig(BaseModel):
-    """The fully validated configuration: one instance per section.
-
-    A missing section is not an error — it simply keeps its field defaults (and
-    any environment overrides for it).
-    """
+    """Fully validated configuration, grouped by section."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -1143,11 +1019,7 @@ class AppConfig(BaseModel):
 
 
 def _normalize_key(key: Any) -> str:
-    """Fold case and hyphens, so ``WEB_SEARCH:`` / ``ssrf-allowlist`` also work.
-
-    Canonical names are lower snake_case; the fold costs nothing and spares
-    someone porting an old `.env` file from rewriting every line by hand.
-    """
+    """Convert a YAML key to canonical lower snake_case."""
     return str(key).strip().lower().replace("-", "_")
 
 
@@ -1161,12 +1033,7 @@ def _normalize_keys(value: Any) -> Any:
 
 
 def _is_env_overridable(annotation: Any) -> bool:
-    """Whether an environment variable can express this field's type.
-
-    Scalars and ``Literal``s can (pydantic coerces the string). Nested models and
-    lists are YAML-only: there is no sane syntax for a list of named tokens in a
-    variable, and pretending otherwise invites a confusing parse error.
-    """
+    """Return whether a string environment variable can express this type."""
     if get_origin(annotation) is Literal:
         return all(isinstance(option, (str, int, float, bool)) for option in get_args(annotation))
     return isinstance(annotation, type) and issubclass(annotation, (str, int, float, bool))
@@ -1175,12 +1042,7 @@ def _is_env_overridable(annotation: Any) -> bool:
 def _env_overrides(
     cls: type[BaseSection], env: Mapping[str, str]
 ) -> dict[str, tuple[str, str]]:
-    """Map field name -> (variable name, raw value) for the variables that are set.
-
-    A variable holding only whitespace counts as unset, so a stray ``FOO=``
-    inherited from a shell, an image layer, or a half-migrated compose file
-    cannot wipe out the value configured in YAML.
-    """
+    """Return nonblank environment overrides keyed by field name."""
     overrides: dict[str, tuple[str, str]] = {}
     for name, field in cls.model_fields.items():
         if not _is_env_overridable(field.annotation):
@@ -1209,13 +1071,7 @@ def _describe_error_location(section: str, loc: tuple[Any, ...]) -> str:
 
 
 def _value_hint(error: Mapping[str, Any]) -> str:
-    """Explain the one YAML mistake that catches almost every migrated file.
-
-    YAML 1.1 resolves bare ``off`` / ``no`` / ``yes`` / ``on`` to booleans, so a
-    textual value like ``brave_safesearch: off`` arrives as ``False`` and fails
-    string validation. Guessing a replacement ("false"?) would silently change
-    what the provider is asked for, so the fix is to say it out loud: quote it.
-    """
+    """Explain YAML boolean words supplied where text was expected."""
     if error.get("type") == "string_type" and isinstance(error.get("input"), bool):
         return (
             "YAML read this as a boolean. Quote the word to keep it text, e.g. "
@@ -1230,12 +1086,7 @@ def _format_validation_error(
     path: Path | None,
     overrides: Mapping[str, tuple[str, str]],
 ) -> str:
-    """Turn a pydantic error into an operator-readable startup message.
-
-    Each line names the setting and — when the value came from the environment
-    rather than the file — the variable responsible, which is otherwise very
-    hard to spot when a legacy variable silently wins.
-    """
+    """Format validation errors without exposing configured values."""
     lines = []
     for error in exc.errors():
         loc = error.get("loc") or ()
@@ -1275,12 +1126,7 @@ def _build_section(
 def _warn_unknown_keys(
     data: Mapping[str, Any], cls: type[BaseModel], where: str, path: Path | None
 ) -> None:
-    """Log (and otherwise ignore) keys no field claims.
-
-    Strict rejection would be friendlier to typos but hostile to upgrades: a
-    file written for an older release mentioning a removed setting must still
-    boot. The warning keeps the typo visible either way.
-    """
+    """Warn about unknown keys while preserving upgrade compatibility."""
     fields = cls.model_fields
     for key, value in data.items():
         if key not in fields:
@@ -1298,11 +1144,7 @@ def _warn_unknown_keys(
 
 
 class _ConfigLoader(yaml.SafeLoader):
-    """Safe YAML with duplicate explicit keys rejected, not silently overwritten.
-
-    YAML merge keys remain supported: an explicit setting may override an
-    inherited one, but two explicit spellings of the same setting are an error.
-    """
+    """Safe YAML loader that rejects duplicate explicit keys."""
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict:
         seen: set[str] = set()
@@ -1356,12 +1198,7 @@ def candidate_config_paths() -> tuple[Path, ...]:
 
 
 def resolve_config_path(env: Mapping[str, str] | None = None) -> Path | None:
-    """Locate the config file, or None when the server runs on defaults.
-
-    An explicitly requested path must exist. Falling back to defaults there
-    would boot a server with no API keys and (fail-closed aside) potentially no
-    authentication, which is a far worse outcome than refusing to start.
-    """
+    """Locate the config file; require an explicitly requested file to exist."""
     env = os.environ if env is None else env
     explicit = (env.get(CONFIG_PATH_ENV_VAR) or "").strip()
     if explicit:
@@ -1381,12 +1218,7 @@ def resolve_config_path(env: Mapping[str, str] | None = None) -> Path | None:
 def load_config(
     path: Path | None = None, *, env: Mapping[str, str] | None = None
 ) -> AppConfig:
-    """Read, validate, and return the configuration.
-
-    `path` defaults to :func:`resolve_config_path` and `env` to ``os.environ``;
-    passing both is how the tests load a temp file without touching the process.
-    Raises :class:`ConfigError` on unreadable/malformed YAML or an invalid value.
-    """
+    """Read and validate configuration from YAML plus environment overrides."""
     env = os.environ if env is None else env
     if path is None:
         path = resolve_config_path(env)
