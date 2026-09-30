@@ -923,12 +923,9 @@ class GeocodingSettings(BaseSection):
             "Overpass query's [timeout:N] so the server stops its own work in time."
         ),
     )
-    # Nominatim's public API allows at most 1 request/second. We serialize calls
-    # and space them by this interval. Set to 0 when self-hosting to disable it.
-    # One throttle covers both OpenStreetMap backends (Nominatim and Overpass).
-    # The public APIs rate-limit aggressive callers (Nominatim caps at ~1/sec;
-    # Overpass rejects bursts with 429/504), so requests to both are serialized
-    # and spaced by this single interval. Set to 0 to disable when self-hosting.
+    # One throttle covers both OpenStreetMap backends: Nominatim's public API
+    # allows at most one request per second, while Overpass rejects bursts with
+    # 429/504 responses. Set the interval to 0 when self-hosting.
     min_request_interval_seconds: float = Field(
         1.0, ge=0,
         description=(
