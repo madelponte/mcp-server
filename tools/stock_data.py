@@ -29,11 +29,13 @@ import anyio
 import requests
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import stock_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result
+from .output_schemas import COMPANY_DATA_OUTPUT_SCHEMA
+from .serialize import log_call, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
@@ -1716,7 +1718,10 @@ async def _fetch_company(
 # ===================================================================
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
+    @mcp.tool(
+        annotations=READ_ONLY_EXTERNAL_TOOL,
+        output_schema=COMPANY_DATA_OUTPUT_SCHEMA,
+    )
     async def get_company_data(
         symbol: Annotated[
             str | list[str],
@@ -1776,7 +1781,7 @@ def register(mcp: FastMCP) -> None:
                 ),
             ),
         ] = None,
-    ) -> str:
+    ) -> ToolResult:
         """Get stock/company data. symbol=ticker or name (auto-resolved); pass a
         list of tickers/names to compare several companies in one call.
 
@@ -1915,7 +1920,7 @@ def register(mcp: FastMCP) -> None:
 
         if single_input and not skipped:
             payload = await _fetch_company(queries[0], *args)
-            return log_result(log, "get_company_data", to_json(payload))
+            return structured_result(log, "get_company_data", payload)
 
         # Multiple symbols: fetch concurrently, capturing each symbol's failure so
         # one bad ticker doesn't sink the comparison (partial-success contract).
@@ -1947,4 +1952,4 @@ def register(mcp: FastMCP) -> None:
                 f"Fetched the first {cfg.max_symbols} of {total} symbols; "
                 f"{len(skipped)} skipped (per-call limit)."
             )
-        return log_result(log, "get_company_data", to_json(batch))
+        return structured_result(log, "get_company_data", batch)

@@ -36,10 +36,12 @@ import regex as safe_regex
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
-from .serialize import to_json, log_call, log_result, debug_enabled, redact_secrets
+from .output_schemas import FETCH_PAGE_OUTPUT_SCHEMA
+from .serialize import to_json, log_call, debug_enabled, redact_secrets, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 from .youtube_transcript import is_youtube_video_url, fetch_transcript
 from .web_fetch import (
@@ -116,8 +118,10 @@ def _fetch_page_desc(prefix: str) -> str:
         "continuations echo the nearest `continuation_anchor`. Offset works for "
         "every format, including JSON and long documents.\n\n"
         "Reads ONE URL per call — to read several pages, call this tool once per "
-        "URL. Use it to read an " + prefix + "search_web result in depth, or to "
-        "read documents (PDF/Word/Excel/RTF/EPUB).\n\n"
+        "URL. In scripting/codemode clients, independent URLs can be fetched in "
+        "parallel and filtered before returning the needed content to the model. "
+        "Use it to read an " + prefix + "search_web result in depth, or to read "
+        "documents (PDF/Word/Excel/RTF/EPUB).\n\n"
         "Returns JSON {url,format,provenance?,content,anchor?,citation_url?,query?,"
         "match_count?,match_metadata?,matching_toc?,sections?,truncated?,offset?,"
         "continuation_anchor?,next_offset?,"
@@ -1803,6 +1807,7 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         description=_fetch_page_desc(server_settings.tool_prefix),
         annotations=READ_ONLY_EXTERNAL_TOOL,
+        output_schema=FETCH_PAGE_OUTPUT_SCHEMA,
     )
     async def fetch_page(
         url: str,
@@ -1830,7 +1835,7 @@ def register(mcp: FastMCP) -> None:
         ] = None,
         include_match_toc: bool = False,
         offset: int | None = None,
-    ) -> str:
+    ) -> ToolResult:
         """Fetch one web page / YouTube transcript. The model-facing guidance
         lives in the @mcp.tool(description=...) above.
 
@@ -1868,4 +1873,4 @@ def register(mcp: FastMCP) -> None:
             context_lines=context_lines,
             include_match_toc=include_match_toc,
         )
-        return log_result(log, "fetch_page", to_json(payload))
+        return structured_result(log, "fetch_page", payload)

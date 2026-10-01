@@ -104,11 +104,12 @@ def server():
 
 @pytest.fixture(scope="session")
 def tool_fns(server):
-    """Map each registered tool name to its underlying (undecorated) async fn.
+    """Map tool names to test adapters around their undecorated async functions.
 
-    ``tool.fn`` is the raw closure: calling it returns the tool's JSON string on
-    success and raises ``ToolError`` on failure, bypassing MCP serialization —
-    ideal for asserting on the tool's own contract.
+    Production functions return ``ToolResult`` so MCP clients receive both JSON
+    text and native ``structuredContent``. The adapters return the text block to
+    keep tool behavior tests focused on the long-standing JSON contract while
+    still bypassing MCP transport serialization. ``ToolError`` passes through.
     """
     names = [
         "search_web",
@@ -119,7 +120,23 @@ def tool_fns(server):
         "send_email",
     ]
 
+    def _json_text_adapter(fn):
+        async def call(*args, **kwargs):
+            from fastmcp.tools import ToolResult
+
+            result = await fn(*args, **kwargs)
+            if not isinstance(result, ToolResult):
+                return result
+            return "\n".join(
+                block.text for block in result.content if block.type == "text"
+            )
+
+        return call
+
     async def _collect():
-        return {n: (await server.get_tool(n)).fn for n in names}
+        return {
+            name: _json_text_adapter((await server.get_tool(name)).fn)
+            for name in names
+        }
 
     return run(_collect())
