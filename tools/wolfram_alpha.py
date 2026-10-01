@@ -17,10 +17,12 @@ from typing import Any, Literal
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 
 from config import wolfram_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result, redact_secrets
+from .output_schemas import WOLFRAM_OUTPUT_SCHEMA
+from .serialize import log_call, redact_secrets, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
@@ -183,12 +185,15 @@ def _structure_result(body: str, query: str) -> dict:
 
 
 def register(mcp: FastMCP) -> None:
-    @mcp.tool(annotations=READ_ONLY_EXTERNAL_TOOL)
+    @mcp.tool(
+        annotations=READ_ONLY_EXTERNAL_TOOL,
+        output_schema=WOLFRAM_OUTPUT_SCHEMA,
+    )
     async def query_wolfram_alpha(
         query: str,
         assumption: str | None = None,
         units: Literal["metric", "nonmetric"] | None = None,
-    ) -> str:
+    ) -> ToolResult:
         """Compute/lookup exact facts: math, units, physics, chemistry, finance,
         geography, demographics, nutrition, weather, astronomy.
 
@@ -249,7 +254,7 @@ def register(mcp: FastMCP) -> None:
         )
         cached = _result_cache.get(cache_key)
         if cached is not None:
-            return log_result(log, "query_wolfram_alpha", cached)
+            return structured_result(log, "query_wolfram_alpha", cached)
 
         try:
             client = _http_client()
@@ -297,6 +302,6 @@ def register(mcp: FastMCP) -> None:
         if not body.strip():
             raise ToolError("Wolfram Alpha returned an empty response.")
 
-        result_json = to_json(_structure_result(body, clean_query))
-        _result_cache.set(cache_key, result_json)
-        return log_result(log, "query_wolfram_alpha", result_json)
+        payload = _structure_result(body, clean_query)
+        _result_cache.set(cache_key, payload)
+        return structured_result(log, "query_wolfram_alpha", payload)

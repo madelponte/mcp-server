@@ -1,8 +1,10 @@
 """
 Shared JSON serialization and debug helpers for the tool modules.
 
-Every tool returns its structured result through :func:`to_json` so the output
-format is consistent across the whole server and driven by a single switch:
+Every tool returns its payload through :func:`structured_result`, which uses
+:func:`to_json` for the text content and mirrors the normalized object into MCP
+``structuredContent``. This keeps the output format consistent across the whole
+server and makes it directly usable by scripting clients:
 
 - **Default (MCP_DEBUG off):** compact JSON with no insignificant whitespace,
   to keep results as small as possible in the model's context window.
@@ -18,6 +20,8 @@ import json
 import logging
 import math
 from typing import Any
+
+from fastmcp.tools import ToolResult
 
 from config import server_settings
 
@@ -77,6 +81,26 @@ def to_json(payload: Any, *, default=str) -> str:
         separators=(",", ":"),
         default=default,
         allow_nan=False,
+    )
+
+
+def structured_result(
+    logger: logging.Logger,
+    tool: str,
+    payload: Any,
+) -> ToolResult:
+    """Return identical JSON text and native MCP structured content.
+
+    The text block preserves the compact/debug formatting expected by ordinary
+    MCP clients. ``structured_content`` lets programmatic clients—and Pi
+    codemode in particular—filter and compose results without reparsing a JSON
+    string. Round-tripping through JSON also guarantees both representations
+    have exactly the same non-finite/default-string normalization.
+    """
+    serialized = log_result(logger, tool, to_json(payload))
+    return ToolResult(
+        content=serialized,
+        structured_content=json.loads(serialized),
     )
 
 
