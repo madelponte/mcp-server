@@ -2,9 +2,8 @@
 
 import pytest
 from fastmcp.exceptions import ToolError
-from fastmcp.tools import ToolResult
 
-from conftest import run
+from conftest import assert_result_matches_schema, run
 
 EXPECTED_TOOLS = {
     "search_web",
@@ -245,9 +244,8 @@ def test_search_web_schema_and_calls_use_configured_defaults(
 
     monkeypatch.setattr(ws, "_brave_query", fake_query)
     result = run(tool.fn(query="test"))
-    assert isinstance(result, ToolResult)
+    assert_result_matches_schema(tool, result)
     out = result.structured_content
-    assert out is not None
     assert (seen["country"], seen["search_lang"], seen["freshness"]) == ("CA", "fr", "pw")
     assert seen["safesearch"] == configured_safesearch
     assert seen["context_threshold_mode"] == configured_threshold
@@ -327,7 +325,6 @@ def test_stock_wolfram_email_descriptions_include_return_shape(server):
 def test_tool_run_returns_matching_text_and_structured_content(
     monkeypatch, server
 ):
-    import json
     import tools.web_search as ws
 
     monkeypatch.setattr(ws.cfg, "brave_api_key", "test-key")
@@ -338,8 +335,7 @@ def test_tool_run_returns_matching_text_and_structured_content(
     monkeypatch.setattr(ws, "_brave_query", fake_query)
     tool = run(server.get_tool("search_web"))
     result = run(tool.run({"query": "example"}))
-    assert result.structured_content is not None
-    assert json.loads(result.content[0].text) == result.structured_content
+    assert_result_matches_schema(tool, result)
     assert result.structured_content["results"][0]["url"] == "https://example.com"
 
 
