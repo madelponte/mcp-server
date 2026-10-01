@@ -50,15 +50,36 @@ FETCH_PAGE_OUTPUT_SCHEMA = {
     "properties": {
         "url": {"type": "string"},
         "format": {"type": "string"},
-        "provenance": {},
+        # Provenance fields from fetch_page._provenance: present only when the
+        # fetch deviated from a direct HTTP 200 on the requested URL, or in debug.
+        "original_url": {"type": "string"},
+        "status": {"type": ["integer", "null"]},
+        "content_type": {"type": "string"},
+        "via": {"type": "string"},
         "content": {},
+        # HTML text/section pages.
+        "title": {"type": ["string", "null"]},
+        # section= results.
+        "matched_heading": {"type": "string"},
         "anchor": {"type": "string"},
+        "level": {"type": "integer"},
+        "next_heading": {"type": ["string", "null"]},
+        "next_heading_anchor": {"type": ["string", "null"]},
+        "source_fragment": {"type": "string"},
         "citation_url": {"type": "string"},
+        # Standalone images.
+        "media_type": {"type": "string"},
+        "filename": {"type": "string"},
+        "description": {"type": "string"},
+        "description_source": {"type": "string"},
+        # query= results.
         "query": {"type": "string"},
+        "context_lines": {"type": "integer"},
+        "line_numbering": {"type": "string"},
         "match_count": {"type": "integer"},
         "match_metadata": {"type": "array", "items": {"type": "object"}},
         "matching_toc": {"type": "array", "items": {}},
-        "sections": {"type": "array", "items": {}},
+        "sections": {"type": "integer"},
         "truncated": {"type": "boolean"},
         "offset": {"type": "integer"},
         "continuation_anchor": {"type": "string"},
@@ -118,6 +139,7 @@ WOLFRAM_OUTPUT_SCHEMA = {
 PLACES_OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
+        "query": {"type": "string"},
         "query_category": {"type": "string"},
         "center": {"type": "object"},
         "radius_m": {"type": "integer"},

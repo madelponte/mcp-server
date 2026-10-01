@@ -387,6 +387,26 @@ def test_find_nearby_places_place_details_happy_path(monkeypatch, tool_fns):
     assert out["place"]["population"] == 650000
 
 
+def test_find_nearby_places_place_details_returns_alternatives(monkeypatch, tool_fns):
+    import json as _json
+
+    async def fake_geocode(query, limit, detailed=False):
+        return [
+            {"name": "Portland, OR", "latitude": 45.52, "longitude": -122.68,
+             "category": "place", "type": "city", "extratags": {}, "namedetails": {}},
+            {"name": "Portland, ME", "latitude": 43.66, "longitude": -70.26,
+             "type": "city", "extratags": {}, "namedetails": {}},
+        ]
+
+    monkeypatch.setattr(geo, "_geocode", fake_geocode)
+    fn = tool_fns["find_nearby_places"]
+    out = _json.loads(run(fn(near="Portland", place_details=True)))
+    assert out["query"] == "Portland"
+    assert out["alternatives"] == [
+        {"name": "Portland, ME", "latitude": 43.66, "longitude": -70.26, "type": "city"}
+    ]
+
+
 def test_find_nearby_places_place_details_accepts_coordinates(monkeypatch, tool_fns):
     import json as _json
 

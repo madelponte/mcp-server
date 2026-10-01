@@ -5,3 +5,7 @@
 # Test runner. The suite is offline (httpx MockTransport + monkeypatching) and
 # drives async code with asyncio.run, so no async pytest plugin is required.
 pytest>=9.1.1
+
+# Validates tool payloads against their advertised MCP output schemas in tests
+# (also a transitive dependency of mcp; listed so the tests' direct use is explicit).
+jsonschema>=4.26.0

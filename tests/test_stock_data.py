@@ -756,6 +756,30 @@ def test_get_company_data_single_happy_path(monkeypatch, tool_fns):
     assert out["data"]["quote"]["price"] == 1.0
 
 
+def test_get_company_data_resolved_name_with_partial_errors(monkeypatch, tool_fns):
+    # Real _fetch_company: a company name resolves via symbol search, one
+    # section succeeds and one fails, so resolved_from and errors both appear.
+    def fake_search(query, limit):
+        return [{"symbol": "AAPL", "description": "Apple Inc"}], [], "finnhub"
+
+    def fake_quote(symbol, opts):
+        return {"provider": "x", "symbol": symbol, "price": 1.0}, []
+
+    def fake_news(symbol, opts):
+        return None, ["finnhub: empty"]
+
+    monkeypatch.setattr(stock, "_search_symbols", fake_search)
+    monkeypatch.setitem(stock._SECTION_FETCHERS, "quote", fake_quote)
+    monkeypatch.setitem(stock._SECTION_FETCHERS, "news", fake_news)
+    fn = tool_fns["get_company_data"]
+    out = json.loads(run(fn(symbol="Apple", sections=["quote", "news"])))
+    assert out["symbol"] == "AAPL"
+    assert out["resolved_from"]["query"] == "Apple"
+    assert out["resolved_from"]["matched"]["symbol"] == "AAPL"
+    assert out["data"]["quote"]["price"] == 1.0
+    assert out["errors"] == {"news": ["finnhub: empty"]}
+
+
 def test_get_company_data_decodes_json_string_list(monkeypatch, tool_fns):
     async def fake_fetch_company(raw_query, *args):
         return {"symbol": raw_query.upper(), "sections": ["quote"], "data": {"quote": {}}}
