@@ -36,6 +36,42 @@ fixed amounts. The model can request less per call, and anything above the
 server-configured cap is silently clamped so an oversized response can't
 overwhelm a model's context window. Omitting a value uses the cap.
 
+### Pi codemode and structured results
+
+Pi's default MCP exposure is `codemode`: MCP tools are discovered at runtime and
+called from a sandboxed JavaScript script rather than being permanently declared
+to the chat model. This does not change how the server executes a call. It lets
+Pi run independent read-only calls concurrently and filter large results before
+only the useful subset reaches model context.
+
+Every tool advertises an MCP output schema and returns the same payload in two
+forms: JSON text for ordinary clients and native `structuredContent` for
+programmatic clients. A Pi codemode MCP call resolves to the complete
+`CallToolResult`, so inspect `isError` and then read `structuredContent` directly;
+there is no need to `JSON.parse()` the text block. For example, if this server is
+configured in Pi as `research`:
+
+```js
+const search = await tools.mcp__research__search_web({ query: "FastMCP structured output" });
+if (search.isError) throw new Error(search.content?.[0]?.text || "search failed");
+const pages = await Promise.allSettled(
+  search.structuredContent.results.slice(0, 3).map(({ url }) =>
+    tools.mcp__research__fetch_page({ url, query: "structured output" })
+  )
+);
+return pages
+  .filter(({ status, value }) => status === "fulfilled" && !value.isError)
+  .map(({ value }) => value.structuredContent);
+```
+
+The client-side server name determines the `mcp__<server>__<tool>` identifier.
+Keep dependent calls ordered (`search_web` before fetching its URLs, or a page
+outline before a section), and use `Promise.allSettled()` when partial success is
+useful. `send_email` is a real, non-idempotent side effect: never invoke it
+speculatively, in a parallel fan-out, or as an automatic retry. Pi exposure
+(`codemode`, `deferred`, `direct`, or `hidden`) is configured in Pi's `mcp.json`;
+the server needs no Pi-specific setting.
+
 ### Agentic Web Search
 
 `search_web(query, time_range=None, country=None, search_lang=None, safesearch=None, context_threshold_mode=None, num_results=None, max_tokens=None)`

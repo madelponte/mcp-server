@@ -32,11 +32,13 @@ import anyio
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import geocoding_settings as cfg
 from .cache import TTLCache
-from .serialize import to_json, log_call, log_result, redact_secrets
+from .output_schemas import PLACES_OUTPUT_SCHEMA
+from .serialize import log_call, redact_secrets, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
@@ -964,6 +966,7 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         description=description,
         annotations=READ_ONLY_EXTERNAL_TOOL,
+        output_schema=PLACES_OUTPUT_SCHEMA,
     )
     async def find_nearby_places(
         category: str = "",
@@ -993,7 +996,7 @@ def register(mcp: FastMCP) -> None:
             ),
         ] = None,
         place_details: bool = False,
-    ) -> str:
+    ) -> ToolResult:
         """Find nearby places via OpenStreetMap. The model-facing guidance lives in
         the @mcp.tool(description=...) above (built with the live caps from cfg).
 
@@ -1034,10 +1037,10 @@ def register(mcp: FastMCP) -> None:
 
             if coords:
                 payload = await _place_lookup_coords(*coords)
-                return log_result(log, "find_nearby_places", to_json(payload))
+                return structured_result(log, "find_nearby_places", payload)
             if osm_object:
                 payload = await _place_lookup_osm_object(*osm_object)
-                return log_result(log, "find_nearby_places", to_json(payload))
+                return structured_result(log, "find_nearby_places", payload)
 
             if not (near and near.strip()):
                 raise ToolError(
@@ -1052,7 +1055,7 @@ def register(mcp: FastMCP) -> None:
                     "or address as `near`."
                 )
             payload = await _place_lookup(near.strip())
-            return log_result(log, "find_nearby_places", to_json(payload))
+            return structured_result(log, "find_nearby_places", payload)
 
         if not (category or "").strip():
             raise ToolError("Empty category. Say what to look for, e.g. 'pharmacy'.")
@@ -1175,4 +1178,4 @@ def register(mcp: FastMCP) -> None:
         payload["nearby_towns_radius_m"] = cfg.nearby_towns_radius_m
         payload["nearby_towns"] = await _nearby_towns(lat, lon, towns_n, center_name)
 
-        return log_result(log, "find_nearby_places", to_json(payload))
+        return structured_result(log, "find_nearby_places", payload)

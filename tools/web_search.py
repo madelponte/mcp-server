@@ -21,10 +21,12 @@ import anyio
 import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
-from .serialize import to_json, log_call, log_result, redact_secrets
+from .output_schemas import SEARCH_WEB_OUTPUT_SCHEMA
+from .serialize import log_call, redact_secrets, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
@@ -561,6 +563,7 @@ def register(mcp: FastMCP) -> None:
     @mcp.tool(
         description=_search_web_desc(server_settings.tool_prefix),
         annotations=READ_ONLY_EXTERNAL_TOOL,
+        output_schema=SEARCH_WEB_OUTPUT_SCHEMA,
     )
     async def search_web(
         query: Annotated[
@@ -626,7 +629,7 @@ def register(mcp: FastMCP) -> None:
                 "for the max."
             ),
         ] = None,
-    ) -> str:
+    ) -> ToolResult:
         """Search the web. Model-facing guidance is in the tool description."""
         log_call(
             log,
@@ -715,8 +718,8 @@ def register(mcp: FastMCP) -> None:
         if resolved_threshold:
             applied["context_threshold_mode"] = resolved_threshold
 
-        return log_result(
+        return structured_result(
             log,
             "search_web",
-            to_json({"query": query, **applied, "results": results}),
+            {"query": query, **applied, "results": results},
         )

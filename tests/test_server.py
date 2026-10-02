@@ -3,7 +3,7 @@
 import pytest
 from fastmcp.exceptions import ToolError
 
-from conftest import run
+from conftest import assert_result_matches_schema, run
 
 EXPECTED_TOOLS = {
     "search_web",
@@ -50,6 +50,16 @@ def test_each_tool_can_be_disabled_independently(monkeypatch, tool_name, flag_at
 def test_every_tool_has_a_description(server):
     for t in _list_tools(server):
         assert t.description and t.description.strip(), f"{t.name} has no description"
+
+
+def test_every_tool_advertises_native_object_output(server):
+    """Codemode should see payload fields, not ``{result: <JSON string>}``."""
+    for tool in _list_tools(server):
+        schema = tool.to_mcp_tool().output_schema
+        assert schema is not None, tool.name
+        assert schema.get("type") == "object", tool.name
+        assert "x-fastmcp-wrap-result" not in schema, tool.name
+        assert schema.get("properties"), tool.name
 
 
 def test_tool_safety_annotations_match_effects(server):
@@ -233,7 +243,9 @@ def test_search_web_schema_and_calls_use_configured_defaults(
         return []
 
     monkeypatch.setattr(ws, "_brave_query", fake_query)
-    out = json.loads(run(tool.fn(query="test")))
+    result = run(tool.fn(query="test"))
+    assert_result_matches_schema(tool, result)
+    out = result.structured_content
     assert (seen["country"], seen["search_lang"], seen["freshness"]) == ("CA", "fr", "pw")
     assert seen["safesearch"] == configured_safesearch
     assert seen["context_threshold_mode"] == configured_threshold
@@ -308,6 +320,23 @@ def test_stock_wolfram_email_descriptions_include_return_shape(server):
     email = _tool_by_name(server, "send_email").description
     assert "Returns JSON" in email
     assert "accepted_recipients" in email
+
+
+def test_tool_run_returns_matching_text_and_structured_content(
+    monkeypatch, server
+):
+    import tools.web_search as ws
+
+    monkeypatch.setattr(ws.cfg, "brave_api_key", "test-key")
+
+    async def fake_query(**kwargs):
+        return [{"url": "https://example.com", "title": "Example", "snippets": []}]
+
+    monkeypatch.setattr(ws, "_brave_query", fake_query)
+    tool = run(server.get_tool("search_web"))
+    result = run(tool.run({"query": "example"}))
+    assert_result_matches_schema(tool, result)
+    assert result.structured_content["results"][0]["url"] == "https://example.com"
 
 
 def test_tool_run_invokes_the_function(server):
