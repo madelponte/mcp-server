@@ -14,14 +14,52 @@ mapping (see test_config.py) and never touch the deployment's own file.
 """
 
 import asyncio
+import json
 
 import httpx
 import pytest
+from fastmcp.tools import ToolResult
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import best_match
 
 
 def run(coro):
     """Run an async coroutine to completion (one fresh event loop per call)."""
     return asyncio.run(coro)
+
+
+def assert_result_matches_schema(tool, result) -> None:
+    """Check a tool's ``ToolResult`` against the output schema it advertises.
+
+    MCP clients validate ``structuredContent`` against ``outputSchema`` and fail
+    the call on a mismatch, so a payload/schema drift is a real client-facing
+    bug. Validation uses the schema exactly as served (``to_mcp_tool()``) and
+    the draft the MCP client uses. On top of that, the test copy rejects
+    undeclared top-level fields: production schemas stay permissive for forward
+    compatibility, but a payload field missing from the schema is invisible to
+    clients that type ``structuredContent`` from it (e.g. Pi codemode).
+    """
+    assert isinstance(result, ToolResult), (
+        f"{tool.name} returned {type(result).__name__}, not ToolResult"
+    )
+    content = result.structured_content
+    assert content is not None, f"{tool.name} returned no structured_content"
+    text = "\n".join(block.text for block in result.content if block.type == "text")
+    assert json.loads(text) == content, (
+        f"{tool.name}: text content and structured_content differ"
+    )
+
+    schema = {
+        **tool.to_mcp_tool().output_schema,
+        "additionalProperties": False,
+    }
+    error = best_match(Draft202012Validator(schema).iter_errors(content))
+    if error is not None:
+        path = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        raise AssertionError(
+            f"{tool.name} payload does not match its output schema at {path}: "
+            f"{error.message}"
+        )
 
 
 def make_mock_async_client_cls(handler):
@@ -104,11 +142,14 @@ def server():
 
 @pytest.fixture(scope="session")
 def tool_fns(server):
-    """Map each registered tool name to its underlying (undecorated) async fn.
+    """Map tool names to test adapters around their undecorated async functions.
 
-    ``tool.fn`` is the raw closure: calling it returns the tool's JSON string on
-    success and raises ``ToolError`` on failure, bypassing MCP serialization —
-    ideal for asserting on the tool's own contract.
+    Production functions return ``ToolResult`` so MCP clients receive both JSON
+    text and native ``structuredContent``. Each adapter checks every successful
+    result against the tool's output schema (:func:`assert_result_matches_schema`),
+    then returns the text block to keep tool behavior tests focused on the
+    long-standing JSON contract while still bypassing MCP transport
+    serialization. ``ToolError`` passes through.
     """
     names = [
         "search_web",
@@ -119,7 +160,20 @@ def tool_fns(server):
         "send_email",
     ]
 
+    def _json_text_adapter(tool):
+        async def call(*args, **kwargs):
+            result = await tool.fn(*args, **kwargs)
+            assert_result_matches_schema(tool, result)
+            return "\n".join(
+                block.text for block in result.content if block.type == "text"
+            )
+
+        return call
+
     async def _collect():
-        return {n: (await server.get_tool(n)).fn for n in names}
+        return {
+            name: _json_text_adapter(await server.get_tool(name))
+            for name in names
+        }
 
     return run(_collect())

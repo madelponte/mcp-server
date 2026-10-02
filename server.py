@@ -75,7 +75,14 @@ def build_server() -> FastMCP:
         instructions=(
             "Tools for web search & page fetching (fetch_page also returns YouTube "
             "video transcripts), stock market data, Wolfram Alpha computations, "
-            "geocoding & nearby place search (OpenStreetMap), and sending email."
+            "geocoding & nearby place search (OpenStreetMap), and sending email.\n\n"
+            "Scripting/codemode clients receive each MCP CallToolResult with the "
+            "payload as native structuredContent as well as JSON text. Inspect "
+            "isError before using structuredContent. Independent read-only calls "
+            "may be run in parallel and filtered before their output reaches the "
+            "model; preserve dependent workflows such as search_web → fetch_page "
+            "and outline → section. send_email is side-effecting: never call it "
+            "speculatively or retry it automatically."
         ),
     )
 

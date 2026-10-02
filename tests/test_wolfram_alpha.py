@@ -180,3 +180,13 @@ def test_assumptions_omitted_when_no_alternatives(monkeypatch, patch_httpx, tool
     out = json.loads(run(tool_fns["query_wolfram_alpha"](query="2 + 2")))
     assert "assumptions" not in out
     assert out["data"]["Result"] == "4"
+
+
+def test_unparseable_body_falls_back_to_result(monkeypatch, patch_httpx, tool_fns):
+    # Only the echoed query section: nothing lands in data, so the cleaned
+    # body is kept under `result` rather than returning an empty answer.
+    _set_appid(monkeypatch)
+    patch_httpx(lambda req: httpx.Response(200, text='Query:\n"zorblax"'))
+    out = json.loads(run(tool_fns["query_wolfram_alpha"](query="zorblax")))
+    assert "data" not in out
+    assert out["result"] == 'Query:\n"zorblax"'

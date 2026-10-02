@@ -24,10 +24,12 @@ from typing import Annotated
 import anyio
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import email_settings as cfg
-from .serialize import log_call, log_result, to_json
+from .output_schemas import EMAIL_OUTPUT_SCHEMA
+from .serialize import log_call, structured_result, to_json
 from .tool_annotations import SIDE_EFFECTING_EXTERNAL_TOOL
 
 log = logging.getLogger(__name__)
@@ -341,7 +343,10 @@ def register(mcp: FastMCP) -> None:
         else "Disabled on this server (EMAIL_ATTACHMENT_ROOT is unset)."
     )
 
-    @mcp.tool(annotations=SIDE_EFFECTING_EXTERNAL_TOOL)
+    @mcp.tool(
+        annotations=SIDE_EFFECTING_EXTERNAL_TOOL,
+        output_schema=EMAIL_OUTPUT_SCHEMA,
+    )
     async def send_email(
         recipients: Annotated[
             list[str],
@@ -380,10 +385,12 @@ def register(mcp: FastMCP) -> None:
             list[str] | None,
             Field(description=attachments_desc),
         ] = None,
-    ) -> str:
+    ) -> ToolResult:
         """Send a plain-text email from the server's configured account.
 
-        Send-only: this delivers a message; no other interaction.
+        Send-only: this delivers a message; no other interaction. Every call is
+        a real delivery, so scripting/codemode clients must not retry it
+        automatically or call it speculatively.
         Use it to notify a person of a result, forward a summary, or
         deliver content you have already produced. Supports CC, BCC, Reply-To,
         and optional local file attachments when the server allows them.
@@ -568,4 +575,4 @@ def register(mcp: FastMCP) -> None:
         }
         if refused and not accepted:
             payload["status"] = "failed"
-        return log_result(log, "send_email", to_json(payload))
+        return structured_result(log, "send_email", payload)

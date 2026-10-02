@@ -101,6 +101,27 @@ def test_text_mode_markdown(monkeypatch, tool_fns):
     assert "Body text here." in out["content"]
 
 
+def test_text_mode_offset_echoes_continuation_anchor(monkeypatch, tool_fns):
+    html = (
+        "<html><body><article><h1>First</h1><p>" + "alpha " * 40 + "</p>"
+        "<h2>Second</h2><p>" + "beta " * 40 + "</p></article></body></html>"
+    )
+    _patch_fetch(monkeypatch, _fetched(text=html))
+    full = json.loads(run(tool_fns["fetch_page"](url="https://example.com")))["content"]
+    offset = full.index("{#cite-second}") + len("{#cite-second}") + 5
+
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 20)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://example.com", offset=offset))
+    )
+    # The continuation names the nearest heading anchor before the offset, so a
+    # model paging mid-page still knows which section it is reading.
+    assert out["offset"] == offset
+    assert out["continuation_anchor"] == "cite-second"
+    assert out["truncated"] is True
+    assert out["next_offset"] == offset + 20
+
+
 def test_text_mode_marks_prominent_image_in_place(monkeypatch, tool_fns):
     html = (
         '<article><p>Before image.</p><img src="/chart.png" '
