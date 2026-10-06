@@ -1,6 +1,6 @@
 # MCP server framework (FastMCP v4 + streamable-http transport).
 # fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
-fastmcp>=4.0.10
+fastmcp>=4.0.11
 starlette>=1.7.0
 uvicorn>=0.54.0
 
