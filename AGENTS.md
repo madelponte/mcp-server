@@ -46,6 +46,8 @@ uv pip compile requirements-dev.in --universal --python-version 3.13 --generate-
 
 Drop `--upgrade` to re-lock without moving versions already pinned. Run the test suite (3.13 and 3.14) after a refresh.
 
+Python 3.15 is blocked on packaging, not code. The list of blocking packages lives at the top of `requirements.in` (not the generated `.txt`, which a re-lock overwrites). Re-check it on each refresh and remove entries as they clear. Until beartype 0.23.0 final ships, the lock pins a beartype pre-release on 3.15 only. On a 3.15 *release candidate*, `python_full_version >= '3.15'` evaluates false (PEP 440 sorts `3.15.0rcN` below `3.15`), so an rc interpreter selects the wrong beartype. That affects rc testing only, not 3.15.0 final.
+
 ### Tests
 
 ```bash

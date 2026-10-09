@@ -416,6 +416,21 @@ def test_connection_error_raises_toolerror(monkeypatch, tool_fns):
     assert "smtp server" in str(exc.value).lower()
 
 
+def test_unencodable_header_raises_toolerror(monkeypatch, tool_fns):
+    # What Python 3.15+ raises from send_message() for a non-ASCII Reply-To
+    # when the envelope (and so the SMTPUTF8 decision) is all ASCII.
+    from email.errors import HeaderWriteError
+
+    def boom(msg, envelope_recipients):
+        raise HeaderWriteError("Non-ASCII local-part 'jörg' is invalid under current policy setting (utf8=False)")
+
+    monkeypatch.setattr(email_mod, "_send", boom)
+    fn = tool_fns["send_email"]
+    with pytest.raises(ToolError) as exc:
+        run(fn(recipients=["a@b.com"], subject="hi", body="yo", reply_to="jörg@example.com"))
+    assert "could not encode" in str(exc.value).lower()
+
+
 def test_smtp_send_uses_verifying_tls_context(monkeypatch):
     import ssl
     import smtplib

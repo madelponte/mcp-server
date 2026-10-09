@@ -16,6 +16,7 @@ import mimetypes
 import re
 import smtplib
 import ssl
+from email.errors import HeaderWriteError
 from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
@@ -536,6 +537,12 @@ def register(mcp: FastMCP) -> None:
             )
         except smtplib.SMTPException as exc:
             raise ToolError(f"SMTP error while sending email: {exc}")
+        except HeaderWriteError as exc:
+            # Python 3.15+ refuses to flatten a header it cannot encode
+            # faithfully, e.g. a non-ASCII Reply-To while the envelope is ASCII
+            # (so smtplib never switches to SMTPUTF8). Earlier versions silently
+            # mangled the address into an RFC 2047 encoded-word instead.
+            raise ToolError(f"Could not encode the email headers: {exc}")
         except (OSError, TimeoutError) as exc:
             raise ToolError(
                 f"Could not connect to the SMTP server {cfg.smtp_host}:{cfg.smtp_port}: {exc}"

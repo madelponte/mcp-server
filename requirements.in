@@ -1,6 +1,33 @@
+# ---------------------------------------------------------------------------
+# Python 3.15 blockers (last checked 2026-10-09 against 3.15.0rc3)
+#
+# The code and full test suite pass on 3.15; what keeps the image and CI on
+# 3.14 is packaging. Re-check these on each re-lock and delete an entry once
+# it is resolved:
+#
+#   youtube-transcript-api 1.2.4  Declares Requires-Python "<3.15" (upstream
+#       master is still capped). Works on 3.15 (verified with a live transcript
+#       fetch), and uv ignores the cap so the Docker build installs it, but pip
+#       refuses, which blocks the CI test job. Unblocked by a release that lifts
+#       the cap.
+#   brotli 1.2.0, PyYAML 6.0.3, zstandard 0.25.0  No cp315 wheels yet. Their
+#       sdists build and pass on 3.15, but python:3.15-slim has no compiler, so
+#       the Dockerfile builder stage fails. Unblocked by cp315 wheels (PyYAML
+#       has merged 3.15 wheel builds, awaiting a release), or by installing gcc
+#       in the builder stage only.
+#   beartype (transitive, via fastmcp / py-key-value-aio)  Stable 0.22.9
+#       doesn't support 3.15; fastmcp>=4.1.0 requires >=0.23.0rc2 there, so the
+#       lock pins a pre-release on 3.15 only. Unblocked by beartype 0.23.0 final.
+#
+# Once unblocked: build with `--build-arg PYTHON_VERSION=3.15` (Dockerfile),
+# add "3.15" to the CI test matrix (.github/workflows/docker-publish.yml), and
+# update the versions named in AGENTS.md.
+# ---------------------------------------------------------------------------
+
 # MCP server framework (FastMCP v4 + streamable-http transport).
-# fastmcp depends on the `mcp` SDK, so it is pulled in transitively.
-fastmcp>=4.0.11
+# fastmcp depends on the `mcp` SDK, so it is pulled in transitively. 4.1.0 is
+# the first release that declares Python 3.15 support.
+fastmcp>=4.1.0
 starlette>=1.7.0
 uvicorn>=0.54.0
 
