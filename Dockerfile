@@ -1,4 +1,9 @@
-FROM python:3.14-slim AS builder
+# Both stages must use the same Python minor version: the venv built here is
+# copied into the runtime stage. Python 3.15 is blocked on packaging, not code;
+# see the blocker list at the top of requirements.in.
+ARG PYTHON_VERSION=3.14
+
+FROM python:${PYTHON_VERSION}-slim AS builder
 
 # Track the latest uv 0.12 patch release for bug fixes. uv is build-only and
 # is not copied into the runtime image.
@@ -14,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv \
     && uv pip install --python /opt/venv/bin/python -r requirements.txt
 
-FROM python:3.14-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim AS runtime
 
 # Configuration comes from one YAML file bind-mounted at /app/config.yaml (see
 # docker-compose.yml). Naming the path explicitly means a missing mount fails at
