@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Python 3.15 blockers (last checked 2026-10-09 against 3.15.0rc3)
+# Python 3.15 blockers (last checked 2026-10-18 against PyPI releases)
 #
 # The code and full test suite pass on 3.15; what keeps the image and CI on
 # 3.14 is packaging. Re-check these on each re-lock and delete an entry once
@@ -15,10 +15,10 @@
 #       the Dockerfile builder stage fails. Unblocked by cp315 wheels (PyYAML
 #       has merged 3.15 wheel builds, awaiting a release), or by installing gcc
 #       in the builder stage only.
-#   beartype (transitive, via fastmcp / py-key-value-aio)  Stable 0.22.9
-#       doesn't support 3.15; fastmcp>=4.1.0 requires >=0.23.0rc2 there, so the
-#       lock pins a pre-release on 3.15 only. Unblocked by beartype 0.23.0 final.
 #
+# Cleared: beartype 0.23.1 (final) supports 3.15 and Requires-Python >=3.10, so
+# the lock no longer pins a pre-release; fastmcp's `beartype>=0.23.0rc2` floor is
+# satisfied by it everywhere.
 # Once unblocked: build with `--build-arg PYTHON_VERSION=3.15` (Dockerfile),
 # add "3.15" to the CI test matrix (.github/workflows/docker-publish.yml), and
 # update the versions named in AGENTS.md.
