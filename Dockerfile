@@ -5,9 +5,7 @@ ARG PYTHON_VERSION=3.14
 
 FROM python:${PYTHON_VERSION}-slim AS builder
 
-# Track the latest uv 0.12 patch release for bug fixes. uv is build-only and
-# is not copied into the runtime image.
-COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13 /uv /bin/uv
 
 ENV UV_PYTHON_DOWNLOADS=0 \
     UV_LINK_MODE=copy
