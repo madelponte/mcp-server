@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Python 3.15 blockers (last checked 2026-10-22 against PyPI releases)
+# Python 3.15 blockers (last checked 2026-10-27 against PyPI releases)
 #
 # The code and full test suite pass on 3.15; what keeps the image and CI on
 # 3.14 is packaging. Re-check these on each re-lock and delete an entry once
