@@ -538,7 +538,8 @@ class WebSearchSettings(BaseSection):
         description=(
             "Reddit OAuth application client ID. When this, reddit_client_secret, "
             "and reddit_user_agent are set, fetch_page uses Reddit's authenticated "
-            "Data API before its anonymous RSS/HTML fallbacks."
+            "Data API before its anonymous fallbacks. Reddit stopped accepting new "
+            "Data API requests on 2026-10-31 and ends public access in March 2027."
         ),
     )
     reddit_client_secret: str = Field(
@@ -556,7 +557,7 @@ class WebSearchSettings(BaseSection):
         ge=0,
         description=(
             "Minimum quiet period between Reddit fetch_page acquisitions. "
-            "Requests are serialized to reduce anonymous RSS/HTML throttling; "
+            "Requests are serialized to reduce anonymous RSS/oEmbed throttling; "
             "0 disables queueing."
         ),
     )
@@ -566,6 +567,14 @@ class WebSearchSettings(BaseSection):
         description=(
             "Wait this many seconds and retry Reddit RSS once after HTTP 429; "
             "0 disables the retry."
+        ),
+    )
+    reddit_search_fallback: bool = Field(
+        True,
+        description=(
+            "When Reddit OAuth and RSS are unavailable, return Brave LLM Context "
+            "search-index excerpts for a Reddit post (one Brave call per fetch; "
+            "requires brave_api_key). False skips straight to oEmbed metadata."
         ),
     )
     ssrf_allowlist: str = Field(

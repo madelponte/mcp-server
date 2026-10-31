@@ -28,6 +28,11 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp, "_reddit_access_token", None)
     monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
     monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
+    # Brave is opt-in per test; RSS availability is pinned so date-based
+    # retirement cannot change results when the suite runs.
+    monkeypatch.setattr(fp.cfg, "brave_api_key", "")
+    monkeypatch.setattr(fp.cfg, "reddit_search_fallback", True)
+    monkeypatch.setattr(fp, "_reddit_rss_available", lambda: True)
 
 
 @pytest.fixture(autouse=True)
@@ -586,27 +591,25 @@ def test_reddit_debug_note_traces_and_redacts_fallbacks(monkeypatch, tool_fns):
     assert secret not in out["note"]
 
 
-def test_reddit_rss_failure_uses_old_html(monkeypatch, tool_fns):
-    calls = []
-    old_html = """<html><body><div class="thing link" data-fullname="t3_abc"
-      data-author="poster" data-subreddit="python" data-score="5" data-comments-count="0">
-      <a class="title">Old title</a><div class="entry"><div class="usertext-body"><div class="md"><p>Old body</p></div></div></div>
-    </div></body></html>"""
-
-    async def acquire(url):
-        calls.append(url)
-        if url.endswith(".rss"):
-            raise RuntimeError("RSS blocked")
-        return _fetched(text=old_html)
-
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
-    out = json.loads(
-        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+def _oembed_fetched(title="Oembed title", author="poster"):
+    return _fetched(
+        text=json.dumps({"title": title, "author_name": author, "provider_name": "reddit"}),
+        content_type="application/json",
     )
-    assert calls[0].endswith("/.rss")
-    assert calls[1].startswith("https://old.reddit.com/")
-    assert json.loads(out["content"])["post"]["title"] == "Old title"
-    assert "old.reddit" in out["note"]
+
+
+def _enable_brave(monkeypatch, results):
+    """Configure Brave and replace the LLM Context call with canned results."""
+    monkeypatch.setattr(fp.cfg, "brave_api_key", "brave-key")
+    monkeypatch.setattr(fp.cfg, "brave_api_url", "https://brave.test/llm/context")
+    queries = []
+
+    async def brave_query(**kwargs):
+        queries.append(kwargs)
+        return results
+
+    monkeypatch.setattr(fp, "_brave_query", brave_query)
+    return queries
 
 
 def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
@@ -626,10 +629,193 @@ def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
     assert calls[0].endswith("/.rss")
-    assert calls[1].startswith("https://old.reddit.com/")
-    assert "/oembed?" in calls[2]
+    assert "/oembed?" in calls[1]
+    assert len(calls) == 2
     assert json.loads(out["content"])["title"] == "Fallback title"
-    assert "without comments" in out["note"]
+    assert "without the post body or comments" in out["note"]
+
+
+def test_reddit_rss_failure_uses_brave_excerpts(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        if url.endswith(".rss"):
+            raise RuntimeError("RSS blocked")
+        return _oembed_fetched(title="Exact post title")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    queries = _enable_brave(monkeypatch, [
+        {
+            "url": "https://www.reddit.com/r/python/comments/zzz/other/",
+            "title": "Unrelated thread",
+            "snippets": ["unrelated text"],
+        },
+        {
+            "url": "https://www.reddit.com/r/python/comments/abc/title/",
+            "title": "r/python on Reddit: Exact post title",
+            "snippets": ["post body excerpt", "## commenter\ncomment excerpt"],
+            "page_date": "2026-09-30T17:37:11Z",
+        },
+        {
+            "url": "https://www.reddit.com/r/python/comments/ABC/title/def456/",
+            "title": "comment permalink",
+            "snippets": ["post body excerpt", "deep comment excerpt"],
+        },
+    ])
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert calls[0].endswith("/.rss")
+    assert "/oembed?" in calls[1]
+    assert queries[0]["query"] == "site:reddit.com r/python Exact post title"
+    assert queries[0]["freshness"] == ""
+    assert out["url"] == "https://www.reddit.com/r/python/comments/abc/title/"
+    assert out["via"] == "brave_llm_context"
+    content = json.loads(out["content"])
+    assert content["post"] == {
+        "title": "Exact post title",
+        "author": "poster",
+        "subreddit": "python",
+        "permalink": "https://www.reddit.com/r/python/comments/abc/title",
+    }
+    # Only same-submission results, deduplicated, in result order.
+    assert content["excerpts"] == [
+        "post body excerpt",
+        "## commenter\ncomment excerpt",
+        "deep comment excerpt",
+    ]
+    assert content["complete"] is False
+    assert content["page_date"] == "2026-09-30T17:37:11Z"
+    assert "search-index excerpts" in out["note"]
+
+
+def test_reddit_brave_uses_slug_when_oembed_fails(monkeypatch, tool_fns):
+    async def acquire(url):
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    queries = _enable_brave(monkeypatch, [{
+        "url": "https://www.reddit.com/r/python/comments/abc/my_post_title/",
+        "title": "My post title",
+        "snippets": ["excerpt"],
+    }])
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/my_post_title/"
+    )))
+    assert queries[0]["query"] == "site:reddit.com r/python my post title"
+    content = json.loads(out["content"])
+    assert content["post"]["title"] == "My post title"
+    assert "author" not in content["post"]
+
+
+def test_reddit_brave_without_matching_post_returns_oembed(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.server_settings, "debug", True)
+
+    async def acquire(url):
+        if "/oembed?" in url:
+            return _oembed_fetched()
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    _enable_brave(monkeypatch, [{
+        "url": "https://www.reddit.com/r/python/comments/zzz/similar_title/",
+        "title": "Similar",
+        "snippets": ["wrong thread"],
+    }])
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert json.loads(out["content"])["title"] == "Oembed title"
+    assert "without the post body or comments" in out["note"]
+    assert "Brave excerpts failed (search index returned no excerpts for post abc)" in out["note"]
+    assert "brave-key" not in out["note"]
+
+
+def test_reddit_search_fallback_can_be_disabled(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.server_settings, "debug", True)
+
+    async def acquire(url):
+        if "/oembed?" in url:
+            return _oembed_fetched()
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    queries = _enable_brave(monkeypatch, [])
+    monkeypatch.setattr(fp.cfg, "reddit_search_fallback", False)
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert queries == []
+    assert json.loads(out["content"])["title"] == "Oembed title"
+    assert "reddit_search_fallback disabled" in out["note"]
+
+
+def test_reddit_skips_rss_after_retirement(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp.server_settings, "debug", True)
+    monkeypatch.setattr(fp, "_reddit_rss_available", lambda: False)
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        return _oembed_fetched()
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    _enable_brave(monkeypatch, [{
+        "url": "https://www.reddit.com/r/python/comments/abc/title/",
+        "title": "t",
+        "snippets": ["excerpt"],
+    }])
+    out = json.loads(
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    )
+    assert not any(url.endswith(".rss") for url in calls)
+    assert "RSS skipped (Reddit retired it on 2026-11-13)" in out["note"]
+    assert json.loads(out["content"])["excerpts"] == ["excerpt"]
+
+
+def test_reddit_listing_after_rss_retirement_points_to_search(monkeypatch, tool_fns):
+    monkeypatch.setattr(fp, "_reddit_rss_available", lambda: False)
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        raise AssertionError("listing fallbacks should not fetch anything")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/"))
+    assert calls == []
+    assert "site:reddit.com/r/<subreddit>" in str(exc.value)
+
+
+def test_reddit_post_fails_when_every_source_fails(monkeypatch, tool_fns):
+    async def acquire(url):
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    with pytest.raises(ToolError) as exc:
+        run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
+    message = str(exc.value)
+    assert "RSS failed (blocked)" in message
+    assert "oEmbed failed (blocked)" in message
+    assert "Brave Search not configured" in message
+
+
+def test_reddit_developer_docs_use_normal_page_fetch(monkeypatch, tool_fns):
+    calls = []
+
+    async def acquire(url):
+        calls.append(url)
+        return _fetched(text="<html><head><title>Docs</title></head><body><h1>Migrate</h1><p>Guide text.</p></body></html>")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://developers.reddit.com/docs/guides/migrate/public-api"
+    )))
+    assert calls == ["https://developers.reddit.com/docs/guides/migrate/public-api"]
+    assert out["format"] != "json"
+    assert "Guide text." in out["content"]
 
 
 def test_reddit_rss_retries_once_after_rate_limit(monkeypatch, tool_fns):
@@ -679,7 +865,7 @@ def test_reddit_oembed_reports_rate_limit_without_debug(monkeypatch, tool_fns):
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
     assert "HTTP 429" in out["note"]
-    assert "configure Reddit OAuth" in out["note"]
+    assert "Retry later" in out["note"]
 
 
 def test_json_content_returned_as_json(monkeypatch, tool_fns):
