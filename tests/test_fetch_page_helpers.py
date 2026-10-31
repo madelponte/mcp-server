@@ -16,11 +16,13 @@ from tools.fetch_page import (
     _normalize_reddit_url,
     _reddit_oauth_url,
     _reddit_rss_url,
-    _reddit_old_url,
     _reddit_oembed_url,
+    _reddit_post_id,
+    _reddit_search_query,
+    _reddit_rss_available,
+    _is_reddit_url,
     _compact_reddit_json,
     _compact_reddit_rss,
-    _compact_reddit_html,
     _provenance,
     _is_contentless,
 )
@@ -312,7 +314,6 @@ def test_reddit_representation_urls():
     assert "limit=500" in oauth
     assert _reddit_rss_url(url).endswith("/title/.rss")
     assert "context=" not in _reddit_rss_url(url)
-    assert _reddit_old_url(url).startswith("https://old.reddit.com/")
 
 
 def test_reddit_listing_representation_urls():
@@ -320,7 +321,6 @@ def test_reddit_listing_representation_urls():
     assert _reddit_rss_url(url) == (
         "https://www.reddit.com/r/python/search.rss?q=asyncio&restrict_sr=1"
     )
-    assert _reddit_old_url(url) == url
 
 
 def test_normalize_reddit_url_non_reddit_unchanged():
@@ -341,6 +341,61 @@ def test_reddit_oembed_url_uses_post_url_not_json_endpoint():
     assert "title.json" not in out
     assert "www.reddit.com" in out
     assert "context%3D3" not in out
+
+
+@pytest.mark.parametrize("url", [
+    "https://reddit.com/r/x/comments/abc/t",
+    "https://www.reddit.com/r/x/",
+    "https://old.reddit.com/r/x/comments/abc/t",
+    "https://np.reddit.com/r/x/comments/abc/t",
+    "https://WWW.Reddit.com:443/r/x/",
+])
+def test_is_reddit_url_content_hosts(url):
+    assert _is_reddit_url(url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://developers.reddit.com/docs/guides/migrate/public-api",
+    "https://support.reddithelp.com/hc/en-us/articles/1",
+    "https://redditinc.com/policies",
+    "https://notreddit.com/r/x/comments/abc",
+    "https://evil.com/?u=https://www.reddit.com/r/x",
+])
+def test_is_reddit_url_rejects_non_content_hosts(url):
+    assert not _is_reddit_url(url)
+
+
+def test_reddit_post_id():
+    assert _reddit_post_id("https://www.reddit.com/r/x/comments/AbC12/title/") == "abc12"
+    assert _reddit_post_id("https://www.reddit.com/comments/abc/") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t/def/") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t.json") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/r/x/") is None
+    assert _reddit_post_id("https://example.com/r/x/comments/abc/t") is None
+
+
+def test_reddit_search_query_prefers_title_then_slug():
+    url = "https://www.reddit.com/r/redditdev/comments/abc/moving_data_api_apps/"
+    assert _reddit_search_query(url, "Moving Data API Apps: dates") == (
+        "site:reddit.com r/redditdev Moving Data API Apps: dates"
+    )
+    assert _reddit_search_query(url, None) == (
+        "site:reddit.com r/redditdev moving data api apps"
+    )
+    assert _reddit_search_query("https://www.reddit.com/comments/abc/", None) is None
+
+
+def test_reddit_search_query_stays_within_brave_limits():
+    url = "https://www.reddit.com/r/x/comments/abc/t/"
+    query = _reddit_search_query(url, " ".join(["word"] * 200))
+    assert len(query.split()) <= 75
+    assert len(query) <= 600
+
+
+def test_reddit_rss_available_until_retirement():
+    from datetime import date
+    assert _reddit_rss_available(date(2026, 11, 12))
+    assert not _reddit_rss_available(date(2026, 11, 13))
 
 
 # --------------------------- _compact_reddit_json ---------------------------
@@ -387,29 +442,6 @@ def test_compact_reddit_rss_extracts_post_and_comments(monkeypatch):
     assert out["comments"][0]["body"] == "comment body"
     assert out["comments_returned"] == 1
     assert out["comments_incomplete"] is True
-
-
-def test_compact_old_reddit_html_extracts_targeted_content(monkeypatch):
-    monkeypatch.setattr(fp.cfg, "markdown", False)
-    html = """<html><body>
-      <div class="thing link" data-fullname="t3_abc" data-author="poster"
-           data-subreddit="python" data-score="12" data-comments-count="2"
-           data-permalink="/r/python/comments/abc/title/" data-url="/r/python/comments/abc/title/">
-        <a class="title">Post title</a><div class="entry"><div class="usertext-body"><div class="md"><p>post body</p></div></div></div>
-      </div>
-      <div class="thing comment" data-fullname="t1_def" data-type="comment" data-author="commenter">
-        <div class="entry"><a class="author">commenter</a><span class="score unvoted">5 points</span><div class="usertext-body"><div class="md"><p>comment body</p></div></div></div>
-      </div><div class="morecomments">more</div>
-    </body></html>"""
-    out = _compact_reddit_html(
-        html, "https://old.reddit.com/r/python/comments/abc/title/"
-    )
-    assert out["post"]["title"] == "Post title"
-    assert out["post"]["selftext"] == "post body"
-    assert out["comments"][0]["body"] == "comment body"
-    assert out["comments"][0]["depth"] == 0
-    assert out["comments_incomplete"] is True
-    assert out["more_comment_placeholders"] == 1
 
 
 # --------------------------- _provenance ---------------------------

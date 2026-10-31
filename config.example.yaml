@@ -197,19 +197,25 @@ web_search:
   # UA sent with direct fetches (and by search_web).
   user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   # Optional Reddit Data API OAuth. When all three are set, fetch_page tries the
-  # authenticated JSON API before RSS, old.reddit HTML, and oEmbed fallbacks.
-  # Setup steps are in README.md; never commit the secret.
+  # authenticated JSON API before its anonymous fallbacks. Reddit stopped
+  # accepting new Data API requests on 2026-10-31 and ends public access in
+  # March 2027, so this only helps if you already hold approved credentials.
+  # See README.md; never commit the secret.
   reddit_client_id: ""
   reddit_client_secret: ""
   # Required by Reddit for OAuth clients; replace the username and keep it honest.
   reddit_user_agent: ""
   # Serialize Reddit acquisitions with this quiet period between calls to reduce
-  # anonymous RSS/HTML burst throttling (OAuth is still strongly recommended).
-  # 0 disables queueing.
+  # anonymous RSS/oEmbed burst throttling. 0 disables queueing.
   reddit_request_delay_seconds: 1
   # On HTTP 429, wait this long and retry the RSS representation once. 0 goes
-  # straight to the old.reddit/oEmbed fallbacks.
+  # straight to the post fallbacks. (RSS is skipped after Reddit retires it on
+  # 2026-11-13.)
   reddit_rate_limit_retry_seconds: 3
+  # Without OAuth/RSS, return Brave search-index excerpts for a Reddit post (one
+  # Brave call per fetch; needs brave_api_key). false falls back to oEmbed
+  # title/author metadata only.
+  reddit_search_fallback: true
   # fetch_page refuses URLs resolving to non-public addresses. Allowlist only
   # trusted local/private hosts, IPs, or CIDRs (redirect targets are checked too).
   # A YAML list or a comma-separated string both work.

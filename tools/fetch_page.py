@@ -7,8 +7,8 @@ stand-ins, or, when handed a YouTube video URL, returns that video's transcript.
 Direct image URLs return metadata/embedded descriptions rather than raw bytes.
 PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
-uses authenticated OAuth JSON when configured, then tries RSS, old.reddit HTML,
-and finally oEmbed metadata for individual posts.
+uses authenticated OAuth JSON when configured, then RSS (until Reddit retires it),
+then — for individual posts — Brave search-index excerpts and oEmbed metadata.
 An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
@@ -22,6 +22,7 @@ extraction in `tools/web_extract.py`; the YouTube transcript logic in
 
 import asyncio
 from bisect import bisect_right
+from datetime import date, datetime, timezone
 import json
 import logging
 import re
@@ -53,6 +54,13 @@ from .web_fetch import (
     _tika_extract,
 )
 from .page_acquire import acquire_page as _acquire_page
+from .web_search import (
+    _BRAVE_SAFESEARCH,
+    _brave_query,
+    _resolve_country,
+    _resolve_optional_choice,
+    _resolve_search_lang,
+)
 from .web_extract import (
     _find_section,
     _heading_anchor_records,
@@ -571,10 +579,39 @@ async def _query_payload(
 # ---------------------------------------------------------------------------
 # Reddit handling
 #
-# Authenticated JSON is the durable first choice. Anonymous hosted-provider
-# traffic is commonly blocked, so the remaining representations are best-effort:
-# RSS, targeted old.reddit HTML, and (for posts) official oEmbed metadata.
+# Authenticated JSON is the only complete source, but Reddit stopped granting
+# new Data API access on 2026-10-31 and closes the public API in March 2027.
+# Anonymous access is shrinking: `.json` returns 403, old.reddit redirects
+# logged-out visitors to a login page, www.reddit.com HTML sits behind a
+# "prove your humanity" challenge even for a headless browser, and RSS is
+# retired on 2026-11-13. What remains is best-effort: RSS until its retirement,
+# then (for posts) Brave's search-index excerpts plus official oEmbed metadata.
 # ---------------------------------------------------------------------------
+
+# Hosts that serve Reddit posts and listings. Other *.reddit.com hosts
+# (developers., support., redditinc. …) are ordinary sites and must use the
+# normal page-acquisition path.
+_REDDIT_CONTENT_HOSTS = frozenset({
+    "reddit.com",
+    "www.reddit.com",
+    "old.reddit.com",
+    "new.reddit.com",
+    "np.reddit.com",
+    "m.reddit.com",
+    "i.reddit.com",
+    "sh.reddit.com",
+    "amp.reddit.com",
+})
+
+# Reddit announced RSS support ends on this date (r/modnews, 2026-09-30).
+# After it, the RSS step is skipped instead of spending a request (and the
+# anti-burst queue's quiet period) on a guaranteed failure.
+_REDDIT_RSS_RETIRED_ON = date(2026, 11, 13)
+
+_REDDIT_POST_ID_RE = re.compile(r"/comments/(?P<id>[a-z0-9]+)(?:/(?P<slug>[^/]+))?", re.I)
+_REDDIT_SUBREDDIT_RE = re.compile(r"^/r/(?P<sub>[^/]+)", re.I)
+# Brave allows 75 words; leave room for the site:/subreddit prefix.
+_REDDIT_SEARCH_MAX_TITLE_WORDS = 60
 
 _REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 _reddit_access_token: str | None = None
@@ -587,7 +624,7 @@ class _RedditRequestQueue:
 
     Reddit's anonymous RSS/HTML endpoints throttle bursts aggressively on hosted
     IPs. One slot covers the complete fallback chain so concurrent tool calls do
-    not each fan out into RSS, old.reddit, and oEmbed requests at the same time.
+    not each fan out into RSS, oEmbed, and Brave requests at the same time.
     """
 
     def __init__(self) -> None:
@@ -613,17 +650,22 @@ _reddit_request_queue = _RedditRequestQueue()
 
 
 def _is_reddit_url(url: str) -> bool:
-    """Whether a URL targets reddit.com or one of its real subdomains."""
+    """Whether a URL targets a Reddit content host (posts, comments, listings)."""
     try:
         p = urlparse(url)
     except Exception:
         return False
-    # Match reddit.com and its subdomains (www./old./np. …) only. A bare
-    # `endswith("reddit.com")` on the netloc would also catch look-alike domains
-    # like `notreddit.com` (and miss `reddit.com:443`, since the port is part of
-    # the netloc), so test the parsed hostname for an exact or dotted-suffix match.
-    host = (p.hostname or "").lower()
-    return host == "reddit.com" or host.endswith(".reddit.com")
+    # Compare the parsed hostname (not the netloc, which carries any port)
+    # against an explicit allowlist. A suffix match would also capture
+    # look-alikes like `notreddit.com` and documentation hosts such as
+    # `developers.reddit.com`, which are normal pages, not Reddit content.
+    return (p.hostname or "").lower() in _REDDIT_CONTENT_HOSTS
+
+
+def _reddit_rss_available(today: date | None = None) -> bool:
+    """Whether Reddit still serves RSS (before its announced retirement date)."""
+    today = today or datetime.now(timezone.utc).date()
+    return today < _REDDIT_RSS_RETIRED_ON
 
 
 def _normalize_reddit_url(url: str) -> str:
@@ -653,6 +695,41 @@ def _is_reddit_post_url(url: str) -> bool:
     return "/comments/" in _reddit_clean_path(url).lower()
 
 
+def _reddit_post_id(url: str) -> str | None:
+    """Return the lowercase base-36 submission id of a Reddit post URL."""
+    if not _is_reddit_url(url):
+        return None
+    match = _REDDIT_POST_ID_RE.search(_reddit_clean_path(url))
+    return match.group("id").lower() if match else None
+
+
+def _reddit_subreddit(url: str) -> str | None:
+    match = _REDDIT_SUBREDDIT_RE.match(_reddit_clean_path(url))
+    return match.group("sub") if match else None
+
+
+def _reddit_search_query(url: str, title: str | None) -> str | None:
+    """Build a Brave query that should surface one specific Reddit post.
+
+    The post title (from oEmbed) is the best key; the URL slug is a lossy
+    fallback (Reddit truncates and strips it). Without either there is nothing
+    a search index can match on, so return None.
+    """
+    words = (title or "").split()
+    if not words:
+        match = _REDDIT_POST_ID_RE.search(_reddit_clean_path(url))
+        slug = match.group("slug") if match else None
+        words = unquote(slug or "").replace("_", " ").split()
+    if not words:
+        return None
+    parts = ["site:reddit.com"]
+    subreddit = _reddit_subreddit(url)
+    if subreddit:
+        parts.append(f"r/{subreddit}")
+    parts.extend(words[:_REDDIT_SEARCH_MAX_TITLE_WORDS])
+    return " ".join(parts)[:590]
+
+
 def _reddit_oauth_url(url: str) -> str:
     """Build the OAuth Data API URL corresponding to a public Reddit URL."""
     parsed = urlparse(url)
@@ -678,14 +755,6 @@ def _reddit_rss_url(url: str) -> str:
     path += "/.rss" if is_post else ".rss"
     query = "" if is_post else parsed.query
     return urlunparse(("https", "www.reddit.com", path or "/.rss", "", query, ""))
-
-
-def _reddit_old_url(url: str) -> str:
-    """Build the old.reddit HTML URL for a post or listing."""
-    parsed = urlparse(url)
-    return urlunparse(
-        ("https", "old.reddit.com", _reddit_clean_path(url), "", parsed.query, "")
-    )
 
 
 def _reddit_oembed_url(url: str) -> str:
@@ -769,95 +838,6 @@ def _compact_reddit_rss(xml: str, url: str) -> dict | None:
             }
 
         return {"items": parsed_entries, "items_returned": len(parsed_entries)}
-    except Exception:
-        return None
-
-
-def _old_reddit_entry_body(node, url: str) -> str:
-    entry = node.find("div", class_="entry", recursive=False)
-    body = entry.select_one(".usertext-body") if entry else None
-    return _reddit_fragment_text(str(body), url) if body else ""
-
-
-def _compact_reddit_html(html: str, url: str) -> dict | None:
-    """Extract posts/comments from old.reddit HTML without page chrome."""
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        links = soup.select("div.thing.link[data-fullname^='t3_']")
-        comments = []
-        for node in soup.select("div.thing.comment[data-fullname^='t1_']"):
-            author_node = node.select_one(".author")
-            score_node = node.select_one(".score.unvoted, .score.likes, .score.dislikes")
-            depth = sum(
-                1
-                for parent in node.parents
-                if getattr(parent, "get", lambda *_: None)("data-type") == "comment"
-            )
-            comments.append(
-                {
-                    "id": node.get("data-fullname"),
-                    "author": (
-                        author_node.get_text(" ", strip=True)
-                        if author_node
-                        else node.get("data-author")
-                    ),
-                    "score": score_node.get_text(" ", strip=True) if score_node else None,
-                    "depth": depth,
-                    "body": _old_reddit_entry_body(node, url),
-                    "permalink": node.get("data-permalink"),
-                }
-            )
-
-        if _is_reddit_post_url(url) and links:
-            node = links[0]
-            title_node = node.select_one("a.title")
-            reported = node.get("data-comments-count")
-            try:
-                reported = int(reported) if reported is not None else None
-            except (TypeError, ValueError):
-                reported = None
-            post = {
-                "title": title_node.get_text(" ", strip=True) if title_node else None,
-                "author": node.get("data-author"),
-                "subreddit": node.get("data-subreddit"),
-                "score": (
-                    int(node.get("data-score"))
-                    if str(node.get("data-score", "")).isdigit()
-                    else None
-                ),
-                "num_comments": reported,
-                "permalink": node.get("data-permalink"),
-                "url": node.get("data-url"),
-                "selftext": _old_reddit_entry_body(node, url),
-            }
-            result = {
-                "post": post,
-                "comments": comments,
-                "comments_returned": len(comments),
-                "more_comment_placeholders": len(soup.select(".morecomments")),
-            }
-            if reported is not None:
-                result["comments_reported"] = reported
-                result["comments_incomplete"] = len(comments) < reported
-            return result
-
-        items = []
-        for node in links:
-            title_node = node.select_one("a.title")
-            items.append(
-                {
-                    "id": node.get("data-fullname"),
-                    "title": title_node.get_text(" ", strip=True) if title_node else None,
-                    "author": node.get("data-author"),
-                    "subreddit": node.get("data-subreddit"),
-                    "score": node.get("data-score"),
-                    "num_comments": node.get("data-comments-count"),
-                    "permalink": node.get("data-permalink"),
-                    "url": node.get("data-url"),
-                    "selftext": _old_reddit_entry_body(node, url),
-                }
-            )
-        return {"items": items, "items_returned": len(items)} if items else None
     except Exception:
         return None
 
@@ -1060,8 +1040,100 @@ def _reddit_failure_trace(name: str, exc: BaseException) -> str:
     return f"{name} failed ({detail})"
 
 
+def _brave_configured() -> bool:
+    return bool(cfg.brave_api_key.strip() and cfg.brave_api_url.strip())
+
+
+async def _fetch_reddit_oembed(url: str) -> tuple[dict, dict]:
+    """Fetch Reddit's official oEmbed record (title/author, no body) for a post."""
+    fetched = await _acquire_page(_reddit_oembed_url(url))
+    if fetched.get("status", 0) >= 400:
+        raise RuntimeError(f"HTTP {fetched['status']}")
+    data = json.loads(fetched.get("text") or "")
+    if not isinstance(data, dict):
+        raise RuntimeError("oEmbed response was not a JSON object")
+    return fetched, data
+
+
+async def _fetch_reddit_brave(url: str, oembed: dict | None) -> tuple[dict, dict]:
+    """Return Brave LLM Context excerpts of one Reddit post.
+
+    Brave's index holds pre-extracted text of many Reddit threads (post body and
+    a selection of comments). Results are kept only when their URL names the
+    same submission id, so an unrelated thread with a similar title is never
+    returned as this post.
+    """
+    post_id = _reddit_post_id(url)
+    title = (oembed or {}).get("title")
+    title = title.strip() if isinstance(title, str) and title.strip() else None
+    query = _reddit_search_query(url, title)
+    if not post_id or not query:
+        raise RuntimeError("no post title or URL slug to search for")
+
+    results = await _brave_query(
+        api_url=cfg.brave_api_url.strip(),
+        api_key=cfg.brave_api_key.strip(),
+        query=query,
+        num_results=cfg.max_num_results,
+        country=_resolve_country(None, cfg.brave_country),
+        search_lang=_resolve_search_lang(None, cfg.brave_search_lang),
+        # Any age: a configured search_web freshness default must not hide the
+        # older thread the model explicitly asked for.
+        freshness="",
+        safesearch=_resolve_optional_choice(
+            None, cfg.brave_safesearch, _BRAVE_SAFESEARCH, "safesearch"
+        ),
+        # Results are filtered to the exact submission id below, so favor
+        # coverage over Brave's relevance threshold.
+        context_threshold_mode="lenient",
+        max_tokens=cfg.max_context_tokens,
+        search_count=cfg.brave_search_count,
+        max_tokens_per_url=cfg.brave_max_tokens_per_url,
+        timeout=cfg.brave_timeout_seconds,
+        verify_ssl=cfg.verify_ssl,
+        user_agent=cfg.user_agent,
+        request_delay_seconds=cfg.brave_request_delay_seconds,
+        max_retries=cfg.brave_max_retries,
+        retry_backoff_seconds=cfg.brave_retry_backoff_seconds,
+    )
+    matches = [r for r in results if _reddit_post_id(r.get("url") or "") == post_id]
+    excerpts = list(dict.fromkeys(
+        snippet for result in matches for snippet in result.get("snippets") or []
+    ))
+    if not excerpts:
+        raise RuntimeError(f"search index returned no excerpts for post {post_id}")
+
+    first = matches[0]
+    post = {
+        "title": title or first.get("title"),
+        "author": (oembed or {}).get("author_name"),
+        "subreddit": _reddit_subreddit(url),
+        "permalink": urlunparse(
+            ("https", "www.reddit.com", _reddit_clean_path(url), "", "", "")
+        ),
+    }
+    compact: dict = {
+        "post": {key: value for key, value in post.items() if value},
+        "excerpts": excerpts,
+        "excerpts_source": "brave_llm_context",
+        "complete": False,
+    }
+    if first.get("page_date"):
+        compact["page_date"] = first["page_date"]
+    fetched = {
+        "url": first["url"],
+        "status": 200,
+        "content_type": "application/json",
+        "text": None,
+        "bytes": None,
+        "via": "brave_llm_context",
+        "blocked_detected": False,
+    }
+    return fetched, compact
+
+
 async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]:
-    """Try OAuth JSON -> RSS -> old.reddit HTML -> oEmbed."""
+    """Try OAuth JSON -> RSS (until retired) -> Brave excerpts -> oEmbed."""
     errors: list[str] = []
     trace: list[str] = []
 
@@ -1078,62 +1150,76 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
     else:
         trace.append("OAuth JSON skipped (not configured)")
 
-    rss_url = _reddit_rss_url(url)
-    try:
-        fetched = await _acquire_page(rss_url)
-        if (
-            fetched.get("status") == 429
-            and cfg.reddit_rate_limit_retry_seconds > 0
-        ):
-            trace.append(
-                "RSS returned HTTP 429; retrying after "
-                f"{cfg.reddit_rate_limit_retry_seconds:g}s"
-            )
-            await anyio.sleep(cfg.reddit_rate_limit_retry_seconds)
-            fetched = await _acquire_page(rss_url)
-        if fetched.get("status", 0) >= 400:
-            raise RuntimeError(f"HTTP {fetched['status']}")
-        compact = await anyio.to_thread.run_sync(
-            _compact_reddit_rss, fetched.get("text") or "", url
-        )
-        if compact is None:
-            raise RuntimeError("feed contained no Reddit entries")
-        trace.append("RSS succeeded")
-        return fetched, compact, "rss", trace
-    except Exception as exc:
-        failure = _reddit_failure_trace("RSS", exc)
-        errors.append(failure)
-        trace.append(failure)
-
-    old_url = _reddit_old_url(url)
-    try:
-        fetched = await _acquire_page(old_url)
-        if fetched.get("status", 0) >= 400:
-            raise RuntimeError(f"HTTP {fetched['status']}")
-        compact = await anyio.to_thread.run_sync(
-            _compact_reddit_html, fetched.get("text") or "", url
-        )
-        if compact is None:
-            raise RuntimeError("page contained no extractable Reddit entries")
-        trace.append("old.reddit HTML succeeded")
-        return fetched, compact, "old_html", trace
-    except Exception as exc:
-        failure = _reddit_failure_trace("old.reddit HTML", exc)
-        errors.append(failure)
-        trace.append(failure)
-
-    if _is_reddit_post_url(url):
-        oembed_url = _reddit_oembed_url(url)
+    if _reddit_rss_available():
+        rss_url = _reddit_rss_url(url)
         try:
-            fetched = await _acquire_page(oembed_url)
+            fetched = await _acquire_page(rss_url)
+            if (
+                fetched.get("status") == 429
+                and cfg.reddit_rate_limit_retry_seconds > 0
+            ):
+                trace.append(
+                    "RSS returned HTTP 429; retrying after "
+                    f"{cfg.reddit_rate_limit_retry_seconds:g}s"
+                )
+                await anyio.sleep(cfg.reddit_rate_limit_retry_seconds)
+                fetched = await _acquire_page(rss_url)
             if fetched.get("status", 0) >= 400:
                 raise RuntimeError(f"HTTP {fetched['status']}")
-            trace.append("oEmbed succeeded")
-            return fetched, json.loads(fetched.get("text") or ""), "oembed", trace
+            compact = await anyio.to_thread.run_sync(
+                _compact_reddit_rss, fetched.get("text") or "", url
+            )
+            if compact is None:
+                raise RuntimeError("feed contained no Reddit entries")
+            trace.append("RSS succeeded")
+            return fetched, compact, "rss", trace
         except Exception as exc:
-            failure = _reddit_failure_trace("oEmbed", exc)
+            failure = _reddit_failure_trace("RSS", exc)
             errors.append(failure)
             trace.append(failure)
+    else:
+        trace.append(
+            f"RSS skipped (Reddit retired it on {_REDDIT_RSS_RETIRED_ON.isoformat()})"
+        )
+
+    if not _is_reddit_post_url(url):
+        errors.append(
+            "Reddit no longer serves subreddit, user, or search listings to "
+            "anonymous clients; use search_web with a site:reddit.com/r/<subreddit> "
+            "query to find posts, then fetch an individual post URL"
+        )
+        raise RuntimeError("; ".join(errors))
+
+    oembed_fetched: dict | None = None
+    oembed: dict | None = None
+    try:
+        oembed_fetched, oembed = await _fetch_reddit_oembed(url)
+        trace.append("oEmbed metadata succeeded")
+    except Exception as exc:
+        failure = _reddit_failure_trace("oEmbed", exc)
+        errors.append(failure)
+        trace.append(failure)
+
+    if not cfg.reddit_search_fallback:
+        skipped = "Brave excerpts skipped (reddit_search_fallback disabled)"
+    elif not _brave_configured():
+        skipped = "Brave excerpts skipped (Brave Search not configured)"
+    else:
+        skipped = None
+        try:
+            fetched, compact = await _fetch_reddit_brave(url, oembed)
+            trace.append("Brave excerpts succeeded")
+            return fetched, compact, "brave", trace
+        except Exception as exc:
+            failure = _reddit_failure_trace("Brave excerpts", exc)
+            errors.append(failure)
+            trace.append(failure)
+    if skipped:
+        errors.append(skipped)
+        trace.append(skipped)
+
+    if oembed_fetched is not None and oembed is not None:
+        return oembed_fetched, oembed, "oembed", trace
 
     raise RuntimeError("; ".join(errors) or "no Reddit acquisition method succeeded")
 
@@ -1317,6 +1403,7 @@ def _redact_backend_secrets(text: Any, *extra_secrets: str) -> str:
         *extra_secrets,
         cfg.firecrawl_api_key,
         cfg.classifier_api_key,
+        cfg.brave_api_key,
         *passwords,
     )
 
@@ -1414,9 +1501,8 @@ async def _fetch_one(
         source_url = {
             "oauth": _reddit_oauth_url(url),
             "rss": _reddit_rss_url(url),
-            "old_html": _reddit_old_url(url),
             "oembed": _reddit_oembed_url(url),
-        }[reddit_source]
+        }.get(reddit_source) or fetched.get("url") or url
         status = fetched.get("status")
         ctype = (fetched.get("content_type") or "").lower()
         payload = {
@@ -1431,17 +1517,20 @@ async def _fetch_one(
                 "Returned Reddit's RSS feed; it may contain only an initial "
                 "snapshot of the comments.",
             )
-        elif reddit_source == "old_html":
+        elif reddit_source == "brave":
             payload["note"] = _join_note(
                 payload.get("note"),
-                "Reddit OAuth JSON and RSS were unavailable; returned targeted "
-                "old.reddit HTML extraction, which may omit unloaded comments.",
+                "Reddit's API and RSS are unavailable, so this is search-index "
+                "excerpts of the post from Brave, not the full thread: excerpts "
+                "may omit parts of the post and most comments, and may lag "
+                "recent edits.",
             )
         elif reddit_source == "oembed":
             payload["note"] = _join_note(
                 payload.get("note"),
-                "Reddit OAuth JSON, RSS, and old.reddit HTML were unavailable; "
-                "returning official oEmbed post metadata without comments.",
+                "Reddit's API, RSS, and search-index excerpts were unavailable; "
+                "returning official oEmbed post metadata without the post body "
+                "or comments.",
             )
         if any("HTTP 429" in step for step in reddit_trace):
             if reddit_source == "rss" and any(
@@ -1449,13 +1538,12 @@ async def _fetch_one(
             ):
                 rate_limit_note = (
                     "Reddit rate-limited the initial RSS request (HTTP 429); "
-                    "the automatic retry succeeded. Configure Reddit OAuth for "
-                    "more reliable post/comment access."
+                    "the automatic retry succeeded."
                 )
             else:
                 rate_limit_note = (
                     "Reddit rate-limited at least one representation (HTTP 429). "
-                    "Retry later or configure Reddit OAuth for reliable post/comment access."
+                    "Retry later for a fuller result."
                 )
             payload["note"] = _join_note(payload.get("note"), rate_limit_note)
         if debug_enabled():

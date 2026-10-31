@@ -164,12 +164,23 @@ returned `next_offset` to read the next chunk; this works for HTML, documents,
 JSON, Reddit, and transcripts. A YouTube video URL returns the video's transcript
 rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
 
-Reddit URLs are returned as compacted JSON. When Reddit OAuth is configured,
-`fetch_page` uses the authenticated Data API first. It otherwise falls back in
-order to Reddit's RSS feed, targeted `old.reddit.com` HTML extraction, and
-official oEmbed metadata. RSS and old Reddit may expose only an initial comment
-snapshot; the result reports comment counts/completeness when the source makes
-them available.
+Reddit URLs are returned as compacted JSON. Reddit has been closing anonymous
+access (see [Reddit access after 2026](#reddit-access-after-2026)), so what
+`fetch_page` can return depends on what is still open:
+
+1. **OAuth Data API** (only with already-approved credentials) — the full post
+   and comment tree.
+2. **RSS** (until Reddit retires it on 2026-11-13; skipped automatically
+   afterwards) — the post plus an initial comment snapshot.
+3. **Brave search-index excerpts** (posts only; needs `web_search.brave_api_key`)
+   — excerpts of the post and some comments from Brave's index, filtered to the
+   exact submission id and marked `complete: false`. New posts may not be indexed
+   yet.
+4. **oEmbed** (posts only) — official title/author metadata, no body or comments.
+
+Subreddit, user, and search listings have no anonymous source once RSS is gone;
+the tool error points the model to `search_web` with a `site:reddit.com/r/<name>`
+query instead.
 
 Fetching is resilient: a direct `httpx` request first, an automatic
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
@@ -396,9 +407,10 @@ Key things to set:
 - `web_search.firecrawl_api_key` — optional `fetch_page` credential; enables the last-resort fetch fallback when the first-line FlareSolverr HTML render is blocked/unusable or a known document is hidden behind an HTML challenge. Firecrawl is not used by `search_web`. `firecrawl_hedge_enabled` / `firecrawl_hedge_delay_seconds` optionally start Firecrawl while a slow FlareSolverr render is still running; disabled by default to avoid unnecessary credits.
 - `web_search.classifier_api_url` / `classifier_model` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `classifier_api_key` supplies an optional bearer token.
 - `web_search.circuit_breaker_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
-- `web_search.reddit_client_id` / `reddit_client_secret` / `reddit_user_agent` — optional Reddit OAuth credentials; strongly recommended for reliable Reddit post/comment fetching. See [Reddit Data API setup](#reddit-data-api-setup).
-- `web_search.reddit_request_delay_seconds` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/HTML burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
-- `web_search.reddit_rate_limit_retry_seconds` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to old Reddit/oEmbed; `0` disables the retry. These throttling mitigations are not a substitute for OAuth on hosted-server IPs.
+- `web_search.reddit_client_id` / `reddit_client_secret` / `reddit_user_agent` — optional Reddit OAuth credentials. Only useful if you already hold approved Data API credentials; Reddit no longer grants new ones. See [Reddit access after 2026](#reddit-access-after-2026).
+- `web_search.reddit_request_delay_seconds` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/oEmbed burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
+- `web_search.reddit_rate_limit_retry_seconds` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to the post fallbacks; `0` disables the retry.
+- `web_search.reddit_search_fallback` — when OAuth and RSS are unavailable, return Brave search-index excerpts for a Reddit post (default `true`; one Brave call per fetch, needs `brave_api_key`). `false` falls back straight to oEmbed metadata.
 - `web_search.ssrf_allowlist` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 - `geocoding.user_agent` — set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `nominatim_email` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `nominatim_url` / `overpass_url`, clear `overpass_fallback_urls` when queries must stay private, and set `min_request_interval_seconds: 0`.
 - `email.username` / `email.password` — required for `send_email`. For Gmail,
@@ -410,39 +422,41 @@ Key things to set:
 - `web_search.max_concurrent_*` — in-flight caps for direct fetches, FlareSolverr,
   Tika, and Firecrawl (defaults 8 / 2 / 2 / 2).
 
-### Reddit Data API setup
+### Reddit access after 2026
 
-Reddit blocks unidentified API traffic from many hosted-server networks. A
-personal, non-commercial project can request free Data API access, subject to
-Reddit's approval and rate limits:
+Reddit announced on 2026-09-30 that it is closing its public data surfaces
+([r/redditdev](https://www.reddit.com/r/redditdev/comments/1wubcvf/moving_data_api_apps_to_the_developer_platform/),
+[r/modnews](https://www.reddit.com/r/modnews/comments/1wubgvt/continuing_our_infrastructure_updates_whats/)):
 
-1. Sign in to the Reddit account that will own the application.
-2. Read Reddit's [Developer Platform and Data API access guidance](https://support.reddithelp.com/hc/en-us/articles/14945211791892-Developer-Platform-Accessing-Reddit-Data) and [Responsible Builder Policy](https://support.reddithelp.com/hc/en-us/articles/42728983564564-Responsible-Builder-Policy).
-3. Submit Reddit's [Data API access request](https://support.reddithelp.com/hc/en-us/requests/new?ticket_form_id=14868593862164). Describe this as a personal, non-commercial MCP page reader and provide the repository URL if requested. Follow any approval instructions Reddit sends you.
-4. Open [Reddit app preferences](https://www.reddit.com/prefs/apps), select
-   **create another app**, and create a confidential application. For a personal
-   server, the **script** type is normally appropriate. The redirect URI is not
-   used by this server's application-only flow, but Reddit may still require a
-   valid URL such as `http://localhost:8080`.
-5. Copy the short value displayed beneath the application name as the client ID,
-   and copy the value labeled `secret` as the client secret.
-6. Add the credentials to the `web_search:` section of `config.yaml`, replacing
-   `your_username` with the owning Reddit username:
+| Date | Change |
+| --- | --- |
+| already in effect | `old.reddit.com` requires login; anonymous `.json` returns 403; `www.reddit.com` HTML shows a "prove your humanity" challenge, even to FlareSolverr. |
+| 2026-10-31 | New Data API access requests are no longer accepted. `reddit.com/prefs/apps` refuses to create an app without prior Responsible Builder Policy approval. |
+| 2026-11-13 | RSS feeds end. |
+| 2027-01-12 | API access starts closing for apps not registered at [developers.reddit.com/app-registration](https://developers.reddit.com/app-registration). |
+| March 2027 | Public Data API access ends for everyone. |
 
-   ```yaml
-   web_search:
-     reddit_client_id: "your_client_id"
-     reddit_client_secret: "your_client_secret"
-     reddit_user_agent: "linux:mcp-server:1.0 (by /u/your_username)"
-   ```
+An account on developers.reddit.com is for Reddit's Developer Platform (Devvit),
+which runs apps inside Reddit. The token in its `npm create devvit …` command
+logs in the Devvit CLI; it is **not** a Data API client ID or secret, and does
+not work here.
 
-7. Restart the MCP server. Do not commit `config.yaml` or expose the client secret.
+If you already hold approved Data API credentials (a **script** app listed at
+[reddit.com/prefs/apps](https://www.reddit.com/prefs/apps)), they still work
+until March 2027. Register the app before 2027-01-12, then add the credentials
+to the `web_search:` section of `config.yaml`:
 
-The server exchanges these credentials for a short-lived application-only OAuth
-token, caches it until shortly before expiration, and sends requests to
-`oauth.reddit.com`. It does not store or require your Reddit password. Reddit's
-current free-access limit is 100 queries per minute per OAuth client ID; consult
-the [Data API Wiki](https://support.reddithelp.com/hc/en-us/articles/16160319875092-Reddit-Data-API-Wiki) for current requirements.
+```yaml
+web_search:
+  reddit_client_id: "the string under the app name"
+  reddit_client_secret: "the value labeled secret"
+  reddit_user_agent: "linux:mcp-server:1.0 (by /u/your_username)"
+```
+
+The server exchanges these for a short-lived application-only OAuth token and
+calls `oauth.reddit.com`; it never needs your Reddit password. Never commit
+`config.yaml`. Without credentials, `fetch_page` degrades to the RSS → Brave
+excerpts → oEmbed chain described under [Agentic Web Search](#agentic-web-search).
 
 ### Email
 
@@ -469,8 +483,8 @@ raise tool errors instead of being returned as successful sends.
 Set `server.debug: true` to enable debug mode: tool responses are serialized as
 indented, human-readable JSON (instead of compact JSON) and each tool call emits
 verbose per-call logs to stdout. Reddit `fetch_page` results also append a
-redacted fallback trace to `note`, showing whether OAuth JSON, RSS, old Reddit,
-and oEmbed were skipped, failed, or succeeded. Useful for troubleshooting; leave
+redacted fallback trace to `note`, showing whether OAuth JSON, RSS, oEmbed,
+and Brave excerpts were skipped, failed, or succeeded. Useful for troubleshooting; leave
 it off in normal operation so responses stay compact in the model's context
 window.
 
