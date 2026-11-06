@@ -1,25 +1,19 @@
 # ---------------------------------------------------------------------------
-# Python 3.15 blockers (last checked 2026-10-29 against PyPI releases)
+# Python 3.15 blockers (last checked 2026-11-06 against PyPI releases)
 #
-# The code and full test suite pass on 3.15; what keeps the image and CI on
-# 3.14 is packaging. Re-check these on each re-lock and delete an entry once
-# it is resolved:
+# The code and full test suite pass on 3.15 (3.15.2 in python:3.15-slim); what
+# keeps the image on 3.14 is packaging. Re-check these on each re-lock and
+# delete an entry once it is resolved:
 #
-#   youtube-transcript-api 1.2.4  Declares Requires-Python "<3.15" (upstream
-#       master is still capped). Works on 3.15 (verified with a live transcript
-#       fetch), and uv ignores the cap so the Docker build installs it, but pip
-#       refuses, which blocks the CI test job. Unblocked by a release that lifts
-#       the cap.
 #   PyYAML 6.0.3, zstandard 0.25.0  No cp315 wheels yet. Their sdists build
 #       and pass on 3.15, but python:3.15-slim has no compiler, so the
 #       Dockerfile builder stage fails. Unblocked by cp315 wheels (PyYAML has
 #       merged 3.15 wheel builds, awaiting a release; zstandard has open 3.15
 #       wheel/support PRs), or by installing gcc in the builder stage only.
+#       This does not block CI: GitHub runners have a compiler, so
+#       `pip install --require-hashes -r requirements-dev.txt` builds both from
+#       sdist and the suite passes on 3.15.
 #
-# Cleared: beartype 0.23.1 (final) supports 3.15 and Requires-Python >=3.10, so
-# the lock no longer pins a pre-release; fastmcp's `beartype>=0.23.0rc2` floor is
-# satisfied by it everywhere. brotli 1.2.1 ships cp315 manylinux wheels for
-# x86_64 and aarch64 (both image platforms).
 # Once unblocked: build with `--build-arg PYTHON_VERSION=3.15` (Dockerfile),
 # add "3.15" to the CI test matrix (.github/workflows/docker-publish.yml), and
 # update the versions named in AGENTS.md.
@@ -63,4 +57,4 @@ requests>=2.34.2
 yfinance>=1.7.0
 
 # YouTube Transcript
-youtube-transcript-api>=1.2.4
+youtube-transcript-api>=1.2.5
