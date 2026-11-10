@@ -1,22 +1,22 @@
 # ---------------------------------------------------------------------------
-# Python 3.15 blockers (last checked 2026-11-09 against PyPI releases)
+# Python 3.15 source-build workaround (last checked 2026-11-09 against PyPI)
 #
-# The code and full test suite pass on 3.15 (3.15.2 in python:3.15-slim); what
-# keeps the image on 3.14 is packaging. Re-check these on each re-lock and
-# delete an entry once it is resolved:
+# The image runs on Python 3.15. Two dependencies still publish no cp315
+# wheels, so the Dockerfile's builder stage uses the full (non-slim)
+# python:3.15 image, which has a C toolchain, and compiles them from sdist.
+# The runtime stage is still python:3.15-slim; only the built venv is copied.
+# Re-check on each re-lock and delete an entry once its wheels ship:
 #
-#   PyYAML 6.0.3, zstandard 0.25.0  No cp315 wheels yet. Their sdists build
-#       and pass on 3.15, but python:3.15-slim has no compiler, so the
-#       Dockerfile builder stage fails. Unblocked by cp315 wheels (PyYAML has
-#       merged 3.15 wheel builds, awaiting a release; zstandard has open 3.15
-#       wheel/support PRs), or by installing gcc in the builder stage only.
-#       This does not block CI: GitHub runners have a compiler, so
-#       `pip install --require-hashes -r requirements-dev.txt` builds both from
-#       sdist and the suite passes on 3.15.
+#   PyYAML 6.0.3     No cp315 wheel (3.15 wheel builds merged upstream,
+#                    awaiting a release). Built with PYYAML_FORCE_LIBYAML=0
+#                    because the slim runtime has no libyaml; the config loader
+#                    uses the pure-Python SafeLoader anyway.
+#   zstandard 0.25.0 No cp315 wheel (open 3.15 wheel/support PRs upstream).
 #
-# Once unblocked: build with `--build-arg PYTHON_VERSION=3.15` (Dockerfile),
-# add "3.15" to the CI test matrix (.github/workflows/docker-publish.yml), and
-# update the versions named in AGENTS.md.
+# Once BOTH ship cp315 wheels the workaround is no longer needed: switch the
+# Dockerfile builder back to `python:${PYTHON_VERSION}-slim`, drop
+# PYYAML_FORCE_LIBYAML, and delete this note. (CI is unaffected either way:
+# GitHub runners have a compiler.)
 # ---------------------------------------------------------------------------
 
 # MCP server framework (FastMCP v4 + streamable-http transport).

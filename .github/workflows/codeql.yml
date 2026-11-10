@@ -59,7 +59,7 @@ jobs:
           IMAGE: ${{ github.repository }}
         run: echo "ref=ghcr.io/${IMAGE,,}:latest" >> "$GITHUB_OUTPUT"
 
-      # Scans the built image — OS packages from python:3.14-slim plus the
+      # Scans the built image — OS packages from python:3.15-slim plus the
       # installed Python deps — for known CVEs. Reports to the Security tab via
       # SARIF; does not fail the job (exit-code defaults to 0), mirroring CodeQL.
       - name: Run Trivy image vulnerability scan

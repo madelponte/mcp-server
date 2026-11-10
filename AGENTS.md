@@ -44,9 +44,9 @@ uv pip compile requirements.in --universal --python-version 3.13 --generate-hash
 uv pip compile requirements-dev.in --universal --python-version 3.13 --generate-hashes --upgrade -o requirements-dev.txt
 ```
 
-Drop `--upgrade` to re-lock without moving versions already pinned. Run the test suite (3.13 and 3.14) after a refresh.
+Drop `--upgrade` to re-lock without moving versions already pinned. Run the test suite (3.13, 3.14, and 3.15) after a refresh.
 
-Python 3.15 is blocked on packaging, not code. The list of blocking packages lives at the top of `requirements.in` (not the generated `.txt`, which a re-lock overwrites). Re-check it on each refresh and remove entries as they clear. (beartype 0.23.1 final cleared its entry — it supports 3.15, so the lock pins it unconditionally.)
+The image runs on Python 3.15, with a temporary packaging workaround: PyYAML and zstandard have no cp315 wheels yet, so the Dockerfile's **builder** stage uses the full `python:3.15` image (it has a compiler) to build them from sdist, while the runtime stage stays `python:3.15-slim`. The workaround is documented at the top of `requirements.in` (not the generated `.txt`, which a re-lock overwrites). Re-check it on each refresh; once both packages ship cp315 wheels, switch the builder back to `-slim`, drop `PYYAML_FORCE_LIBYAML`, and delete the note. (beartype 0.23.1 final cleared its entry — it supports 3.15, so the lock pins it unconditionally.)
 
 ### Tests
 
@@ -65,7 +65,7 @@ The suite under `tests/` is **offline and deterministic** — no real network, n
 - **What's covered.** Pure helpers (cache, serialization, web extraction, fetch-page helpers, geocoding/stock/web-search math and clamping, YouTube URL parsing), the SSRF guard, page quality/Tika detection, the config loader (file discovery, env precedence, unknown keys, malformed YAML, fail-fast ranges, named auth tokens), the bearer-auth middleware (including multiple named tokens), each tool's validation and happy path against mocked providers, and server wiring (tool registration, dynamic cap interpolation in descriptions, and object-shaped output schemas).
 - **Output-schema check.** `conftest.assert_result_matches_schema` validates every tool result the suite produces against the tool's advertised `outputSchema` (JSON Schema 2020-12, as the MCP client does) and asserts the text block parses to the same object. MCP clients fail the call on a mismatch, so this is a client-facing contract. The check is **stricter than production**: it rejects undeclared top-level fields (`additionalProperties: false` on a test-only copy), because a field missing from the schema is invisible to clients that type `structuredContent` from it, such as Pi codemode. So a new payload field, a changed type, or a new nullable value needs a matching edit to `tools/output_schemas.py` in the same change. The production schemas stay permissive so older clients tolerate newer servers. The check only sees shapes the tests produce, so add a tool-level test when a new payload branch adds fields.
 
-CI (`.github/workflows/`) runs the test suite on Python 3.13 and 3.14 before building/publishing the Docker image. A separate security workflow runs CodeQL and scans the published image with Trivy. There is no linter or formatter configured.
+CI (`.github/workflows/`) runs the test suite on Python 3.13, 3.14, and 3.15 before building/publishing the Docker image. A separate security workflow runs CodeQL and scans the published image with Trivy. There is no linter or formatter configured.
 
 ## Architecture
 
