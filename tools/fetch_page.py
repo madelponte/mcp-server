@@ -7,8 +7,9 @@ stand-ins, or, when handed a YouTube video URL, returns that video's transcript.
 Direct image URLs return metadata/embedded descriptions rather than raw bytes.
 PDF/Office/OpenDocument/RTF/EPUB documents are normally routed to
 Apache Tika (with Firecrawl text recovery for HTML-blocked document URLs); Reddit
-uses authenticated OAuth JSON when configured, then RSS (until Reddit retires it),
-then — for individual posts — Brave search-index excerpts and oEmbed metadata.
+uses authenticated OAuth JSON when configured, then the Arctic Shift archive, then
+RSS (while Reddit still serves it), then — for individual posts — Brave
+search-index excerpts and oEmbed metadata.
 An optional
 `query` does server-side extractive filtering (only the passages matching a
 keyword/regex), `section` extracts a single heading, and `offset` pages through
@@ -22,7 +23,7 @@ extraction in `tools/web_extract.py`; the YouTube transcript logic in
 
 import asyncio
 from bisect import bisect_right
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 import json
 import logging
 import re
@@ -41,6 +42,7 @@ from fastmcp.tools import ToolResult
 from pydantic import Field
 
 from config import web_search_settings as cfg, server_settings
+from .cache import TTLCache
 from .output_schemas import FETCH_PAGE_OUTPUT_SCHEMA
 from .serialize import to_json, log_call, debug_enabled, redact_secrets, structured_result
 from .tool_annotations import READ_ONLY_EXTERNAL_TOOL
@@ -53,7 +55,7 @@ from .web_fetch import (
     _sniff_document_bytes,
     _tika_extract,
 )
-from .page_acquire import acquire_page as _acquire_page
+from .page_acquire import UnexpectedResourceHTMLError, acquire_page as _acquire_page
 from .web_search import (
     _BRAVE_SAFESEARCH,
     _brave_query,
@@ -583,9 +585,12 @@ async def _query_payload(
 # new Data API access on 2026-10-31 and closes the public API in March 2027.
 # Anonymous access is shrinking: `.json` returns 403, old.reddit redirects
 # logged-out visitors to a login page, www.reddit.com HTML sits behind a
-# "prove your humanity" challenge even for a headless browser, and RSS is
-# retired on 2026-11-13. What remains is best-effort: RSS until its retirement,
-# then (for posts) Brave's search-index excerpts plus official oEmbed metadata.
+# "prove your humanity" challenge even for a headless browser. RSS was announced
+# to end on 2026-11-13 but still answered on 2026-11-16, throttled to about one
+# request per minute per IP. The anonymous chain is therefore: the Arctic Shift
+# archive (third-party, near-real-time, posts and listings), then RSS until it
+# actually fails, then (for posts) Brave's search-index excerpts plus official
+# oEmbed metadata.
 # ---------------------------------------------------------------------------
 
 # Hosts that serve Reddit posts and listings. Other *.reddit.com hosts
@@ -603,12 +608,47 @@ _REDDIT_CONTENT_HOSTS = frozenset({
     "amp.reddit.com",
 })
 
-# Reddit announced RSS support ends on this date (r/modnews, 2026-09-30).
-# After it, the RSS step is skipped instead of spending a request (and the
-# anti-burst queue's quiet period) on a guaranteed failure.
-_REDDIT_RSS_RETIRED_ON = date(2026, 11, 13)
+# Reddit announced RSS would end on 2026-11-13 but kept serving it past that
+# date, so RSS is gated on observed failures rather than the calendar: a
+# response that is no longer a feed at all (HTML, an empty 403, HTTP 410) marks
+# RSS as retired for this long, so later fetches stop spending a request on it.
+# A 429 is only the per-minute budget, and an Atom-bodied error (a missing
+# subreddit/post, Reddit's search-feed refusal) is a per-URL failure.
+_REDDIT_RSS_RETIRED_TTL_SECONDS = 6 * 3600.0
+_reddit_rss_retired_until = 0.0
 
-_REDDIT_POST_ID_RE = re.compile(r"/comments/(?P<id>[a-z0-9]+)(?:/(?P<slug>[^/]+))?", re.I)
+# Body/title placeholders Reddit leaves when a post or its text is gone.
+_REDDIT_DELETED_MARKERS = frozenset({"[deleted]", "[removed]"})
+
+# Listing sort suffixes the archive cannot reproduce (it returns newest first).
+_REDDIT_LISTING_SORTS = frozenset({
+    "hot", "new", "top", "rising", "controversial", "best",
+})
+# Archive `fields=` is a strict whitelist: one unsupported name rejects the
+# whole request. These were verified against the live API on 2026-11-16
+# (`permalink`, `_meta`, `removed_by_category`, `is_self`, and `parent_id` are
+# not accepted). Single-post lookups omit `fields=` to get the full record.
+_ARCHIVE_POST_LISTING_FIELDS = (
+    "id,title,author,subreddit,score,num_comments,created_utc,url,selftext,"
+    "over_18,link_flair_text"
+)
+_ARCHIVE_COMMENT_LISTING_FIELDS = "id,author,body,created_utc,link_id,subreddit,score"
+# Per-item text excerpt in archived listings; the full thread is one fetch away.
+_ARCHIVE_LISTING_EXCERPT_CHARS = 300
+
+# Compacted archive results, keyed by archive request URL, so paging through a
+# long thread with `offset` (or a re-fetch) does not re-download it.
+_reddit_archive_cache = TTLCache(cfg.cache_ttl_seconds, cfg.cache_max_entries)
+
+
+class RedditPostDeletedError(RuntimeError):
+    """The post was deleted/removed and no copy of its content survives."""
+
+_REDDIT_POST_ID_RE = re.compile(
+    r"^/(?:(?:r|user|u)/[^/]+/)?comments/(?P<id>[a-z0-9]+)(?=/|$)"
+    r"(?:/(?P<slug>[^/]+))?",
+    re.I,
+)
 _REDDIT_SUBREDDIT_RE = re.compile(r"^/r/(?P<sub>[^/]+)", re.I)
 # Brave allows 75 words; leave room for the site:/subreddit prefix.
 _REDDIT_SEARCH_MAX_TITLE_WORDS = 60
@@ -662,10 +702,33 @@ def _is_reddit_url(url: str) -> bool:
     return (p.hostname or "").lower() in _REDDIT_CONTENT_HOSTS
 
 
-def _reddit_rss_available(today: date | None = None) -> bool:
-    """Whether Reddit still serves RSS (before its announced retirement date)."""
-    today = today or datetime.now(timezone.utc).date()
-    return today < _REDDIT_RSS_RETIRED_ON
+def _reddit_rss_available() -> bool:
+    """Whether RSS has not been observed retired within the latch window."""
+    return time.monotonic() >= _reddit_rss_retired_until
+
+
+def _mark_reddit_rss_retired() -> None:
+    global _reddit_rss_retired_until
+    _reddit_rss_retired_until = time.monotonic() + _REDDIT_RSS_RETIRED_TTL_SECONDS
+
+
+def _rss_response_means_retired(fetched: dict) -> bool:
+    """Whether an RSS response shows Reddit no longer serves feeds at all."""
+    status = fetched.get("status") or 0
+    if status == 429 or status >= 500:
+        # Per-minute budget, or a transient server/CDN failure.
+        return False
+    if status == 410:
+        return True
+    text = (fetched.get("text") or "")[:4096].lower()
+    # Reddit returns Atom even for per-URL errors (404 for an unknown
+    # subreddit/post, 403 for search feeds); anything else is not a feed.
+    return "<feed" not in text and "<rss" not in text
+
+
+def _is_reddit_search_url(url: str) -> bool:
+    segments = [s for s in _reddit_clean_path(url).split("/") if s]
+    return bool(segments) and segments[-1].lower() == "search"
 
 
 def _normalize_reddit_url(url: str) -> str:
@@ -692,7 +755,7 @@ def _reddit_clean_path(url: str) -> str:
 
 
 def _is_reddit_post_url(url: str) -> bool:
-    return "/comments/" in _reddit_clean_path(url).lower()
+    return _reddit_post_id(url) is not None
 
 
 def _reddit_post_id(url: str) -> str | None:
@@ -736,7 +799,7 @@ def _reddit_oauth_url(url: str) -> str:
     path = _reddit_clean_path(url).rstrip("/") or "/"
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
     params["raw_json"] = "1"
-    if "/comments/" in path.lower():
+    if _is_reddit_post_url(url):
         params.setdefault("limit", "500")
     return urlunparse(("https", "oauth.reddit.com", path, "", urlencode(params), ""))
 
@@ -810,7 +873,9 @@ def _compact_reddit_rss(xml: str, url: str) -> dict | None:
             )
 
         # A post feed begins with the submission (t3), followed by comments (t1).
-        if (parsed_entries[0].get("id") or "").startswith("t3_"):
+        # Subreddit feeds are all t3 entries, so decide from the URL, not the
+        # first entry's kind.
+        if _is_reddit_post_url(url) and (parsed_entries[0].get("id") or "").startswith("t3_"):
             first = parsed_entries[0]
             post = {
                 "title": first["title"],
@@ -1047,12 +1112,456 @@ def _brave_configured() -> bool:
 async def _fetch_reddit_oembed(url: str) -> tuple[dict, dict]:
     """Fetch Reddit's official oEmbed record (title/author, no body) for a post."""
     fetched = await _acquire_page(_reddit_oembed_url(url))
+    if fetched.get("status") == 404:
+        raise RedditPostDeletedError(
+            "Reddit reports that this post does not exist: it was deleted, or the "
+            "URL is wrong. No archived copy is available."
+        )
     if fetched.get("status", 0) >= 400:
         raise RuntimeError(f"HTTP {fetched['status']}")
     data = json.loads(fetched.get("text") or "")
     if not isinstance(data, dict):
         raise RuntimeError("oEmbed response was not a JSON object")
+    if _reddit_text_gone(data.get("title")):
+        raise RedditPostDeletedError(_REDDIT_DELETED_MESSAGE)
     return fetched, data
+
+
+# ---------------------------------------------------------------------------
+# Arctic Shift archive
+# ---------------------------------------------------------------------------
+
+_ARCHIVE_USER_AGENT = "mcp-server-fetch_page/1.0 (Reddit archive client)"
+_REDDIT_DELETED_MESSAGE = (
+    "This Reddit post was deleted or removed, and no archived copy of its "
+    "content is available."
+)
+
+
+def _reddit_text_gone(value: Any) -> bool:
+    """Whether a Reddit text field is empty or a deletion placeholder."""
+    if not isinstance(value, str):
+        return value is None
+    text = value.strip()
+    return not text or text in _REDDIT_DELETED_MARKERS
+
+
+def _iso_utc(timestamp: Any) -> str | None:
+    try:
+        return (
+            datetime.fromtimestamp(float(timestamp), timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+class _ArchiveTimeoutError(RuntimeError):
+    """The archive's own query timed out; it usually succeeds on a retry."""
+
+
+# The archive's query engine reports an internal timeout ("Timeout. Maybe slow
+# down a bit") on cold queries, as HTTP 422 or as HTTP 200 with `data: null`.
+# Observed on 2026-11-16, an identical request usually succeeded moments later.
+_ARCHIVE_TIMEOUT_RETRY_SECONDS = 1.0
+
+
+def _archive_error_text(body: bytes) -> str | None:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict) and parsed.get("error"):
+        return " ".join(str(parsed["error"]).split())[:200]
+    return None
+
+
+def _raise_archive_error(error: str, prefix: str) -> None:
+    message = f"{prefix}archive error: {error}"
+    if "timeout" in error.lower():
+        raise _ArchiveTimeoutError(message)
+    raise RuntimeError(message)
+
+
+async def _reddit_archive_get(path: str, params: dict) -> tuple[str, Any]:
+    """GET one Arctic Shift endpoint; return (request URL, the `data` member).
+
+    The API reports some failures ("Timeout. Maybe slow down a bit", an invalid
+    `fields=` name) as a JSON `error` string, with HTTP 200 or 4xx, so that is
+    treated as a failure exactly like an HTTP error. An archive-side timeout is
+    retried once after a short pause.
+    """
+    try:
+        return await _reddit_archive_get_once(path, params)
+    except _ArchiveTimeoutError:
+        await anyio.sleep(_ARCHIVE_TIMEOUT_RETRY_SECONDS)
+        return await _reddit_archive_get_once(path, params)
+
+
+async def _reddit_archive_get_once(path: str, params: dict) -> tuple[str, Any]:
+    base = urlparse(cfg.reddit_archive_api_url.strip().rstrip("/"))
+    auth = (unquote(base.username), unquote(base.password or "")) if base.username else None
+    # Use Basic auth separately so neither provenance nor HTTP URLs include userinfo.
+    public_base = base._replace(netloc=base.netloc.rsplit("@", 1)[-1]).geturl()
+    request_url = f"{public_base}{path}?{urlencode(params)}"
+    headers = {"User-Agent": _ARCHIVE_USER_AGENT, "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(verify=cfg.verify_ssl, auth=auth) as client:
+            async with client.stream(
+                "GET", request_url, headers=headers, timeout=cfg.http_timeout_seconds
+            ) as response:
+                status = response.status_code
+                if status >= 400:
+                    detail = f"HTTP {status}"
+                    reset = response.headers.get("x-ratelimit-reset")
+                    if status == 429 and reset:
+                        detail += f", rate limit resets in {reset}s"
+                    body = b""
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > 4096:
+                            break
+                    error = _archive_error_text(body)
+                    if error:
+                        _raise_archive_error(error, f"{detail}, ")
+                    raise RuntimeError(detail)
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if cfg.max_download_bytes and total > cfg.max_download_bytes:
+                        raise DownloadTooLargeError(
+                            f"Archive response exceeds the {cfg.max_download_bytes}-byte "
+                            "WEB_SEARCH_MAX_DOWNLOAD_BYTES cap."
+                        )
+                    chunks.append(chunk)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            f"network error: {exc.__class__.__name__} - {str(exc)[:200]}"
+        ) from exc
+    try:
+        body = json.loads(b"".join(chunks))
+    except ValueError as exc:
+        raise RuntimeError("response was not valid JSON") from exc
+    if not isinstance(body, dict):
+        raise RuntimeError("response was not a JSON object")
+    if body.get("error"):
+        _raise_archive_error(" ".join(str(body["error"]).split())[:200], "")
+    return request_url, body.get("data")
+
+
+def _archive_fetched(request_url: str) -> dict:
+    return {
+        "url": request_url,
+        "status": 200,
+        "content_type": "application/json",
+        "text": None,
+        "bytes": None,
+        "via": "arctic_shift",
+        "blocked_detected": False,
+    }
+
+
+async def _archive_gather(requests: dict[str, tuple[str, dict]]) -> dict[str, Any]:
+    """Run independent archive requests together; failures become exceptions."""
+    results: dict[str, Any] = {}
+
+    async def run_one(key: str, path: str, params: dict) -> None:
+        try:
+            results[key] = await _reddit_archive_get(path, params)
+        except Exception as exc:  # collected per request, never cancels siblings
+            results[key] = exc
+
+    async with anyio.create_task_group() as tg:
+        for key, (path, params) in requests.items():
+            tg.start_soon(run_one, key, path, params)
+    return results
+
+
+async def _fetch_reddit_archive_post(url: str) -> tuple[dict, dict]:
+    """Return the archived post and comment tree in the compact Reddit shape.
+
+    Raises RuntimeError when the archive has no copy yet (so later fallbacks
+    run) and RedditPostDeletedError when its copy has no surviving content.
+    """
+    post_id = _reddit_post_id(url)
+    if not post_id:
+        raise RuntimeError("no submission id in the URL")
+    limit = cfg.reddit_archive_max_comments
+    cache_key = f"post:{post_id}:{limit}"
+    cached = _reddit_archive_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    results = await _archive_gather({
+        # No `fields=`: permalink, _meta, and removed_by_category are needed
+        # but are not accepted by the field whitelist.
+        "post": ("/posts/ids", {"ids": post_id}),
+        "tree": ("/comments/tree", {"link_id": f"t3_{post_id}", "limit": limit}),
+    })
+    post_result = results["post"]
+    if isinstance(post_result, Exception):
+        raise post_result
+    post_url, posts = post_result
+    if not isinstance(posts, list) or not posts or not isinstance(posts[0], dict):
+        raise RuntimeError(f"archive has no copy of post {post_id} yet")
+    post = posts[0]
+    if _reddit_text_gone(post.get("title")) and _reddit_text_gone(post.get("selftext")):
+        raise RedditPostDeletedError(_REDDIT_DELETED_MESSAGE)
+
+    tree_result = results["tree"]
+    tree_error: Exception | None = None
+    tree = []
+    if isinstance(tree_result, Exception):
+        tree_error = tree_result
+    elif not isinstance(tree_result[1], list):
+        tree_error = RuntimeError("expected an array in archive comment-tree data")
+    else:
+        tree = tree_result[1]
+    compact = _compact_reddit_json([
+        {"data": {"children": [{"kind": "t3", "data": post}]}},
+        {"data": {"children": tree}},
+    ])
+    if not isinstance(compact, dict) or not isinstance(compact.get("post"), dict):
+        raise RuntimeError("archive returned an unexpected post shape")
+
+    compact_post = compact["post"]
+    permalink = compact_post.get("permalink")
+    if isinstance(permalink, str) and permalink.startswith("/"):
+        compact_post["permalink"] = "https://www.reddit.com" + permalink
+    if post.get("removed_by_category"):
+        compact_post["removed_by_category"] = post["removed_by_category"]
+
+    meta = post.get("_meta") if isinstance(post.get("_meta"), dict) else {}
+    archived_at = _iso_utc(meta.get("retrieved_2nd_on") or post.get("retrieved_on"))
+
+    returned = compact.get("comments_returned", 0)
+    reported = post.get("num_comments")
+    if isinstance(reported, int) and reported < returned:
+        # A first-ingest snapshot often reports 0 comments for a thread whose
+        # tree the archive has since collected; the count is just stale.
+        compact.pop("comments_reported", None)
+    if tree_error is not None:
+        compact["comments_incomplete"] = True
+        compact["comments_unavailable"] = _redact_backend_secrets(
+            _reddit_failure_trace("Archive comment tree", tree_error)
+        )
+    elif compact.get("more_children"):
+        compact["comments_incomplete"] = True
+    elif isinstance(reported, int) and reported > returned:
+        compact["comments_incomplete"] = True
+    elif not meta:
+        # Only the first-ingest snapshot exists (no re-crawl yet), so whether
+        # comments are missing is unknown.
+        compact["comments_incomplete"] = None
+    else:
+        compact["comments_incomplete"] = False
+
+    ordered = {"post": compact.pop("post")}
+    if archived_at:
+        ordered["archived_at"] = archived_at
+    ordered.update(compact)
+    result = (_archive_fetched(post_url), ordered)
+    if tree_error is None:
+        _reddit_archive_cache.set(cache_key, result)
+    return result
+
+
+def _reddit_archive_listing_plan(url: str) -> tuple[dict, dict[str, tuple[str, dict]]]:
+    """Map a Reddit listing URL to archive requests.
+
+    Returns (listing metadata, {"posts"|"comments": (path, params)}) or raises
+    RuntimeError for pages the archive cannot list.
+    """
+    segments = [s for s in _reddit_clean_path(url).split("/") if s]
+    lowered = [s.lower() for s in segments]
+    limit = cfg.reddit_archive_max_listing
+    common = {"sort": "desc", "limit": limit}
+
+    if len(segments) >= 2 and lowered[0] == "r":
+        sub = segments[1]
+        if "+" in sub or sub.lower() in {"all", "popular", "friends", "mod"}:
+            raise RuntimeError(
+                "archive does not cover multi-subreddit, r/all, or r/popular listings"
+            )
+        rest = lowered[2:]
+        if not rest or (len(rest) == 1 and rest[0] in _REDDIT_LISTING_SORTS):
+            meta = {"listing": f"r/{sub}"}
+            params = {"subreddit": sub, **common}
+        elif rest[0] == "search":
+            q = dict(parse_qsl(urlparse(url).query)).get("q", "").strip()
+            if not q:
+                raise RuntimeError("subreddit search URL has no q= query")
+            meta = {"listing": f"r/{sub} search", "query": q, "match": "title"}
+            params = {"subreddit": sub, "title": q, **common}
+        else:
+            raise RuntimeError(f"archive does not cover this r/{sub} page")
+        params["fields"] = _ARCHIVE_POST_LISTING_FIELDS
+        return meta, {"posts": ("/posts/search", params)}
+
+    if len(segments) >= 2 and lowered[0] in {"user", "u"}:
+        name = segments[1]
+        view = lowered[2] if len(lowered) > 2 else "overview"
+        requests: dict[str, tuple[str, dict]] = {}
+        if view in {"overview", "submitted", "posts"}:
+            requests["posts"] = ("/posts/search", {
+                "author": name, **common, "fields": _ARCHIVE_POST_LISTING_FIELDS,
+            })
+        if view in {"overview", "comments"}:
+            requests["comments"] = ("/comments/search", {
+                "author": name, **common, "fields": _ARCHIVE_COMMENT_LISTING_FIELDS,
+            })
+        if not requests:
+            raise RuntimeError(f"archive does not cover this u/{name} page")
+        return {"listing": f"u/{name}"}, requests
+
+    raise RuntimeError(
+        "archive lists only subreddits, subreddit searches, and users "
+        "(not the front page or site-wide search)"
+    )
+
+
+def _archive_excerpt(text: Any) -> str | None:
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = " ".join(text.split())
+    if len(text) > _ARCHIVE_LISTING_EXCERPT_CHARS:
+        text = text[: _ARCHIVE_LISTING_EXCERPT_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _archive_post_item(item: dict) -> dict:
+    sub = item.get("subreddit") or ""
+    post_id = item.get("id") or ""
+    permalink = f"https://www.reddit.com/r/{sub}/comments/{post_id}/"
+    out = {
+        "type": "post",
+        "title": item.get("title"),
+        "author": item.get("author"),
+        "subreddit": sub or None,
+        "score": item.get("score"),
+        "num_comments": item.get("num_comments"),
+        "created": _iso_utc(item.get("created_utc")),
+        "permalink": permalink,
+    }
+    link = item.get("url")
+    if isinstance(link, str) and link and _reddit_post_id(link) != post_id.lower():
+        out["url"] = link
+    if item.get("link_flair_text"):
+        out["flair"] = item["link_flair_text"]
+    if item.get("over_18"):
+        out["nsfw"] = True
+    excerpt = _archive_excerpt(item.get("selftext"))
+    if excerpt:
+        out["text"] = excerpt
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _archive_comment_item(item: dict) -> dict:
+    sub = item.get("subreddit") or ""
+    link_id = str(item.get("link_id") or "")
+    if link_id.startswith("t3_"):
+        link_id = link_id[3:]
+    out = {
+        "type": "comment",
+        "author": item.get("author"),
+        "subreddit": sub or None,
+        "score": item.get("score"),
+        "created": _iso_utc(item.get("created_utc")),
+        "text": _archive_excerpt(item.get("body")),
+        "permalink": (
+            f"https://www.reddit.com/r/{sub}/comments/{link_id}/_/{item.get('id')}/"
+            if sub and link_id else None
+        ),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+async def _fetch_reddit_archive_listing(url: str) -> tuple[dict, dict]:
+    """Return a newest-first archive listing for a subreddit, search, or user."""
+    meta, requests = _reddit_archive_listing_plan(url)
+    cache_key = "listing:" + to_json(sorted(
+        (key, path, sorted(params.items())) for key, (path, params) in requests.items()
+    ))
+    cached = _reddit_archive_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    results = await _archive_gather(requests)
+    items: list[tuple[float, dict]] = []
+    failures: dict[str, str] = {}
+    request_url = None
+    for key, result in results.items():
+        if isinstance(result, Exception) or not isinstance(result[1], list):
+            if isinstance(result, Exception):
+                detail = " ".join((str(result).strip() or type(result).__name__).split())
+                detail = _redact_backend_secrets(detail)
+            else:
+                detail = "expected an array in archive listing data"
+            failures[key] = detail if len(requests) == 1 else f"{key}: {detail}"
+            continue
+        request_url = request_url or result[0]
+        render = _archive_post_item if key == "posts" else _archive_comment_item
+        for raw in result[1]:
+            if isinstance(raw, dict):
+                items.append((float(raw.get("created_utc") or 0), render(raw)))
+    if request_url is None:
+        raise RuntimeError("; ".join(failures.values()))
+
+    items.sort(key=lambda pair: pair[0], reverse=True)
+    rendered = [item for _, item in items[: cfg.reddit_archive_max_listing]]
+    if len(requests) == 1:
+        for item in rendered:
+            item.pop("type", None)
+    compact: dict = {
+        **meta,
+        "sort": "newest_first",
+        "items": rendered,
+        "items_returned": len(rendered),
+    }
+    if failures:
+        compact["unavailable"] = failures
+    result = (_archive_fetched(request_url), compact)
+    if not failures:
+        _reddit_archive_cache.set(cache_key, result)
+    return result
+
+
+def _archive_note(compact: Any) -> str:
+    """Model-facing caveats for an Arctic Shift result."""
+    if isinstance(compact, dict) and "items" in compact:
+        note = (
+            "This listing comes from Arctic Shift, a third-party Reddit archive, "
+            "because Reddit's API is unavailable. It is ordered newest first "
+            "(Reddit's hot/top ranking is not available), and scores and comment "
+            "counts are snapshots that may be out of date. Fetch an item's "
+            "permalink to read the full thread."
+        )
+        if compact.get("match") == "title":
+            note += " Search results match post titles only."
+        return note
+    note = (
+        "This thread comes from Arctic Shift, a third-party Reddit archive, "
+        "because Reddit's API is unavailable. Scores and comment counts are as "
+        "of archived_at, and very recent comments may be missing."
+    )
+    post = compact.get("post") if isinstance(compact, dict) else None
+    if isinstance(post, dict) and post.get("removed_by_category"):
+        note += (
+            " Reddit has since removed or deleted this post "
+            f"(removed_by_category: {post['removed_by_category']}); the content "
+            "shown is the archived copy."
+        )
+    return note
+
+
+def _reddit_rss_post_deleted(compact: dict) -> bool:
+    post = compact.get("post") if isinstance(compact, dict) else None
+    if not isinstance(post, dict) or not _reddit_text_gone(post.get("title")):
+        return False
+    body = (post.get("selftext") or "").strip()
+    return not body or any(body.startswith(marker) for marker in _REDDIT_DELETED_MARKERS)
 
 
 async def _fetch_reddit_brave(url: str, oembed: dict | None) -> tuple[dict, dict]:
@@ -1132,10 +1641,24 @@ async def _fetch_reddit_brave(url: str, oembed: dict | None) -> tuple[dict, dict
     return fetched, compact
 
 
+async def _fetch_reddit_rss(rss_url: str) -> dict:
+    try:
+        return await _acquire_page(rss_url)
+    except UnexpectedResourceHTMLError as exc:
+        # Known feed URLs don't download HTML bodies, but their status still
+        # distinguishes throttling/server errors from definitive non-feeds.
+        return {"status": exc.status, "text": ""}
+
+
 async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]:
-    """Try OAuth JSON -> RSS (until retired) -> Brave excerpts -> oEmbed."""
+    """Try OAuth JSON -> archive -> RSS -> Brave excerpts -> oEmbed.
+
+    RedditPostDeletedError ends the chain: once a source shows the post's
+    content is gone, later sources cannot recover it.
+    """
     errors: list[str] = []
     trace: list[str] = []
+    is_post = _is_reddit_post_url(url)
 
     if _reddit_oauth_requested():
         try:
@@ -1150,10 +1673,35 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
     else:
         trace.append("OAuth JSON skipped (not configured)")
 
-    if _reddit_rss_available():
+    if cfg.reddit_archive_api_url.strip():
+        try:
+            if is_post:
+                fetched, compact = await _fetch_reddit_archive_post(url)
+            else:
+                fetched, compact = await _fetch_reddit_archive_listing(url)
+            trace.append("Archive succeeded")
+            return fetched, compact, "archive", trace
+        except RedditPostDeletedError:
+            raise
+        except Exception as exc:
+            failure = _reddit_failure_trace("Archive", exc)
+            errors.append(failure)
+            trace.append(failure)
+    else:
+        trace.append("Archive skipped (not configured)")
+
+    if _is_reddit_search_url(url):
+        skipped = "RSS skipped (Reddit refuses anonymous search feeds)"
+        errors.append(skipped)
+        trace.append(skipped)
+    elif not _reddit_rss_available():
+        skipped = "RSS skipped (Reddit recently stopped serving feeds)"
+        errors.append(skipped)
+        trace.append(skipped)
+    else:
         rss_url = _reddit_rss_url(url)
         try:
-            fetched = await _acquire_page(rss_url)
+            fetched = await _fetch_reddit_rss(rss_url)
             if (
                 fetched.get("status") == 429
                 and cfg.reddit_rate_limit_retry_seconds > 0
@@ -1163,7 +1711,11 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
                     f"{cfg.reddit_rate_limit_retry_seconds:g}s"
                 )
                 await anyio.sleep(cfg.reddit_rate_limit_retry_seconds)
-                fetched = await _acquire_page(rss_url)
+                fetched = await _fetch_reddit_rss(rss_url)
+            if _rss_response_means_retired(fetched):
+                _mark_reddit_rss_retired()
+                if fetched.get("status", 0) < 400:
+                    raise RuntimeError("response was not a feed")
             if fetched.get("status", 0) >= 400:
                 raise RuntimeError(f"HTTP {fetched['status']}")
             compact = await anyio.to_thread.run_sync(
@@ -1171,22 +1723,22 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
             )
             if compact is None:
                 raise RuntimeError("feed contained no Reddit entries")
+            if is_post and _reddit_rss_post_deleted(compact):
+                raise RedditPostDeletedError(_REDDIT_DELETED_MESSAGE)
             trace.append("RSS succeeded")
             return fetched, compact, "rss", trace
+        except RedditPostDeletedError:
+            raise
         except Exception as exc:
             failure = _reddit_failure_trace("RSS", exc)
             errors.append(failure)
             trace.append(failure)
-    else:
-        trace.append(
-            f"RSS skipped (Reddit retired it on {_REDDIT_RSS_RETIRED_ON.isoformat()})"
-        )
 
-    if not _is_reddit_post_url(url):
+    if not is_post:
         errors.append(
-            "Reddit no longer serves subreddit, user, or search listings to "
-            "anonymous clients; use search_web with a site:reddit.com/r/<subreddit> "
-            "query to find posts, then fetch an individual post URL"
+            "no source could list this Reddit page; use search_web with a "
+            "site:reddit.com/r/<subreddit> query to find posts, then fetch an "
+            "individual post URL"
         )
         raise RuntimeError("; ".join(errors))
 
@@ -1195,6 +1747,8 @@ async def _acquire_reddit_unqueued(url: str) -> tuple[dict, Any, str, list[str]]
     try:
         oembed_fetched, oembed = await _fetch_reddit_oembed(url)
         trace.append("oEmbed metadata succeeded")
+    except RedditPostDeletedError:
+        raise
     except Exception as exc:
         failure = _reddit_failure_trace("oEmbed", exc)
         errors.append(failure)
@@ -1398,9 +1952,20 @@ def _redact_backend_secrets(text: Any, *extra_secrets: str) -> str:
         )
         if endpoint
     )
+    try:
+        archive_netloc = urlparse(cfg.reddit_archive_api_url).netloc
+    except ValueError:
+        # An invalid archive URL must not break error reporting for other providers.
+        archive_netloc = ""
+    archive_userinfo = archive_netloc.rpartition("@")[0]
+    archive_password = archive_userinfo.partition(":")[2]
     return redact_secrets(
         text,
         *extra_secrets,
+        archive_userinfo,
+        unquote(archive_userinfo),
+        archive_password,
+        unquote(archive_password),
         cfg.firecrawl_api_key,
         cfg.classifier_api_key,
         cfg.brave_api_key,
@@ -1492,6 +2057,8 @@ async def _fetch_one(
     if reddit_request:
         try:
             fetched, compact, reddit_source, reddit_trace = await _acquire_reddit(url)
+        except RedditPostDeletedError as exc:
+            raise ToolError(f"{url}: {exc}")
         except Exception as exc:
             detail = _redact_backend_secrets(
                 exc, cfg.reddit_client_secret
@@ -1511,7 +2078,9 @@ async def _fetch_one(
             "format": "json",
         }
         _set_content(payload, to_json(compact), hint=False, offset=offset)
-        if reddit_source == "rss":
+        if reddit_source == "archive":
+            payload["note"] = _join_note(payload.get("note"), _archive_note(compact))
+        elif reddit_source == "rss":
             payload["note"] = _join_note(
                 payload.get("note"),
                 "Returned Reddit's RSS feed; it may contain only an initial "
@@ -1520,7 +2089,8 @@ async def _fetch_one(
         elif reddit_source == "brave":
             payload["note"] = _join_note(
                 payload.get("note"),
-                "Reddit's API and RSS are unavailable, so this is search-index "
+                "No full-thread Reddit source (API, archive, or RSS) returned this "
+                "post, so this is search-index "
                 "excerpts of the post from Brave, not the full thread: excerpts "
                 "may omit parts of the post and most comments, and may lag "
                 "recent edits.",
@@ -1528,7 +2098,8 @@ async def _fetch_one(
         elif reddit_source == "oembed":
             payload["note"] = _join_note(
                 payload.get("note"),
-                "Reddit's API, RSS, and search-index excerpts were unavailable; "
+                "No full-thread Reddit source (API, archive, or RSS) or "
+                "search-index excerpts were available; "
                 "returning official oEmbed post metadata without the post body "
                 "or comments.",
             )
@@ -1542,7 +2113,7 @@ async def _fetch_one(
                 )
             else:
                 rate_limit_note = (
-                    "Reddit rate-limited at least one representation (HTTP 429). "
+                    "At least one Reddit source was rate-limited (HTTP 429). "
                     "Retry later for a fuller result."
                 )
             payload["note"] = _join_note(payload.get("note"), rate_limit_note)

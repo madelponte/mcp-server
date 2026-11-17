@@ -544,6 +544,39 @@ def test_reddit_rate_limit_retry_must_be_nonnegative():
     )
 
 
+def test_reddit_archive_settings_load_from_yaml_and_env(tmp_path):
+    path = write(tmp_path, (
+        "web_search:\n"
+        "  reddit_archive_api_url: ''\n"
+        "  reddit_archive_max_comments: 50\n"
+        "  reddit_archive_max_listing: 10\n"
+    ))
+    loaded = load_config(path, env=NO_ENV).web_search
+    assert loaded.reddit_archive_api_url == ""
+    assert loaded.reddit_archive_max_comments == 50
+    assert loaded.reddit_archive_max_listing == 10
+    env = {
+        "WEB_SEARCH_REDDIT_ARCHIVE_API_URL": "https://archive.example/api",
+        "WEB_SEARCH_REDDIT_ARCHIVE_MAX_LISTING": "100",
+    }
+    loaded = load_config(path, env=env).web_search
+    assert loaded.reddit_archive_api_url == "https://archive.example/api"
+    assert loaded.reddit_archive_max_listing == 100
+    defaults = WebSearchSettings()
+    assert defaults.reddit_archive_api_url == "https://arctic-shift.photon-reddit.com/api"
+    assert defaults.reddit_rate_limit_retry_seconds == 0
+
+
+@pytest.mark.parametrize("field, value", [
+    ("reddit_archive_max_comments", 0),
+    ("reddit_archive_max_listing", 0),
+    ("reddit_archive_max_listing", 101),
+])
+def test_reddit_archive_caps_fail_fast(field, value):
+    with pytest.raises(ValidationError):
+        WebSearchSettings(**{field: value})
+
+
 def test_image_description_cap_must_be_nonnegative():
     with pytest.raises(ValidationError):
         WebSearchSettings(max_image_descriptions=-1)

@@ -19,7 +19,6 @@ from tools.fetch_page import (
     _reddit_oembed_url,
     _reddit_post_id,
     _reddit_search_query,
-    _reddit_rss_available,
     _is_reddit_url,
     _compact_reddit_json,
     _compact_reddit_rss,
@@ -370,6 +369,8 @@ def test_reddit_post_id():
     assert _reddit_post_id("https://www.reddit.com/comments/abc/") == "abc"
     assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t/def/") == "abc"
     assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t.json") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/user/alice/comments/abc/t/") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/user/alice/comments/") is None
     assert _reddit_post_id("https://www.reddit.com/r/x/") is None
     assert _reddit_post_id("https://example.com/r/x/comments/abc/t") is None
 
@@ -392,10 +393,129 @@ def test_reddit_search_query_stays_within_brave_limits():
     assert len(query) <= 600
 
 
-def test_reddit_rss_available_until_retirement():
-    from datetime import date
-    assert _reddit_rss_available(date(2026, 11, 12))
-    assert not _reddit_rss_available(date(2026, 11, 13))
+def test_reddit_rss_retired_latch_opens_and_expires(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(fp.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(fp, "_reddit_rss_retired_until", 0.0)
+    assert fp._reddit_rss_available()
+    fp._mark_reddit_rss_retired()
+    assert not fp._reddit_rss_available()
+    clock[0] += fp._REDDIT_RSS_RETIRED_TTL_SECONDS
+    assert fp._reddit_rss_available()
+
+
+@pytest.mark.parametrize("fetched, retired", [
+    ({"status": 429, "text": ""}, False),
+    ({"status": 503, "text": "<html>down</html>"}, False),
+    # Reddit answers unknown subreddits/posts and search feeds with Atom errors.
+    ({"status": 404, "text": "<?xml version='1.0'?><feed xmlns='x'></feed>"}, False),
+    ({"status": 403, "text": "<?xml version='1.0'?><feed xmlns='x'></feed>"}, False),
+    ({"status": 200, "text": "<feed><entry/></feed>"}, False),
+    ({"status": 410, "text": "<feed></feed>"}, True),
+    ({"status": 403, "text": "<html>blocked</html>"}, True),
+    ({"status": 403, "text": ""}, True),
+    ({"status": 200, "text": "<!doctype html><html></html>"}, True),
+])
+def test_rss_response_means_retired(fetched, retired):
+    assert fp._rss_response_means_retired(fetched) is retired
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://www.reddit.com/r/python/search?q=x", True),
+    ("https://www.reddit.com/search/?q=x", True),
+    ("https://www.reddit.com/r/python/", False),
+    ("https://www.reddit.com/r/python/comments/abc/search/", True),
+])
+def test_is_reddit_search_url(url, expected):
+    assert fp._is_reddit_search_url(url) is expected
+
+
+# --------------------------- archive listing plan ---------------------------
+
+@pytest.fixture
+def listing_cap(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "reddit_archive_max_listing", 7)
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.reddit.com/r/Python/",
+    "https://www.reddit.com/r/Python/top/?t=week",
+    "https://old.reddit.com/r/Python/new.rss",
+])
+def test_archive_plan_subreddit(listing_cap, url):
+    meta, requests = fp._reddit_archive_listing_plan(url)
+    assert meta == {"listing": "r/Python"}
+    path, params = requests["posts"]
+    assert path == "/posts/search"
+    assert params == {
+        "subreddit": "Python", "sort": "desc", "limit": 7,
+        "fields": fp._ARCHIVE_POST_LISTING_FIELDS,
+    }
+
+
+def test_archive_plan_subreddit_search_uses_title(listing_cap):
+    meta, requests = fp._reddit_archive_listing_plan(
+        "https://www.reddit.com/r/Python/search/?q=async+io&restrict_sr=1"
+    )
+    assert meta == {"listing": "r/Python search", "query": "async io", "match": "title"}
+    assert requests["posts"][1]["title"] == "async io"
+    assert "query" not in requests["posts"][1]
+
+
+@pytest.mark.parametrize("url, keys", [
+    ("https://www.reddit.com/user/spez/", {"posts", "comments"}),
+    ("https://www.reddit.com/u/spez", {"posts", "comments"}),
+    ("https://www.reddit.com/user/spez/submitted/", {"posts"}),
+    ("https://www.reddit.com/user/spez/comments/", {"comments"}),
+])
+def test_archive_plan_user(listing_cap, url, keys):
+    meta, requests = fp._reddit_archive_listing_plan(url)
+    assert meta == {"listing": "u/spez"}
+    assert set(requests) == keys
+    for path, params in requests.values():
+        assert params["author"] == "spez"
+        assert params["limit"] == 7
+    if "comments" in requests:
+        assert requests["comments"][1]["fields"] == fp._ARCHIVE_COMMENT_LISTING_FIELDS
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.reddit.com/",
+    "https://www.reddit.com/search/?q=x",
+    "https://www.reddit.com/r/all/",
+    "https://www.reddit.com/r/python+rust/",
+    "https://www.reddit.com/r/python/wiki/index",
+    "https://www.reddit.com/r/python/search/",
+    "https://www.reddit.com/user/spez/saved/",
+])
+def test_archive_plan_rejects_uncovered_pages(listing_cap, url):
+    with pytest.raises(RuntimeError):
+        fp._reddit_archive_listing_plan(url)
+
+
+def test_archive_post_item_builds_permalink_and_drops_self_url():
+    item = fp._archive_post_item({
+        "id": "abc", "subreddit": "Python", "title": "T", "author": "a",
+        "score": 3, "num_comments": 2, "created_utc": 0,
+        "url": "https://www.reddit.com/r/Python/comments/abc/t/",
+        "selftext": "x" * 1000, "link_flair_text": "Discussion", "over_18": False,
+    })
+    assert item["permalink"] == "https://www.reddit.com/r/Python/comments/abc/"
+    assert "url" not in item
+    assert item["created"] == "1970-01-01T00:00:00Z"
+    assert item["flair"] == "Discussion"
+    assert "nsfw" not in item
+    assert len(item["text"]) == fp._ARCHIVE_LISTING_EXCERPT_CHARS
+    link = fp._archive_post_item({"id": "abc", "subreddit": "s", "url": "https://example.com/x"})
+    assert link["url"] == "https://example.com/x"
+
+
+def test_archive_comment_item_permalink():
+    item = fp._archive_comment_item({
+        "id": "c1", "subreddit": "s", "link_id": "t3_abc", "body": "hi", "author": "a",
+    })
+    assert item["permalink"] == "https://www.reddit.com/r/s/comments/abc/_/c1/"
+    assert item["type"] == "comment"
 
 
 # --------------------------- _compact_reddit_json ---------------------------

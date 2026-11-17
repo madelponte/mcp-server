@@ -557,22 +557,49 @@ class WebSearchSettings(BaseSection):
         ge=0,
         description=(
             "Minimum quiet period between Reddit fetch_page acquisitions. "
-            "Requests are serialized to reduce anonymous RSS/oEmbed throttling; "
+            "Requests are serialized to reduce archive/RSS/oEmbed throttling; "
             "0 disables queueing."
         ),
     )
+    reddit_archive_api_url: str = Field(
+        "https://arctic-shift.photon-reddit.com/api",
+        description=(
+            "Base URL of the Arctic Shift Reddit archive API, used by fetch_page "
+            "for posts, comment trees, and subreddit/user listings when Reddit "
+            "OAuth is unavailable. Every fetched Reddit URL is sent to this third "
+            "party. Empty string disables the archive step."
+        ),
+    )
+    reddit_archive_max_comments: int = Field(
+        500,
+        gt=0,
+        description=(
+            "Maximum comments requested from the archive's comment tree for one "
+            "post; the remainder is reported as collapsed 'more' nodes."
+        ),
+    )
+    reddit_archive_max_listing: int = Field(
+        25,
+        gt=0,
+        le=100,
+        description=(
+            "Maximum items returned for an archived subreddit, user, or "
+            "subreddit-search listing (the archive API allows at most 100)."
+        ),
+    )
     reddit_rate_limit_retry_seconds: float = Field(
-        3.0,
+        0.0,
         ge=0,
         description=(
             "Wait this many seconds and retry Reddit RSS once after HTTP 429; "
-            "0 disables the retry."
+            "0 (the default) disables the retry. Anonymous RSS allows about one "
+            "request per minute, so a short wait rarely helps."
         ),
     )
     reddit_search_fallback: bool = Field(
         True,
         description=(
-            "When Reddit OAuth and RSS are unavailable, return Brave LLM Context "
+            "When Reddit OAuth, the archive, and RSS are unavailable, return Brave LLM Context "
             "search-index excerpts for a Reddit post (one Brave call per fetch; "
             "requires brave_api_key). False skips straight to oEmbed metadata."
         ),

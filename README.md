@@ -170,17 +170,31 @@ access (see [Reddit access after 2026](#reddit-access-after-2026)), so what
 
 1. **OAuth Data API** (only with already-approved credentials) — the full post
    and comment tree.
-2. **RSS** (until Reddit retires it on 2026-11-13; skipped automatically
-   afterwards) — the post plus an initial comment snapshot.
-3. **Brave search-index excerpts** (posts only; needs `web_search.brave_api_key`)
+2. **[Arctic Shift](https://github.com/ArthurHeitmann/arctic_shift/tree/master/api)
+   archive** (on by default; `web_search.reddit_archive_api_url`) — a free,
+   third-party Reddit archive that ingests within about a minute of posting.
+   Posts return the full body and up to `reddit_archive_max_comments` comments
+   with an `archived_at` snapshot time. Subreddit, user, and subreddit-search
+   URLs return a newest-first listing (Reddit's hot/top ranking is not
+   available; search matches titles only and is often slow). Posts that Reddit
+   has since removed are still served from the archive and flagged with
+   `removed_by_category`. Every fetched Reddit URL is sent to this third party;
+   set the URL to `""` to opt out.
+3. **RSS** (while Reddit still serves it) — the post plus an initial comment
+   snapshot, or a subreddit/user feed. Reddit announced RSS would end on
+   2026-11-13 but still served it afterwards, limited to about one request per
+   minute per IP. RSS is skipped for six hours after a response shows it is gone
+   (HTML or an empty error instead of a feed, or HTTP 410).
+4. **Brave search-index excerpts** (posts only; needs `web_search.brave_api_key`)
    — excerpts of the post and some comments from Brave's index, filtered to the
    exact submission id and marked `complete: false`. New posts may not be indexed
    yet.
-4. **oEmbed** (posts only) — official title/author metadata, no body or comments.
+5. **oEmbed** (posts only) — official title/author metadata, no body or comments.
 
-Subreddit, user, and search listings have no anonymous source once RSS is gone;
-the tool error points the model to `search_web` with a `site:reddit.com/r/<name>`
-query instead.
+When the archive has no copy of a post and Reddit reports it deleted or removed
+(through RSS or oEmbed), `fetch_page` returns a tool error saying so rather than
+an empty result. A listing no source can serve returns a tool error pointing the
+model to `search_web` with a `site:reddit.com/r/<name>` query.
 
 Fetching is resilient: a direct `httpx` request first, an automatic
 [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fallback for
@@ -408,9 +422,10 @@ Key things to set:
 - `web_search.classifier_api_url` / `classifier_model` — optional OpenAI-compatible small-model classifier for ambiguous rendered pages; both must be set to enable it. `classifier_api_key` supplies an optional bearer token.
 - `web_search.circuit_breaker_*` — configure the short-lived host circuit that skips FlareSolverr after repeated failures when Firecrawl is available.
 - `web_search.reddit_client_id` / `reddit_client_secret` / `reddit_user_agent` — optional Reddit OAuth credentials. Only useful if you already hold approved Data API credentials; Reddit no longer grants new ones. See [Reddit access after 2026](#reddit-access-after-2026).
-- `web_search.reddit_request_delay_seconds` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce anonymous RSS/oEmbed burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
-- `web_search.reddit_rate_limit_retry_seconds` — after an anonymous RSS `HTTP 429`, wait this long (default `3`) and retry once before degrading to the post fallbacks; `0` disables the retry.
-- `web_search.reddit_search_fallback` — when OAuth and RSS are unavailable, return Brave search-index excerpts for a Reddit post (default `true`; one Brave call per fetch, needs `brave_api_key`). `false` falls back straight to oEmbed metadata.
+- `web_search.reddit_request_delay_seconds` — serializes Reddit acquisitions and leaves a quiet period between calls (default `1`) to reduce archive/RSS/oEmbed burst throttling; `0` disables queueing. Post RSS/oEmbed URLs are also canonicalized so share/context parameters cannot bypass the raw-page cache.
+- `web_search.reddit_archive_api_url` — Arctic Shift archive base URL (default `https://arctic-shift.photon-reddit.com/api`); `""` disables the archive step. `reddit_archive_max_comments` (default `500`) bounds the comment tree per post and `reddit_archive_max_listing` (default `25`, max `100`) bounds listing items.
+- `web_search.reddit_rate_limit_retry_seconds` — after an anonymous RSS `HTTP 429`, wait this long and retry once before degrading to the post fallbacks; the default `0` disables the retry, because the anonymous RSS budget resets about once a minute.
+- `web_search.reddit_search_fallback` — when OAuth, the archive, and RSS are unavailable, return Brave search-index excerpts for a Reddit post (default `true`; one Brave call per fetch, needs `brave_api_key`). `false` falls back straight to oEmbed metadata.
 - `web_search.ssrf_allowlist` — optional; hosts/IPs/CIDRs that `fetch_page` may reach despite the SSRF guard's default block on non-public addresses (e.g. a local page you host). Empty by default (all private/loopback/link-local targets blocked).
 - `geocoding.user_agent` — set a descriptive User-Agent (ideally with contact info) as required by Nominatim's usage policy. Also set `nominatim_email` to a contact address (recommended by the policy so they can reach you before blocking on heavy use). Self-hosters should also set `nominatim_url` / `overpass_url`, clear `overpass_fallback_urls` when queries must stay private, and set `min_request_interval_seconds: 0`.
 - `email.username` / `email.password` — required for `send_email`. For Gmail,
@@ -432,7 +447,7 @@ Reddit announced on 2026-09-30 that it is closing its public data surfaces
 | --- | --- |
 | already in effect | `old.reddit.com` requires login; anonymous `.json` returns 403; `www.reddit.com` HTML shows a "prove your humanity" challenge, even to FlareSolverr. |
 | 2026-10-31 | New Data API access requests are no longer accepted. `reddit.com/prefs/apps` refuses to create an app without prior Responsible Builder Policy approval. |
-| 2026-11-13 | RSS feeds end. |
+| 2026-11-13 | RSS feeds were announced to end. They still answered on 2026-11-16, unsupported and limited to about one request per minute per IP. |
 | 2027-01-12 | API access starts closing for apps not registered at [developers.reddit.com/app-registration](https://developers.reddit.com/app-registration). |
 | March 2027 | Public Data API access ends for everyone. |
 
@@ -455,8 +470,8 @@ web_search:
 
 The server exchanges these for a short-lived application-only OAuth token and
 calls `oauth.reddit.com`; it never needs your Reddit password. Never commit
-`config.yaml`. Without credentials, `fetch_page` degrades to the RSS → Brave
-excerpts → oEmbed chain described under [Agentic Web Search](#agentic-web-search).
+`config.yaml`. Without credentials, `fetch_page` degrades to the archive → RSS →
+Brave excerpts → oEmbed chain described under [Agentic Web Search](#agentic-web-search).
 
 ### Email
 
@@ -483,7 +498,7 @@ raise tool errors instead of being returned as successful sends.
 Set `server.debug: true` to enable debug mode: tool responses are serialized as
 indented, human-readable JSON (instead of compact JSON) and each tool call emits
 verbose per-call logs to stdout. Reddit `fetch_page` results also append a
-redacted fallback trace to `note`, showing whether OAuth JSON, RSS, oEmbed,
+redacted fallback trace to `note`, showing whether OAuth JSON, the archive, RSS, oEmbed,
 and Brave excerpts were skipped, failed, or succeeded. Useful for troubleshooting; leave
 it off in normal operation so responses stay compact in the model's context
 window.

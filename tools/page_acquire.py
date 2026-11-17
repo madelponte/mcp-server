@@ -40,6 +40,14 @@ class PageAcquisitionError(RuntimeError):
     """No acquisition provider returned acceptable page content."""
 
 
+class UnexpectedResourceHTMLError(PageAcquisitionError):
+    """A known direct resource returned HTML; retain the probe's HTTP status."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__("Known direct-resource URL returned HTML instead of its expected format.")
+        self.status = status
+
+
 # A direct probe sees the origin/CDN status before any browser renderer can
 # replace it with a synthetic 200 for a branded error document. These statuses
 # definitively mean the requested resource is unavailable; rendering the same
@@ -445,9 +453,7 @@ async def _acquire_page(url: str) -> dict:
                 "Document URL returned HTML instead of a document; "
                 f"Firecrawl document recovery failed: {document_error}"
             )
-        raise PageAcquisitionError(
-            "Known direct-resource URL returned HTML instead of its expected format."
-        )
+        raise UnexpectedResourceHTMLError(status)
 
     if not is_html:
         fetched = _direct_result(url, status, body, ctype)
