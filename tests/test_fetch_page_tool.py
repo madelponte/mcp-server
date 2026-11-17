@@ -1038,6 +1038,21 @@ def test_reddit_archive_removed_post_is_served_and_flagged(monkeypatch, tool_fns
     assert "removed_by_category: moderator" in out["note"]
 
 
+def test_reddit_archive_removed_placeholder_note_says_only_title_survives(
+    monkeypatch, tool_fns, patch_httpx
+):
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/ids": {"data": [_archive_post(selftext="[removed]", removed_by_category="moderator")]},
+        "/comments/tree": {"data": _archive_tree(1)},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/title"
+    )))
+    assert json.loads(out["content"])["post"]["title"] == "Archived title"
+    assert "before the archive captured its text" in out["note"]
+    assert "the content shown is the archived copy" not in out["note"]
+
+
 def test_reddit_archive_copy_without_content_reports_deleted(monkeypatch, tool_fns, patch_httpx):
     _enable_archive(monkeypatch, patch_httpx, {
         "/posts/ids": {"data": [_archive_post(title="[deleted]", selftext="[removed]")]},
@@ -1242,6 +1257,134 @@ def test_reddit_archive_subreddit_listing(monkeypatch, tool_fns, patch_httpx):
     assert "type" not in content["items"][0]
     assert "newest first" in out["note"]
     assert "hot/top ranking is not available" in out["note"]
+
+
+def test_reddit_archive_listing_marks_removed_text(monkeypatch, tool_fns, patch_httpx):
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/search": {"data": [
+            {"id": "p1", "title": "Gone", "subreddit": "python", "selftext": "[removed]"},
+        ]},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/")))
+    item = json.loads(out["content"])["items"][0]
+    assert "text" not in item
+    assert item["text_removed"] is True
+    assert "text_removed marks items" in out["note"]
+
+
+def test_reddit_cached_archive_result_skips_quiet_period(monkeypatch, tool_fns, patch_httpx):
+    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(300, 8))
+    monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 5)
+    monkeypatch.setattr(fp, "_reddit_request_queue", fp._RedditRequestQueue())
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(fp.anyio, "sleep", sleep)
+    requests = _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/ids": {"data": [_archive_post()]},
+        "/comments/tree": {"data": _archive_tree(1)},
+    })
+    url = "https://www.reddit.com/r/python/comments/abc/title"
+    first = json.loads(run(tool_fns["fetch_page"](url=url)))["content"]
+    for variant in (url, url + "/?context=3", url + "?share_id=x"):
+        assert json.loads(run(tool_fns["fetch_page"](url=variant)))["content"] == first
+    assert len(requests) == 2  # post + tree, once
+    assert sleeps == []
+
+
+def test_reddit_archive_cache_does_not_preempt_oauth(monkeypatch):
+    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(300, 8))
+    monkeypatch.setattr(fp.cfg, "reddit_archive_api_url", _ARCHIVE)
+    fp._reddit_archive_cache.set(fp._archive_post_cache_key("abc"), ({}, {"post": {}}))
+    url = "https://www.reddit.com/r/python/comments/abc/title"
+    assert fp._reddit_archive_cached(url)[2] == "archive"
+    monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
+    assert fp._reddit_archive_cached(url) is None
+
+
+def test_reddit_query_returns_matching_comments(monkeypatch, tool_fns, patch_httpx):
+    tree = [
+        {"kind": "t1", "data": {"author": "alice", "score": 5, "body": "I would ride the horse.",
+                                 "permalink": "/r/python/comments/abc/_/c1/"}},
+        {"kind": "t1", "data": {"author": "bob", "score": 2, "body": "Call animal control."}},
+        {"kind": "t1", "data": {"author": "carol", "score": 1, "body": "Offer the horse a carrot."}},
+    ]
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/ids": {"data": [_archive_post(selftext="A horse walks in.")]},
+        "/comments/tree": {"data": tree},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/title", query="horse",
+        context_lines=0,
+    )))
+    assert out["format"] == "text"
+    assert out["match_count"] == 3
+    assert "Call animal control" not in out["content"]
+    assert "Comment 1: u/alice, score 5" in out["content"]
+    assert "Offer the horse a carrot." in out["content"]
+    headings = [m["heading"]["anchor"] for m in out["match_metadata"]]
+    assert headings == ["post", "comment-1", "comment-3"]
+    assert out["match_metadata"][0]["heading"]["citation_url"] == (
+        "https://www.reddit.com/r/python/comments/abc/title/"
+    )
+    assert "Arctic Shift" in out["note"]
+
+
+def test_reddit_query_without_matches_is_empty_result(monkeypatch, tool_fns, patch_httpx):
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/ids": {"data": [_archive_post()]},
+        "/comments/tree": {"data": _archive_tree(2)},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/title", query="zebra",
+    )))
+    assert out["match_count"] == 0
+    assert out["content"] == ""
+    assert "empty result" in out["note"]
+
+
+def test_reddit_query_on_listing_and_oembed(monkeypatch, tool_fns, patch_httpx):
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/search": {"data": [
+            {"id": "p1", "title": "asyncio tips", "subreddit": "python"},
+            {"id": "p2", "title": "packaging", "subreddit": "python"},
+        ]},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/", query="asyncio", include_match_toc=True,
+    )))
+    assert out["match_count"] == 1
+    assert "packaging" not in out["content"]
+    assert out["matching_toc"][0]["citation_url"] == "https://www.reddit.com/r/python/comments/p1/"
+
+    monkeypatch.setattr(fp.cfg, "reddit_archive_api_url", "")
+
+    async def acquire(url):
+        if "/oembed?" in url:
+            return _oembed_fetched(title="Oembed horse")
+        raise RuntimeError("blocked")
+
+    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/title", query="horse",
+    )))
+    assert out["match_count"] == 1
+    assert "Oembed horse" in out["content"]
+
+
+def test_reddit_truncated_json_suggests_query(monkeypatch, tool_fns, patch_httpx):
+    monkeypatch.setattr(fp.cfg, "max_page_chars", 200)
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/ids": {"data": [_archive_post()]},
+        "/comments/tree": {"data": _archive_tree(20)},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/python/comments/abc/title"
+    )))
+    assert out["truncated"] is True
+    assert "retry with `query=`" in out["note"]
 
 
 def test_reddit_archive_subreddit_search_listing(monkeypatch, tool_fns, patch_httpx):

@@ -510,6 +510,29 @@ def test_archive_post_item_builds_permalink_and_drops_self_url():
     assert link["url"] == "https://example.com/x"
 
 
+def test_archive_items_mark_placeholder_text():
+    post = fp._archive_post_item({"id": "a", "subreddit": "s", "selftext": " [removed] "})
+    assert "text" not in post and post["text_removed"] is True
+    empty = fp._archive_post_item({"id": "a", "subreddit": "s", "selftext": ""})
+    assert "text" not in empty and "text_removed" not in empty
+    comment = fp._archive_comment_item({"id": "c", "subreddit": "s", "body": "[deleted]"})
+    assert "text" not in comment and comment["text_removed"] is True
+
+
+def test_reddit_query_text_has_one_heading_per_item():
+    text, lookup = fp._reddit_query_text({
+        "post": {"title": "T {#x}", "author": "op", "selftext": "Body\nline 2",
+                 "permalink": "https://www.reddit.com/r/s/comments/a/"},
+        "comments": [{"author": "c", "score": 1, "depth": 1, "body": "Reply"}],
+    })
+    lines = text.split("\n")
+    assert lines[0] == "# T { #x} {#post}"
+    assert "## Comment 1: u/c, score 1, reply depth 1 {#comment-1}" in lines
+    assert lookup == {"post": {"citation_url": "https://www.reddit.com/r/s/comments/a/"}}
+    oembed_text, _ = fp._reddit_query_text({"title": "Oembed"})
+    assert "Oembed" in oembed_text
+
+
 def test_archive_comment_item_permalink():
     item = fp._archive_comment_item({
         "id": "c1", "subreddit": "s", "link_id": "t3_abc", "body": "hi", "author": "a",

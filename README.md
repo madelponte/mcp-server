@@ -164,7 +164,11 @@ returned `next_offset` to read the next chunk; this works for HTML, documents,
 JSON, Reddit, and transcripts. A YouTube video URL returns the video's transcript
 rather than the watch page (see [below](#youtube-transcripts-via-fetch_page)).
 
-Reddit URLs are returned as compacted JSON. Reddit has been closing anonymous
+Reddit URLs are returned as compacted JSON. With `query=`, the post, each
+comment, and each listing item become separately headed text, so matches come
+back as extractive windows naming the comment's author (format `text`, with
+permalinks as `citation_url` where available). Repeat fetches of a cached
+archive result skip the Reddit quiet period. Reddit has been closing anonymous
 access (see [Reddit access after 2026](#reddit-access-after-2026)), so what
 `fetch_page` can return depends on what is still open:
 

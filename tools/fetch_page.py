@@ -672,6 +672,11 @@ class _RedditRequestQueue:
         self._next_request_at = 0.0
 
     async def acquire(self, url: str) -> tuple[dict, Any, str, list[str]]:
+        # A cached archive result makes no upstream request, so it neither
+        # waits for nor consumes the quiet period.
+        cached = _reddit_archive_cached(url)
+        if cached is not None:
+            return cached
         delay = cfg.reddit_request_delay_seconds
         if delay <= 0:
             return await _acquire_reddit_unqueued(url)
@@ -1289,7 +1294,7 @@ async def _fetch_reddit_archive_post(url: str) -> tuple[dict, dict]:
     if not post_id:
         raise RuntimeError("no submission id in the URL")
     limit = cfg.reddit_archive_max_comments
-    cache_key = f"post:{post_id}:{limit}"
+    cache_key = _archive_post_cache_key(post_id)
     cached = _reddit_archive_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1422,8 +1427,49 @@ def _reddit_archive_listing_plan(url: str) -> tuple[dict, dict[str, tuple[str, d
     )
 
 
+def _archive_post_cache_key(post_id: str) -> str:
+    return f"post:{post_id}:{cfg.reddit_archive_max_comments}"
+
+
+def _archive_listing_cache_key(requests: dict[str, tuple[str, dict]]) -> str:
+    return "listing:" + to_json(sorted(
+        (key, path, sorted(params.items())) for key, (path, params) in requests.items()
+    ))
+
+
+def _reddit_archive_cached(url: str) -> tuple[dict, Any, str, list[str]] | None:
+    """Return a cached archive acquisition for `url` without any network I/O.
+
+    Only used when OAuth is not configured: with OAuth, the authenticated API
+    stays first in the chain and the archive cache must not pre-empt it.
+    """
+    if _reddit_oauth_requested() or not cfg.reddit_archive_api_url.strip():
+        return None
+    try:
+        if _is_reddit_post_url(url):
+            post_id = _reddit_post_id(url)
+            if not post_id:
+                return None
+            key = _archive_post_cache_key(post_id)
+        else:
+            key = _archive_listing_cache_key(_reddit_archive_listing_plan(url)[1])
+    except Exception:
+        return None
+    cached = _reddit_archive_cache.get(key)
+    if cached is None:
+        return None
+    fetched, compact = cached
+    trace = ["OAuth JSON skipped (not configured)", "Archive succeeded (cached)"]
+    return fetched, compact, "archive", trace
+
+
+def _is_placeholder_text(text: Any) -> bool:
+    """Whether a body is only Reddit's [deleted]/[removed] placeholder."""
+    return isinstance(text, str) and text.strip() in _REDDIT_DELETED_MARKERS
+
+
 def _archive_excerpt(text: Any) -> str | None:
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str) or not text.strip() or _is_placeholder_text(text):
         return None
     text = " ".join(text.split())
     if len(text) > _ARCHIVE_LISTING_EXCERPT_CHARS:
@@ -1455,6 +1501,8 @@ def _archive_post_item(item: dict) -> dict:
     excerpt = _archive_excerpt(item.get("selftext"))
     if excerpt:
         out["text"] = excerpt
+    elif _is_placeholder_text(item.get("selftext")):
+        out["text_removed"] = True
     return {k: v for k, v in out.items() if v is not None}
 
 
@@ -1470,6 +1518,7 @@ def _archive_comment_item(item: dict) -> dict:
         "score": item.get("score"),
         "created": _iso_utc(item.get("created_utc")),
         "text": _archive_excerpt(item.get("body")),
+        "text_removed": True if _is_placeholder_text(item.get("body")) else None,
         "permalink": (
             f"https://www.reddit.com/r/{sub}/comments/{link_id}/_/{item.get('id')}/"
             if sub and link_id else None
@@ -1481,9 +1530,7 @@ def _archive_comment_item(item: dict) -> dict:
 async def _fetch_reddit_archive_listing(url: str) -> tuple[dict, dict]:
     """Return a newest-first archive listing for a subreddit, search, or user."""
     meta, requests = _reddit_archive_listing_plan(url)
-    cache_key = "listing:" + to_json(sorted(
-        (key, path, sorted(params.items())) for key, (path, params) in requests.items()
-    ))
+    cache_key = _archive_listing_cache_key(requests)
     cached = _reddit_archive_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1540,6 +1587,11 @@ def _archive_note(compact: Any) -> str:
         )
         if compact.get("match") == "title":
             note += " Search results match post titles only."
+        if any(item.get("text_removed") for item in compact.get("items") or []):
+            note += (
+                " text_removed marks items whose text Reddit deleted or removed "
+                "before the archive captured it; only their metadata survives."
+            )
         return note
     note = (
         "This thread comes from Arctic Shift, a third-party Reddit archive, "
@@ -1548,12 +1600,106 @@ def _archive_note(compact: Any) -> str:
     )
     post = compact.get("post") if isinstance(compact, dict) else None
     if isinstance(post, dict) and post.get("removed_by_category"):
-        note += (
-            " Reddit has since removed or deleted this post "
-            f"(removed_by_category: {post['removed_by_category']}); the content "
-            "shown is the archived copy."
-        )
+        category = post["removed_by_category"]
+        if _is_placeholder_text(post.get("selftext")):
+            note += (
+                f" Reddit removed or deleted this post (removed_by_category: "
+                f"{category}) before the archive captured its text, so the body "
+                "is only a placeholder; the title, metadata, and any archived "
+                "comments are all that survive."
+            )
+        else:
+            note += (
+                " Reddit has since removed or deleted this post "
+                f"(removed_by_category: {category}); the content shown is the "
+                "archived copy."
+            )
     return note
+
+
+def _reddit_heading_text(text: Any) -> str:
+    """One-line heading text that cannot be mistaken for an anchor marker."""
+    return " ".join(str(text or "").replace("{#", "{ #").split())
+
+
+def _reddit_query_text(compact: Any) -> tuple[str, dict[str, dict]]:
+    """Render a compact Reddit result as headed text for `query=` matching.
+
+    Every post, comment, listing item, and excerpt gets its own `{#anchor}`
+    heading line, so match windows never run across two comments and each
+    window's heading names the author. Returns (text, heading lookup); the
+    lookup adds a `citation_url` for items that have a permalink.
+    """
+    lines: list[str] = []
+    lookup: dict[str, dict] = {}
+
+    def body(text: Any) -> None:
+        if isinstance(text, str) and text.strip():
+            lines.extend(text.strip().split("\n"))
+        lines.append("")
+
+    if not isinstance(compact, dict):
+        return to_json(compact), lookup
+
+    post = compact.get("post")
+    if isinstance(post, dict):
+        title = _reddit_heading_text(post.get("title")) or "Reddit post"
+        lines.append(f"# {title} {{#post}}")
+        byline = " ".join(
+            part for part in (
+                f"u/{post['author']}" if post.get("author") else "",
+                f"in r/{post['subreddit']}" if post.get("subreddit") else "",
+                f"(score {post['score']})" if post.get("score") is not None else "",
+            ) if part
+        )
+        if byline:
+            lines.append(byline)
+        if isinstance(post.get("permalink"), str):
+            lookup["post"] = {"citation_url": post["permalink"]}
+        body(post.get("selftext"))
+
+    for number, comment in enumerate(compact.get("comments") or [], 1):
+        if not isinstance(comment, dict):
+            continue
+        details = [f"u/{_reddit_heading_text(comment.get('author')) or '[unknown]'}"]
+        if comment.get("score") is not None:
+            details.append(f"score {comment['score']}")
+        if comment.get("depth"):
+            details.append(f"reply depth {comment['depth']}")
+        anchor = f"comment-{number}"
+        lines.append(f"## Comment {number}: {', '.join(details)} {{#{anchor}}}")
+        if isinstance(comment.get("permalink"), str):
+            lookup[anchor] = {"citation_url": comment["permalink"]}
+        body(comment.get("body"))
+
+    for number, item in enumerate(compact.get("items") or [], 1):
+        if not isinstance(item, dict):
+            continue
+        label = _reddit_heading_text(item.get("title")) or (
+            f"Comment by u/{_reddit_heading_text(item.get('author'))}"
+        )
+        anchor = f"item-{number}"
+        lines.append(f"## {label} {{#{anchor}}}")
+        meta = ", ".join(
+            f"{key} {item[key]}" for key in ("author", "subreddit", "created", "score")
+            if item.get(key) is not None
+        )
+        if meta:
+            lines.append(meta)
+        link = item.get("permalink") or item.get("url")
+        if isinstance(link, str):
+            lines.append(link)
+            lookup[anchor] = {"citation_url": link}
+        body(item.get("text") or item.get("body"))
+
+    for number, excerpt in enumerate(compact.get("excerpts") or [], 1):
+        lines.append(f"## Excerpt {number} {{#excerpt-{number}}}")
+        body(excerpt)
+
+    if not lines:
+        # oEmbed metadata and any unexpected shape: search the JSON itself.
+        return to_json(compact), lookup
+    return "\n".join(lines).strip(), lookup
 
 
 def _reddit_rss_post_deleted(compact: dict) -> bool:
@@ -2077,7 +2223,38 @@ async def _fetch_one(
             **_provenance(url, source_url, status, ctype, fetched.get("via")),
             "format": "json",
         }
-        _set_content(payload, to_json(compact), hint=False, offset=offset)
+        if query:
+            # Search a readable rendering (one heading per post/comment/item)
+            # rather than the single-line JSON, so matches are extractive
+            # windows that name the comment they came from.
+            searchable, heading_lookup = await anyio.to_thread.run_sync(
+                _reddit_query_text, compact
+            )
+            qres = await _query_payload(
+                searchable,
+                query,
+                url,
+                kind="Reddit content",
+                max_matches=resolved_max_matches,
+                context_lines=resolved_context_lines,
+                include_match_toc=include_match_toc,
+                heading_lookup=heading_lookup,
+            )
+            payload["format"] = "text"
+            matched = qres.pop("content")
+            query_note = qres.pop("note", None)
+            payload.update(qres)
+            if query_note:
+                payload["note"] = query_note
+            _set_content(payload, matched, hint=False, offset=offset)
+        else:
+            _set_content(payload, to_json(compact), hint=False, offset=offset)
+            if payload.get("truncated"):
+                payload["note"] = _join_note(
+                    payload.get("note"),
+                    "To find specific comments instead of paging, retry with "
+                    "`query=` (a keyword/phrase or regex).",
+                )
         if reddit_source == "archive":
             payload["note"] = _join_note(payload.get("note"), _archive_note(compact))
         elif reddit_source == "rss":
