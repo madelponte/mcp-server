@@ -1306,8 +1306,8 @@ def test_reddit_archive_cache_does_not_preempt_oauth(monkeypatch):
 
 def test_reddit_query_returns_matching_comments(monkeypatch, tool_fns, patch_httpx):
     tree = [
-        {"kind": "t1", "data": {"author": "alice", "score": 5, "body": "I would ride the horse.",
-                                 "permalink": "/r/python/comments/abc/_/c1/"}},
+        {"kind": "t1", "data": {"id": "c1", "author": "alice", "score": 5,
+                                 "body": "I would ride the horse."}},
         {"kind": "t1", "data": {"author": "bob", "score": 2, "body": "Call animal control."}},
         {"kind": "t1", "data": {"author": "carol", "score": 1, "body": "Offer the horse a carrot."}},
     ]
@@ -1322,13 +1322,39 @@ def test_reddit_query_returns_matching_comments(monkeypatch, tool_fns, patch_htt
     assert out["format"] == "text"
     assert out["match_count"] == 3
     assert "Call animal control" not in out["content"]
-    assert "Comment 1: u/alice, score 5" in out["content"]
+    assert "## Comment 1 (u/alice, score 5) {#comment-1}" in out["content"]
     assert "Offer the horse a carrot." in out["content"]
     headings = [m["heading"]["anchor"] for m in out["match_metadata"]]
     assert headings == ["post", "comment-1", "comment-3"]
     assert out["match_metadata"][0]["heading"]["citation_url"] == (
         "https://www.reddit.com/r/python/comments/abc/title/"
     )
+    assert out["match_metadata"][1]["heading"]["citation_url"] == (
+        "https://www.reddit.com/r/python/comments/abc/title/c1/"
+    )
+    assert "citation_url" not in out["match_metadata"][2]["heading"]  # no id
+
+
+def test_reddit_query_does_not_match_bylines_or_subreddit(monkeypatch, tool_fns, patch_httpx):
+    _enable_archive(monkeypatch, patch_httpx, {
+        "/posts/search": {"data": [
+            {"id": "p1", "title": "Packaging help", "author": "pythonfan",
+             "subreddit": "Python", "selftext": "setuptools question"},
+            {"id": "p2", "title": "Why Python 3.15?", "author": "other",
+             "subreddit": "Python"},
+        ]},
+    })
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/Python/", query="python",
+    )))
+    assert out["match_count"] == 1
+    assert [m["heading"]["anchor"] for m in out["match_metadata"]] == ["item-2"]
+    assert "Packaging help" not in out["content"]
+    # A comment-header-only query (author, score) finds nothing.
+    out = json.loads(run(tool_fns["fetch_page"](
+        url="https://www.reddit.com/r/Python/", query="pythonfan",
+    )))
+    assert out["match_count"] == 0
     assert "Arctic Shift" in out["note"]
 
 

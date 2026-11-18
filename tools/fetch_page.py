@@ -349,11 +349,20 @@ def _extract_matches(
     max_windows: int,
     default_heading: dict | None = None,
     heading_lookup: dict[str, dict] | None = None,
+    match_segments: list[str | None] | None = None,
 ) -> tuple[list[dict], int, int]:
-    """Find matching nonblank lines and return bounded, metadata-rich windows."""
+    """Find matching nonblank lines and return bounded, metadata-rich windows.
+
+    `match_segments`, when given, holds the text to match for each segment of
+    `text` (aligned with `_segment_text(text)`); None marks a context-only line
+    that is shown in windows but never matched, such as a byline. A length
+    mismatch is ignored and every segment is matched as displayed.
+    """
     segments = _segment_text(text)
     if not segments:
         return [], 0, 0
+    if match_segments is None or len(match_segments) != len(segments):
+        match_segments = list(segments)
 
     pattern = _compile_query(query)
     # Give every search only the time remaining in the shared budget. Unlike a
@@ -361,7 +370,9 @@ def _extract_matches(
     # backtracking within a single segment. Never return partial scan results.
     deadline = time.monotonic() + _QUERY_MATCH_BUDGET_SECONDS
     match_idxs = []
-    for i, seg in enumerate(segments):
+    for i, seg in enumerate(match_segments):
+        if seg is None:
+            continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise QueryMatchTimeoutError(
@@ -429,7 +440,10 @@ def _extract_matches(
         lines = segments[start : end + 1]
         if heading and heading.get("line") and heading["line"] - 1 < start:
             lines.insert(0, segments[heading["line"] - 1])
-        qualities = [_match_quality(segments[idx], query) for idx in window_match_idxs]
+        qualities = [
+            _match_quality(match_segments[idx] or segments[idx], query)
+            for idx in window_match_idxs
+        ]
         quality = max(qualities, key=_MATCH_QUALITY_RANK.__getitem__)
         windows.append(
             {
@@ -506,6 +520,7 @@ async def _query_payload(
     include_match_toc: bool,
     default_heading: dict | None = None,
     heading_lookup: dict[str, dict] | None = None,
+    match_segments: list[str | None] | None = None,
 ) -> dict:
     """Filter text into bounded match windows plus line/heading metadata."""
     try:
@@ -518,6 +533,7 @@ async def _query_payload(
                 max_windows=max_matches,
                 default_heading=default_heading,
                 heading_lookup=heading_lookup,
+                match_segments=match_segments,
             )
         )
     except QueryMatchTimeoutError:
@@ -950,14 +966,17 @@ def _compact_reddit_json(data: Any) -> Any:
                     more_children += len(d.get("children") or [])
                     return
                 if kind == "t1":
-                    comments.append(
-                        {
-                            "author": d.get("author"),
-                            "score": d.get("score"),
-                            "depth": depth,
-                            "body": d.get("body"),
-                        }
-                    )
+                    comment = {
+                        "author": d.get("author"),
+                        "score": d.get("score"),
+                        "depth": depth,
+                        "body": d.get("body"),
+                    }
+                    # The short base-36 id lets a comment be linked as
+                    # <post permalink><id>/ without a long per-comment URL.
+                    if isinstance(d.get("id"), str) and d["id"]:
+                        comment = {"id": d["id"], **comment}
+                    comments.append(comment)
                     replies = d.get("replies")
                     if isinstance(replies, dict):
                         for c in (replies.get("data") or {}).get("children", []) or []:
@@ -1622,84 +1641,121 @@ def _reddit_heading_text(text: Any) -> str:
     return " ".join(str(text or "").replace("{#", "{ #").split())
 
 
-def _reddit_query_text(compact: Any) -> tuple[str, dict[str, dict]]:
+def _reddit_absolute_url(link: Any) -> str | None:
+    if not isinstance(link, str) or not link.strip():
+        return None
+    link = link.strip()
+    return "https://www.reddit.com" + link if link.startswith("/") else link
+
+
+def _reddit_query_text(
+    compact: Any,
+) -> tuple[str, dict[str, dict], list[str | None] | None]:
     """Render a compact Reddit result as headed text for `query=` matching.
 
     Every post, comment, listing item, and excerpt gets its own `{#anchor}`
-    heading line, so match windows never run across two comments and each
-    window's heading names the author. Returns (text, heading lookup); the
-    lookup adds a `citation_url` for items that have a permalink.
+    heading line, so match windows never run across two items and each
+    window's heading names the author. Only titles and body text are matched:
+    bylines, scores, dates, comment headers, and link lines are context that
+    appears in a matching passage but never produces a match itself (so
+    `query="python"` on r/Python does not match every item's subreddit).
+
+    Returns (text, heading lookup, match_segments). The lookup adds a
+    `citation_url` for items with a link; match_segments is aligned with
+    `_segment_text(text)`, holding the text to match or None for context-only
+    lines, and is None when the whole text should be searched.
     """
+    if not isinstance(compact, dict):
+        return to_json(compact), {}, None
+
     lines: list[str] = []
+    searchable: list[str | None] = []
     lookup: dict[str, dict] = {}
 
-    def body(text: Any) -> None:
-        if isinstance(text, str) and text.strip():
-            lines.extend(text.strip().split("\n"))
-        lines.append("")
+    def add(line: str, match: str | None) -> None:
+        line = line.strip()
+        if line:
+            lines.append(line)
+            searchable.append(match.strip() if match and match.strip() else None)
 
-    if not isinstance(compact, dict):
-        return to_json(compact), lookup
+    def body(text: Any) -> None:
+        if isinstance(text, str):
+            for line in text.split("\n"):
+                add(line, line)
+
+    def details(*parts: str) -> str:
+        joined = ", ".join(part for part in parts if part)
+        return f" ({joined})" if joined else ""
 
     post = compact.get("post")
+    post_link = None
     if isinstance(post, dict):
-        title = _reddit_heading_text(post.get("title")) or "Reddit post"
-        lines.append(f"# {title} {{#post}}")
-        byline = " ".join(
-            part for part in (
-                f"u/{post['author']}" if post.get("author") else "",
-                f"in r/{post['subreddit']}" if post.get("subreddit") else "",
-                f"(score {post['score']})" if post.get("score") is not None else "",
-            ) if part
+        title = _reddit_heading_text(post.get("title"))
+        byline = details(
+            f"u/{_reddit_heading_text(post['author'])}" if post.get("author") else "",
+            f"r/{_reddit_heading_text(post['subreddit'])}" if post.get("subreddit") else "",
+            f"score {post['score']}" if post.get("score") is not None else "",
         )
-        if byline:
-            lines.append(byline)
-        if isinstance(post.get("permalink"), str):
-            lookup["post"] = {"citation_url": post["permalink"]}
+        add(f"# {title or 'Reddit post'}{byline} {{#post}}", title)
+        post_link = _reddit_absolute_url(post.get("permalink"))
+        if post_link:
+            lookup["post"] = {"citation_url": post_link}
         body(post.get("selftext"))
 
     for number, comment in enumerate(compact.get("comments") or [], 1):
         if not isinstance(comment, dict):
             continue
-        details = [f"u/{_reddit_heading_text(comment.get('author')) or '[unknown]'}"]
-        if comment.get("score") is not None:
-            details.append(f"score {comment['score']}")
-        if comment.get("depth"):
-            details.append(f"reply depth {comment['depth']}")
         anchor = f"comment-{number}"
-        lines.append(f"## Comment {number}: {', '.join(details)} {{#{anchor}}}")
-        if isinstance(comment.get("permalink"), str):
-            lookup[anchor] = {"citation_url": comment["permalink"]}
+        add(
+            f"## Comment {number}"
+            + details(
+                f"u/{_reddit_heading_text(comment.get('author')) or '[unknown]'}",
+                f"score {comment['score']}" if comment.get("score") is not None else "",
+                f"reply depth {comment['depth']}" if comment.get("depth") else "",
+            )
+            + f" {{#{anchor}}}",
+            None,
+        )
+        link = _reddit_absolute_url(comment.get("permalink"))
+        comment_id = comment.get("id")
+        if not link and post_link and isinstance(comment_id, str) and comment_id:
+            link = post_link.rstrip("/") + f"/{comment_id}/"
+        if link:
+            lookup[anchor] = {"citation_url": link}
         body(comment.get("body"))
 
     for number, item in enumerate(compact.get("items") or [], 1):
         if not isinstance(item, dict):
             continue
-        label = _reddit_heading_text(item.get("title")) or (
-            f"Comment by u/{_reddit_heading_text(item.get('author'))}"
-        )
         anchor = f"item-{number}"
-        lines.append(f"## {label} {{#{anchor}}}")
-        meta = ", ".join(
-            f"{key} {item[key]}" for key in ("author", "subreddit", "created", "score")
-            if item.get(key) is not None
+        title = _reddit_heading_text(item.get("title"))
+        author = _reddit_heading_text(item.get("author"))
+        label = title or f"Comment by u/{author or '[unknown]'}"
+        add(
+            f"## {label}"
+            + details(
+                f"u/{author}" if author and title else "",
+                f"r/{_reddit_heading_text(item['subreddit'])}" if item.get("subreddit") else "",
+                _reddit_heading_text(item["created"]) if item.get("created") else "",
+                f"score {item['score']}" if item.get("score") is not None else "",
+            )
+            + f" {{#{anchor}}}",
+            title or None,
         )
-        if meta:
-            lines.append(meta)
-        link = item.get("permalink") or item.get("url")
-        if isinstance(link, str):
-            lines.append(link)
+        link = _reddit_absolute_url(item.get("permalink") or item.get("url"))
+        if link:
+            add(_reddit_heading_text(link), None)
             lookup[anchor] = {"citation_url": link}
         body(item.get("text") or item.get("body"))
 
     for number, excerpt in enumerate(compact.get("excerpts") or [], 1):
-        lines.append(f"## Excerpt {number} {{#excerpt-{number}}}")
+        add(f"## Excerpt {number} {{#excerpt-{number}}}", None)
         body(excerpt)
 
     if not lines:
         # oEmbed metadata and any unexpected shape: search the JSON itself.
-        return to_json(compact), lookup
-    return "\n".join(lines).strip(), lookup
+        return to_json(compact), lookup, None
+    return "\n".join(lines), lookup, searchable
 
 
 def _reddit_rss_post_deleted(compact: dict) -> bool:
@@ -2227,18 +2283,19 @@ async def _fetch_one(
             # Search a readable rendering (one heading per post/comment/item)
             # rather than the single-line JSON, so matches are extractive
             # windows that name the comment they came from.
-            searchable, heading_lookup = await anyio.to_thread.run_sync(
+            searchable, heading_lookup, match_segments = await anyio.to_thread.run_sync(
                 _reddit_query_text, compact
             )
             qres = await _query_payload(
                 searchable,
                 query,
                 url,
-                kind="Reddit content",
+                kind="Reddit titles or text",
                 max_matches=resolved_max_matches,
                 context_lines=resolved_context_lines,
                 include_match_toc=include_match_toc,
                 heading_lookup=heading_lookup,
+                match_segments=match_segments,
             )
             payload["format"] = "text"
             matched = qres.pop("content")

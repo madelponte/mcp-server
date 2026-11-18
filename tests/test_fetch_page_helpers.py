@@ -520,17 +520,70 @@ def test_archive_items_mark_placeholder_text():
 
 
 def test_reddit_query_text_has_one_heading_per_item():
-    text, lookup = fp._reddit_query_text({
+    text, lookup, match_segments = fp._reddit_query_text({
         "post": {"title": "T {#x}", "author": "op", "selftext": "Body\nline 2",
-                 "permalink": "https://www.reddit.com/r/s/comments/a/"},
-        "comments": [{"author": "c", "score": 1, "depth": 1, "body": "Reply"}],
+                 "permalink": "/r/s/comments/a/t/"},
+        "comments": [
+            {"id": "c9", "author": "c", "score": 1, "depth": 1, "body": "Reply"},
+            {"author": "d", "body": "No id"},
+        ],
     })
     lines = text.split("\n")
-    assert lines[0] == "# T { #x} {#post}"
-    assert "## Comment 1: u/c, score 1, reply depth 1 {#comment-1}" in lines
-    assert lookup == {"post": {"citation_url": "https://www.reddit.com/r/s/comments/a/"}}
-    oembed_text, _ = fp._reddit_query_text({"title": "Oembed"})
+    assert lines == fp._segment_text(text)
+    assert lines[0] == "# T { #x} (u/op) {#post}"
+    assert "## Comment 1 (u/c, score 1, reply depth 1) {#comment-1}" in lines
+    assert lookup == {
+        "post": {"citation_url": "https://www.reddit.com/r/s/comments/a/t/"},
+        "comment-1": {"citation_url": "https://www.reddit.com/r/s/comments/a/t/c9/"},
+    }
+    # Only the title and body text are matchable; headers and bylines are context.
+    assert match_segments == ["T { #x}", "Body", "line 2", None, "Reply", None, "No id"]
+    oembed_text, _, oembed_segments = fp._reddit_query_text({"title": "Oembed"})
     assert "Oembed" in oembed_text
+    assert oembed_segments is None
+
+
+def test_reddit_query_text_listing_matches_titles_and_text_only():
+    text, lookup, match_segments = fp._reddit_query_text({
+        "items": [
+            {"title": "Packaging help", "author": "pythonista", "subreddit": "Python",
+             "created": "2026-11-17T00:00:00Z", "score": 3,
+             "permalink": "https://www.reddit.com/r/Python/comments/p1/"},
+            {"author": "someone", "subreddit": "Python", "text": "I love Python",
+             "permalink": "https://www.reddit.com/r/Python/comments/p2/_/c1/"},
+        ],
+    })
+    pairs = list(zip(fp._segment_text(text), match_segments))
+    assert pairs == [
+        ("## Packaging help (u/pythonista, r/Python, 2026-11-17T00:00:00Z, score 3) {#item-1}",
+         "Packaging help"),
+        ("https://www.reddit.com/r/Python/comments/p1/", None),
+        ("## Comment by u/someone (r/Python) {#item-2}", None),
+        ("https://www.reddit.com/r/Python/comments/p2/_/c1/", None),
+        ("I love Python", "I love Python"),
+    ]
+    windows, count, _ = fp._extract_matches(
+        text, "python", context=1, max_windows=10, heading_lookup=lookup,
+        match_segments=match_segments,
+    )
+    assert count == 1
+    assert windows[0]["heading"]["anchor"] == "item-2"
+    assert "## Comment by u/someone" in windows[0]["content"]
+
+
+def test_extract_matches_skips_context_only_segments():
+    text = "alpha target\nbeta\ngamma target"
+    windows, count, _ = fp._extract_matches(
+        text, "target", context=0, max_windows=10,
+        match_segments=[None, "beta", "gamma target"],
+    )
+    assert count == 1
+    assert windows[0]["content"] == "gamma target"
+    # A misaligned list is ignored rather than silently dropping matches.
+    _, count, _ = fp._extract_matches(
+        text, "target", context=0, max_windows=10, match_segments=[None],
+    )
+    assert count == 2
 
 
 def test_archive_comment_item_permalink():
@@ -565,6 +618,9 @@ def test_compact_reddit_json_extracts_post_and_comments():
     # Nested reply collected with incremented depth.
     assert out["comments"][1]["body"] == "reply"
     assert out["comments"][1]["depth"] == 1
+    assert "id" not in out["comments"][0]
+    data[1]["data"]["children"][0]["data"]["id"] = "c1"
+    assert _compact_reddit_json(data)["comments"][0]["id"] == "c1"
 
 
 def test_compact_reddit_json_passthrough_for_unexpected_shape():
