@@ -206,13 +206,23 @@ web_search:
   # Required by Reddit for OAuth clients; replace the username and keep it honest.
   reddit_user_agent: ""
   # Serialize Reddit acquisitions with this quiet period between calls to reduce
-  # anonymous RSS/oEmbed burst throttling. 0 disables queueing.
+  # archive/RSS/oEmbed burst throttling. 0 disables queueing.
   reddit_request_delay_seconds: 1
-  # On HTTP 429, wait this long and retry the RSS representation once. 0 goes
-  # straight to the post fallbacks. (RSS is skipped after Reddit retires it on
-  # 2026-11-13.)
-  reddit_rate_limit_retry_seconds: 3
-  # Without OAuth/RSS, return Brave search-index excerpts for a Reddit post (one
+  # Arctic Shift Reddit archive (third party, no SLA). Without OAuth it is the
+  # first source for posts, comment trees, and subreddit/user listings. Every
+  # fetched Reddit URL is sent to it. Empty string disables the archive step.
+  reddit_archive_api_url: "https://arctic-shift.photon-reddit.com/api"
+  # Comments requested from the archive per post (overflow is reported as
+  # collapsed "more" nodes).
+  reddit_archive_max_comments: 500
+  # Items returned for an archived subreddit/user/search listing (1-100).
+  reddit_archive_max_listing: 25
+  # On HTTP 429, wait this long and retry the RSS representation once. 0 (the
+  # default) goes straight to the next fallback; anonymous RSS allows about one
+  # request per minute, so a short wait rarely helps. RSS outlived its announced
+  # 2026-11-13 retirement and is used until it actually fails.
+  reddit_rate_limit_retry_seconds: 0
+  # Without OAuth/archive/RSS, return Brave search-index excerpts for a Reddit post (one
   # Brave call per fetch; needs brave_api_key). false falls back to oEmbed
   # title/author metadata only.
   reddit_search_fallback: true

@@ -1,5 +1,5 @@
 # ---------------------------------------------------------------------------
-# Python 3.15 source-build workaround (last checked 2026-11-09 against PyPI)
+# Python 3.15 source-build workaround (last checked 2026-11-17 against PyPI)
 #
 # The image runs on Python 3.15. Two dependencies still publish no cp315
 # wheels, so the Dockerfile's builder stage uses the full (non-slim)

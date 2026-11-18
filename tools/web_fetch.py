@@ -21,7 +21,7 @@ import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import anyio
 import httpx
@@ -29,6 +29,7 @@ from bs4 import UnicodeDammit
 
 from config import web_search_settings as cfg
 from .cache import TTLCache
+from .serialize import redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -1097,3 +1098,38 @@ async def _render_document_with_firecrawl(url: str) -> dict:
         "blocked_detected": False,
         "resource_kind": "document_text",
     }
+
+
+# Shared by fetch_page and the Reddit helper (lives here, below both, so neither
+# imports the other for it).
+def _redact_backend_secrets(text: Any, *extra_secrets: str) -> str:
+    """Redact backend credentials (API keys and URL-embedded passwords)."""
+    passwords = tuple(
+        urlparse(endpoint).password or ""
+        for endpoint in (
+            cfg.flaresolverr_url,
+            cfg.firecrawl_api_url,
+            cfg.tika_url,
+            cfg.classifier_api_url,
+        )
+        if endpoint
+    )
+    try:
+        archive_netloc = urlparse(cfg.reddit_archive_api_url).netloc
+    except ValueError:
+        # An invalid archive URL must not break error reporting for other providers.
+        archive_netloc = ""
+    archive_userinfo = archive_netloc.rpartition("@")[0]
+    archive_password = archive_userinfo.partition(":")[2]
+    return redact_secrets(
+        text,
+        *extra_secrets,
+        archive_userinfo,
+        unquote(archive_userinfo),
+        archive_password,
+        unquote(archive_password),
+        cfg.firecrawl_api_key,
+        cfg.classifier_api_key,
+        cfg.brave_api_key,
+        *passwords,
+    )

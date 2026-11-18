@@ -3,6 +3,7 @@
 import pytest
 
 import tools.fetch_page as fp
+import tools.reddit as rd
 import tools.serialize as serialize
 from tools.fetch_page import (
     _join_note,
@@ -13,18 +14,19 @@ from tools.fetch_page import (
     _extract_matches,
     QueryMatchTimeoutError,
     _format_match_windows,
+    _provenance,
+    _is_contentless,
+)
+from tools.reddit import (
     _normalize_reddit_url,
     _reddit_oauth_url,
     _reddit_rss_url,
     _reddit_oembed_url,
     _reddit_post_id,
     _reddit_search_query,
-    _reddit_rss_available,
-    _is_reddit_url,
+    is_reddit_url,
     _compact_reddit_json,
     _compact_reddit_rss,
-    _provenance,
-    _is_contentless,
 )
 
 
@@ -351,7 +353,7 @@ def test_reddit_oembed_url_uses_post_url_not_json_endpoint():
     "https://WWW.Reddit.com:443/r/x/",
 ])
 def test_is_reddit_url_content_hosts(url):
-    assert _is_reddit_url(url)
+    assert is_reddit_url(url)
 
 
 @pytest.mark.parametrize("url", [
@@ -362,7 +364,7 @@ def test_is_reddit_url_content_hosts(url):
     "https://evil.com/?u=https://www.reddit.com/r/x",
 ])
 def test_is_reddit_url_rejects_non_content_hosts(url):
-    assert not _is_reddit_url(url)
+    assert not is_reddit_url(url)
 
 
 def test_reddit_post_id():
@@ -370,6 +372,8 @@ def test_reddit_post_id():
     assert _reddit_post_id("https://www.reddit.com/comments/abc/") == "abc"
     assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t/def/") == "abc"
     assert _reddit_post_id("https://www.reddit.com/r/x/comments/abc/t.json") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/user/alice/comments/abc/t/") == "abc"
+    assert _reddit_post_id("https://www.reddit.com/user/alice/comments/") is None
     assert _reddit_post_id("https://www.reddit.com/r/x/") is None
     assert _reddit_post_id("https://example.com/r/x/comments/abc/t") is None
 
@@ -392,10 +396,205 @@ def test_reddit_search_query_stays_within_brave_limits():
     assert len(query) <= 600
 
 
-def test_reddit_rss_available_until_retirement():
-    from datetime import date
-    assert _reddit_rss_available(date(2026, 11, 12))
-    assert not _reddit_rss_available(date(2026, 11, 13))
+def test_reddit_rss_retired_latch_opens_and_expires(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(rd.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rd, "_reddit_rss_retired_until", 0.0)
+    assert rd._reddit_rss_available()
+    rd._mark_reddit_rss_retired()
+    assert not rd._reddit_rss_available()
+    clock[0] += rd._REDDIT_RSS_RETIRED_TTL_SECONDS
+    assert rd._reddit_rss_available()
+
+
+@pytest.mark.parametrize("fetched, retired", [
+    ({"status": 429, "text": ""}, False),
+    ({"status": 503, "text": "<html>down</html>"}, False),
+    # Reddit answers unknown subreddits/posts and search feeds with Atom errors.
+    ({"status": 404, "text": "<?xml version='1.0'?><feed xmlns='x'></feed>"}, False),
+    ({"status": 403, "text": "<?xml version='1.0'?><feed xmlns='x'></feed>"}, False),
+    ({"status": 200, "text": "<feed><entry/></feed>"}, False),
+    ({"status": 410, "text": "<feed></feed>"}, True),
+    ({"status": 403, "text": "<html>blocked</html>"}, True),
+    ({"status": 403, "text": ""}, True),
+    ({"status": 200, "text": "<!doctype html><html></html>"}, True),
+])
+def test_rss_response_means_retired(fetched, retired):
+    assert rd._rss_response_means_retired(fetched) is retired
+
+
+@pytest.mark.parametrize("url, expected", [
+    ("https://www.reddit.com/r/python/search?q=x", True),
+    ("https://www.reddit.com/search/?q=x", True),
+    ("https://www.reddit.com/r/python/", False),
+    ("https://www.reddit.com/r/python/comments/abc/search/", True),
+])
+def test_is_reddit_search_url(url, expected):
+    assert rd._is_reddit_search_url(url) is expected
+
+
+# --------------------------- archive listing plan ---------------------------
+
+@pytest.fixture
+def listing_cap(monkeypatch):
+    monkeypatch.setattr(fp.cfg, "reddit_archive_max_listing", 7)
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.reddit.com/r/Python/",
+    "https://www.reddit.com/r/Python/top/?t=week",
+    "https://old.reddit.com/r/Python/new.rss",
+])
+def test_archive_plan_subreddit(listing_cap, url):
+    meta, requests = rd._reddit_archive_listing_plan(url)
+    assert meta == {"listing": "r/Python"}
+    path, params = requests["posts"]
+    assert path == "/posts/search"
+    assert params == {
+        "subreddit": "Python", "sort": "desc", "limit": 7,
+        "fields": rd._ARCHIVE_POST_LISTING_FIELDS,
+    }
+
+
+def test_archive_plan_subreddit_search_uses_title(listing_cap):
+    meta, requests = rd._reddit_archive_listing_plan(
+        "https://www.reddit.com/r/Python/search/?q=async+io&restrict_sr=1"
+    )
+    assert meta == {"listing": "r/Python search", "query": "async io", "match": "title"}
+    assert requests["posts"][1]["title"] == "async io"
+    assert "query" not in requests["posts"][1]
+
+
+@pytest.mark.parametrize("url, keys", [
+    ("https://www.reddit.com/user/spez/", {"posts", "comments"}),
+    ("https://www.reddit.com/u/spez", {"posts", "comments"}),
+    ("https://www.reddit.com/user/spez/submitted/", {"posts"}),
+    ("https://www.reddit.com/user/spez/comments/", {"comments"}),
+])
+def test_archive_plan_user(listing_cap, url, keys):
+    meta, requests = rd._reddit_archive_listing_plan(url)
+    assert meta == {"listing": "u/spez"}
+    assert set(requests) == keys
+    for path, params in requests.values():
+        assert params["author"] == "spez"
+        assert params["limit"] == 7
+    if "comments" in requests:
+        assert requests["comments"][1]["fields"] == rd._ARCHIVE_COMMENT_LISTING_FIELDS
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.reddit.com/",
+    "https://www.reddit.com/search/?q=x",
+    "https://www.reddit.com/r/all/",
+    "https://www.reddit.com/r/python+rust/",
+    "https://www.reddit.com/r/python/wiki/index",
+    "https://www.reddit.com/r/python/search/",
+    "https://www.reddit.com/user/spez/saved/",
+])
+def test_archive_plan_rejects_uncovered_pages(listing_cap, url):
+    with pytest.raises(RuntimeError):
+        rd._reddit_archive_listing_plan(url)
+
+
+def test_archive_post_item_builds_permalink_and_drops_self_url():
+    item = rd._archive_post_item({
+        "id": "abc", "subreddit": "Python", "title": "T", "author": "a",
+        "score": 3, "num_comments": 2, "created_utc": 0,
+        "url": "https://www.reddit.com/r/Python/comments/abc/t/",
+        "selftext": "x" * 1000, "link_flair_text": "Discussion", "over_18": False,
+    })
+    assert item["permalink"] == "https://www.reddit.com/r/Python/comments/abc/"
+    assert "url" not in item
+    assert item["created"] == "1970-01-01T00:00:00Z"
+    assert item["flair"] == "Discussion"
+    assert "nsfw" not in item
+    assert len(item["text"]) == rd._ARCHIVE_LISTING_EXCERPT_CHARS
+    link = rd._archive_post_item({"id": "abc", "subreddit": "s", "url": "https://example.com/x"})
+    assert link["url"] == "https://example.com/x"
+
+
+def test_archive_items_mark_placeholder_text():
+    post = rd._archive_post_item({"id": "a", "subreddit": "s", "selftext": " [removed] "})
+    assert "text" not in post and post["text_removed"] is True
+    empty = rd._archive_post_item({"id": "a", "subreddit": "s", "selftext": ""})
+    assert "text" not in empty and "text_removed" not in empty
+    comment = rd._archive_comment_item({"id": "c", "subreddit": "s", "body": "[deleted]"})
+    assert "text" not in comment and comment["text_removed"] is True
+
+
+def test_reddit_query_text_has_one_heading_per_item():
+    text, lookup, match_segments = rd.reddit_query_text({
+        "post": {"title": "T {#x}", "author": "op", "selftext": "Body\nline 2",
+                 "permalink": "/r/s/comments/a/t/"},
+        "comments": [
+            {"id": "c9", "author": "c", "score": 1, "depth": 1, "body": "Reply"},
+            {"author": "d", "body": "No id"},
+        ],
+    })
+    lines = text.split("\n")
+    assert lines == fp._segment_text(text)
+    assert lines[0] == "# T { #x} (u/op) {#post}"
+    assert "## Comment 1 (u/c, score 1, reply depth 1) {#comment-1}" in lines
+    assert lookup == {
+        "post": {"citation_url": "https://www.reddit.com/r/s/comments/a/t/"},
+        "comment-1": {"citation_url": "https://www.reddit.com/r/s/comments/a/t/c9/"},
+    }
+    # Only the title and body text are matchable; headers and bylines are context.
+    assert match_segments == ["T { #x}", "Body", "line 2", None, "Reply", None, "No id"]
+    oembed_text, _, oembed_segments = rd.reddit_query_text({"title": "Oembed"})
+    assert "Oembed" in oembed_text
+    assert oembed_segments is None
+
+
+def test_reddit_query_text_listing_matches_titles_and_text_only():
+    text, lookup, match_segments = rd.reddit_query_text({
+        "items": [
+            {"title": "Packaging help", "author": "pythonista", "subreddit": "Python",
+             "created": "2026-11-17T00:00:00Z", "score": 3,
+             "permalink": "https://www.reddit.com/r/Python/comments/p1/"},
+            {"author": "someone", "subreddit": "Python", "text": "I love Python",
+             "permalink": "https://www.reddit.com/r/Python/comments/p2/_/c1/"},
+        ],
+    })
+    pairs = list(zip(fp._segment_text(text), match_segments))
+    assert pairs == [
+        ("## Packaging help (u/pythonista, r/Python, 2026-11-17T00:00:00Z, score 3) {#item-1}",
+         "Packaging help"),
+        ("https://www.reddit.com/r/Python/comments/p1/", None),
+        ("## Comment by u/someone (r/Python) {#item-2}", None),
+        ("https://www.reddit.com/r/Python/comments/p2/_/c1/", None),
+        ("I love Python", "I love Python"),
+    ]
+    windows, count, _ = fp._extract_matches(
+        text, "python", context=1, max_windows=10, heading_lookup=lookup,
+        match_segments=match_segments,
+    )
+    assert count == 1
+    assert windows[0]["heading"]["anchor"] == "item-2"
+    assert "## Comment by u/someone" in windows[0]["content"]
+
+
+def test_extract_matches_skips_context_only_segments():
+    text = "alpha target\nbeta\ngamma target"
+    windows, count, _ = fp._extract_matches(
+        text, "target", context=0, max_windows=10,
+        match_segments=[None, "beta", "gamma target"],
+    )
+    assert count == 1
+    assert windows[0]["content"] == "gamma target"
+    # A misaligned list is ignored rather than silently dropping matches.
+    _, count, _ = fp._extract_matches(
+        text, "target", context=0, max_windows=10, match_segments=[None],
+    )
+    assert count == 2
+
+
+def test_archive_comment_item_permalink():
+    item = rd._archive_comment_item({
+        "id": "c1", "subreddit": "s", "link_id": "t3_abc", "body": "hi", "author": "a",
+    })
+    assert item["permalink"] == "https://www.reddit.com/r/s/comments/abc/_/c1/"
+    assert item["type"] == "comment"
 
 
 # --------------------------- _compact_reddit_json ---------------------------
@@ -422,6 +621,9 @@ def test_compact_reddit_json_extracts_post_and_comments():
     # Nested reply collected with incremented depth.
     assert out["comments"][1]["body"] == "reply"
     assert out["comments"][1]["depth"] == 1
+    assert "id" not in out["comments"][0]
+    data[1]["data"]["children"][0]["data"]["id"] = "c1"
+    assert _compact_reddit_json(data)["comments"][0]["id"] == "c1"
 
 
 def test_compact_reddit_json_passthrough_for_unexpected_shape():
