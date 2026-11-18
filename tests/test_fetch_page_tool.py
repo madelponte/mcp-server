@@ -12,6 +12,7 @@ import pytest
 from fastmcp.exceptions import ToolError
 
 import tools.fetch_page as fp
+import tools.reddit as rd
 import tools.page_acquire as pa
 from conftest import run
 
@@ -27,18 +28,18 @@ def disable_fallbacks_and_truncation(monkeypatch):
     monkeypatch.setattr(fp.cfg, "reddit_user_agent", "")
     monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 0)
     monkeypatch.setattr(fp.cfg, "reddit_rate_limit_retry_seconds", 0)
-    monkeypatch.setattr(fp, "_reddit_access_token", None)
-    monkeypatch.setattr(fp, "_reddit_access_token_expires_at", 0.0)
-    monkeypatch.setattr(fp, "_reddit_access_token_credentials", None)
+    monkeypatch.setattr(rd, "_reddit_access_token", None)
+    monkeypatch.setattr(rd, "_reddit_access_token_expires_at", 0.0)
+    monkeypatch.setattr(rd, "_reddit_access_token_credentials", None)
     # Brave and the Arctic Shift archive are opt-in per test (the archive would
     # otherwise reach the real network); the RSS retirement latch and archive
     # cache start clean so no test inherits another's state.
     monkeypatch.setattr(fp.cfg, "brave_api_key", "")
     monkeypatch.setattr(fp.cfg, "reddit_search_fallback", True)
     monkeypatch.setattr(fp.cfg, "reddit_archive_api_url", "")
-    monkeypatch.setattr(fp, "_reddit_rss_retired_until", 0.0)
-    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(0, 8))
-    monkeypatch.setattr(fp, "_ARCHIVE_TIMEOUT_RETRY_SECONDS", 0)
+    monkeypatch.setattr(rd, "_reddit_rss_retired_until", 0.0)
+    monkeypatch.setattr(rd, "_reddit_archive_cache", rd.TTLCache(0, 8))
+    monkeypatch.setattr(rd, "_ARCHIVE_TIMEOUT_RETRY_SECONDS", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -520,12 +521,12 @@ def test_reddit_oauth_json_compacted(monkeypatch, tool_fns, patch_httpx):
     def handler(request):
         requests.append(request)
         if request.url.path == "/api/v1/access_token":
-            return fp.httpx.Response(
+            return rd.httpx.Response(
                 200,
                 json={"access_token": "token", "expires_in": 3600},
                 request=request,
             )
-        return fp.httpx.Response(
+        return rd.httpx.Response(
             200,
             text=reddit_json,
             headers={"content-type": "application/json"},
@@ -557,7 +558,7 @@ def test_reddit_without_oauth_uses_rss(monkeypatch, tool_fns):
         calls.append(url)
         return _fetched(text=rss, content_type="application/atom+xml")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
@@ -586,8 +587,8 @@ def test_reddit_debug_note_traces_and_redacts_fallbacks(monkeypatch, tool_fns):
     async def acquire(url):
         return _fetched(text=rss, content_type="application/atom+xml")
 
-    monkeypatch.setattr(fp, "_fetch_reddit_oauth", oauth_failure)
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_fetch_reddit_oauth", oauth_failure)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
@@ -614,7 +615,7 @@ def _enable_brave(monkeypatch, results):
         queries.append(kwargs)
         return results
 
-    monkeypatch.setattr(fp, "_brave_query", brave_query)
+    monkeypatch.setattr(rd, "_brave_query", brave_query)
     return queries
 
 
@@ -630,7 +631,7 @@ def test_reddit_failures_use_oembed_last(monkeypatch, tool_fns):
             content_type="application/json",
         )
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
@@ -650,7 +651,7 @@ def test_reddit_rss_failure_uses_brave_excerpts(monkeypatch, tool_fns):
             raise RuntimeError("RSS blocked")
         return _oembed_fetched(title="Exact post title")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     queries = _enable_brave(monkeypatch, [
         {
             "url": "https://www.reddit.com/r/python/comments/zzz/other/",
@@ -700,7 +701,7 @@ def test_reddit_brave_uses_slug_when_oembed_fails(monkeypatch, tool_fns):
     async def acquire(url):
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     queries = _enable_brave(monkeypatch, [{
         "url": "https://www.reddit.com/r/python/comments/abc/my_post_title/",
         "title": "My post title",
@@ -723,7 +724,7 @@ def test_reddit_brave_without_matching_post_returns_oembed(monkeypatch, tool_fns
             return _oembed_fetched()
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     _enable_brave(monkeypatch, [{
         "url": "https://www.reddit.com/r/python/comments/zzz/similar_title/",
         "title": "Similar",
@@ -746,7 +747,7 @@ def test_reddit_search_fallback_can_be_disabled(monkeypatch, tool_fns):
             return _oembed_fetched()
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     queries = _enable_brave(monkeypatch, [])
     monkeypatch.setattr(fp.cfg, "reddit_search_fallback", False)
     out = json.loads(
@@ -759,14 +760,14 @@ def test_reddit_search_fallback_can_be_disabled(monkeypatch, tool_fns):
 
 def test_reddit_skips_rss_while_retired_latch_is_open(monkeypatch, tool_fns):
     monkeypatch.setattr(fp.server_settings, "debug", True)
-    fp._mark_reddit_rss_retired()
+    rd._mark_reddit_rss_retired()
     calls = []
 
     async def acquire(url):
         calls.append(url)
         return _oembed_fetched()
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     _enable_brave(monkeypatch, [{
         "url": "https://www.reddit.com/r/python/comments/abc/title/",
         "title": "t",
@@ -781,14 +782,14 @@ def test_reddit_skips_rss_while_retired_latch_is_open(monkeypatch, tool_fns):
 
 
 def test_reddit_listing_without_sources_points_to_search(monkeypatch, tool_fns):
-    fp._mark_reddit_rss_retired()
+    rd._mark_reddit_rss_retired()
     calls = []
 
     async def acquire(url):
         calls.append(url)
         raise AssertionError("listing fallbacks should not fetch anything")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/"))
     assert calls == []
@@ -799,7 +800,7 @@ def test_reddit_post_fails_when_every_source_fails(monkeypatch, tool_fns):
     async def acquire(url):
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     message = str(exc.value)
@@ -841,7 +842,7 @@ def test_reddit_rss_retries_once_after_rate_limit(monkeypatch, tool_fns):
     async def sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     monkeypatch.setattr(fp.anyio, "sleep", sleep)
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
@@ -866,7 +867,7 @@ def test_reddit_oembed_reports_rate_limit_without_debug(monkeypatch, tool_fns):
             )
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     )
@@ -914,14 +915,14 @@ def _enable_archive(monkeypatch, patch_httpx, routes, *, forbid_acquire=True):
         route = routes[request.url.path.removeprefix("/api")]
         if callable(route):
             return route(request)
-        return fp.httpx.Response(200, json=route, request=request)
+        return rd.httpx.Response(200, json=route, request=request)
 
     patch_httpx(handler)
     if forbid_acquire:
         async def acquire(url):
             raise AssertionError(f"unexpected Reddit/RSS/oEmbed fetch: {url}")
 
-        monkeypatch.setattr(fp, "_acquire_page", acquire)
+        monkeypatch.setattr(rd, "_acquire_page", acquire)
     return requests
 
 
@@ -1078,7 +1079,7 @@ def test_reddit_archive_miss_falls_through_to_rss(monkeypatch, tool_fns, patch_h
         calls.append(url)
         return _fetched(text=rss, content_type="application/atom+xml")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(run(tool_fns["fetch_page"](
         url="https://www.reddit.com/r/python/comments/abc/title"
     )))
@@ -1089,10 +1090,10 @@ def test_reddit_archive_miss_falls_through_to_rss(monkeypatch, tool_fns, patch_h
 
 
 @pytest.mark.parametrize("failure, detail", [
-    (lambda r: fp.httpx.Response(429, headers={"x-ratelimit-reset": "42"}, request=r),
+    (lambda r: rd.httpx.Response(429, headers={"x-ratelimit-reset": "42"}, request=r),
      "HTTP 429, rate limit resets in 42s"),
-    (lambda r: fp.httpx.Response(500, request=r), "HTTP 500"),
-    (lambda r: fp.httpx.Response(
+    (lambda r: rd.httpx.Response(500, request=r), "HTTP 500"),
+    (lambda r: rd.httpx.Response(
         200, json={"data": None, "error": "Timeout. Maybe slow down a bit"}, request=r),
      "archive error: Timeout. Maybe slow down a bit"),
 ])
@@ -1110,7 +1111,7 @@ def test_reddit_archive_failure_falls_through_to_brave(
             return _fetched(status=429, text="", content_type="")
         return _oembed_fetched()
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     _enable_brave(monkeypatch, [{
         "url": "https://www.reddit.com/r/python/comments/abc/title/",
         "title": "t", "snippets": ["excerpt"],
@@ -1122,7 +1123,7 @@ def test_reddit_archive_failure_falls_through_to_brave(
     assert f"Archive failed ({detail})" in out["note"]
     assert "Retry later" in out["note"]
     # A 429 is the per-minute budget, not a retirement.
-    assert fp._reddit_rss_available()
+    assert rd._reddit_rss_available()
 
 
 def test_reddit_archive_timeout_is_retried_once(monkeypatch, tool_fns, patch_httpx):
@@ -1131,11 +1132,11 @@ def test_reddit_archive_timeout_is_retried_once(monkeypatch, tool_fns, patch_htt
     def posts(request):
         attempts.append(request)
         if len(attempts) == 1:
-            return fp.httpx.Response(
+            return rd.httpx.Response(
                 422, json={"data": None, "error": "Timeout. Maybe slow down a bit"},
                 request=request,
             )
-        return fp.httpx.Response(200, json={"data": [_archive_post()]}, request=request)
+        return rd.httpx.Response(200, json={"data": [_archive_post()]}, request=request)
 
     _enable_archive(monkeypatch, patch_httpx, {
         "/posts/ids": posts,
@@ -1150,14 +1151,14 @@ def test_reddit_archive_timeout_is_retried_once(monkeypatch, tool_fns, patch_htt
 
 def test_reddit_archive_error_body_on_http_error_is_reported(monkeypatch, tool_fns, patch_httpx):
     _enable_archive(monkeypatch, patch_httpx, {
-        "/posts/search": lambda r: fp.httpx.Response(
+        "/posts/search": lambda r: rd.httpx.Response(
             400, json={"data": None, "error": "'x' is not a valid field"}, request=r),
     }, forbid_acquire=False)
 
     async def acquire(url):
         return _fetched(status=429, text="", content_type="")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/"))
     assert "HTTP 400, archive error: 'x' is not a valid field" in str(exc.value)
@@ -1166,7 +1167,7 @@ def test_reddit_archive_error_body_on_http_error_is_reported(monkeypatch, tool_f
 def test_reddit_archive_comment_tree_failure_keeps_post(monkeypatch, tool_fns, patch_httpx):
     _enable_archive(monkeypatch, patch_httpx, {
         "/posts/ids": {"data": [_archive_post()]},
-        "/comments/tree": lambda r: fp.httpx.Response(502, request=r),
+        "/comments/tree": lambda r: rd.httpx.Response(502, request=r),
     })
     content = json.loads(json.loads(run(tool_fns["fetch_page"](
         url="https://www.reddit.com/r/python/comments/abc/title"
@@ -1181,11 +1182,11 @@ def test_reddit_archive_comment_tree_failure_keeps_post(monkeypatch, tool_fns, p
 def test_reddit_malformed_archive_tree_is_unavailable_and_not_cached(
     monkeypatch, tool_fns, patch_httpx, invalid
 ):
-    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(300, 8))
+    monkeypatch.setattr(rd, "_reddit_archive_cache", rd.TTLCache(300, 8))
     trees = iter([invalid, {"data": []}])
     requests = _enable_archive(monkeypatch, patch_httpx, {
         "/posts/ids": {"data": [_archive_post(num_comments=0)]},
-        "/comments/tree": lambda r: fp.httpx.Response(200, json=next(trees), request=r),
+        "/comments/tree": lambda r: rd.httpx.Response(200, json=next(trees), request=r),
     })
     url = "https://www.reddit.com/r/python/comments/abc/title"
     first = json.loads(json.loads(run(tool_fns["fetch_page"](url=url)))["content"])
@@ -1214,7 +1215,7 @@ def test_reddit_archive_download_cap(monkeypatch, tool_fns, patch_httpx):
             return _oembed_fetched()
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(run(tool_fns["fetch_page"](
         url="https://www.reddit.com/r/python/comments/abc/title"
     )))
@@ -1230,7 +1231,7 @@ def test_reddit_archive_disabled_is_traced(monkeypatch, tool_fns):
             return _oembed_fetched()
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(run(tool_fns["fetch_page"](
         url="https://www.reddit.com/r/python/comments/abc/title"
     )))
@@ -1273,9 +1274,9 @@ def test_reddit_archive_listing_marks_removed_text(monkeypatch, tool_fns, patch_
 
 
 def test_reddit_cached_archive_result_skips_quiet_period(monkeypatch, tool_fns, patch_httpx):
-    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(300, 8))
+    monkeypatch.setattr(rd, "_reddit_archive_cache", rd.TTLCache(300, 8))
     monkeypatch.setattr(fp.cfg, "reddit_request_delay_seconds", 5)
-    monkeypatch.setattr(fp, "_reddit_request_queue", fp._RedditRequestQueue())
+    monkeypatch.setattr(rd, "_reddit_request_queue", rd._RedditRequestQueue())
     sleeps = []
 
     async def sleep(seconds):
@@ -1295,13 +1296,13 @@ def test_reddit_cached_archive_result_skips_quiet_period(monkeypatch, tool_fns, 
 
 
 def test_reddit_archive_cache_does_not_preempt_oauth(monkeypatch):
-    monkeypatch.setattr(fp, "_reddit_archive_cache", fp.TTLCache(300, 8))
+    monkeypatch.setattr(rd, "_reddit_archive_cache", rd.TTLCache(300, 8))
     monkeypatch.setattr(fp.cfg, "reddit_archive_api_url", _ARCHIVE)
-    fp._reddit_archive_cache.set(fp._archive_post_cache_key("abc"), ({}, {"post": {}}))
+    rd._reddit_archive_cache.set(rd._archive_post_cache_key("abc"), ({}, {"post": {}}))
     url = "https://www.reddit.com/r/python/comments/abc/title"
-    assert fp._reddit_archive_cached(url)[2] == "archive"
+    assert rd._reddit_archive_cached(url)[2] == "archive"
     monkeypatch.setattr(fp.cfg, "reddit_client_id", "client-id")
-    assert fp._reddit_archive_cached(url) is None
+    assert rd._reddit_archive_cached(url) is None
 
 
 def test_reddit_query_returns_matching_comments(monkeypatch, tool_fns, patch_httpx):
@@ -1392,7 +1393,7 @@ def test_reddit_query_on_listing_and_oembed(monkeypatch, tool_fns, patch_httpx):
             return _oembed_fetched(title="Oembed horse")
         raise RuntimeError("blocked")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(run(tool_fns["fetch_page"](
         url="https://www.reddit.com/r/python/comments/abc/title", query="horse",
     )))
@@ -1483,14 +1484,14 @@ def test_reddit_listing_archive_failure_uses_rss(monkeypatch, tool_fns, patch_ht
     rss = """<feed xmlns="http://www.w3.org/2005/Atom"><entry>
       <id>t3_p1</id><title>From RSS</title></entry></feed>"""
     _enable_archive(monkeypatch, patch_httpx, {
-        "/posts/search": lambda r: fp.httpx.Response(503, request=r),
+        "/posts/search": lambda r: rd.httpx.Response(503, request=r),
     }, forbid_acquire=False)
 
     async def acquire(url):
         assert url == "https://www.reddit.com/r/python.rss"
         return _fetched(text=rss, content_type="application/atom+xml")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     out = json.loads(run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/")))
     assert json.loads(out["content"])["items"][0]["title"] == "From RSS"
     assert "Archive failed (HTTP 503)" in out["note"]
@@ -1498,13 +1499,13 @@ def test_reddit_listing_archive_failure_uses_rss(monkeypatch, tool_fns, patch_ht
 
 def test_reddit_listing_all_sources_fail_points_to_search(monkeypatch, tool_fns, patch_httpx):
     _enable_archive(monkeypatch, patch_httpx, {
-        "/posts/search": lambda r: fp.httpx.Response(503, request=r),
+        "/posts/search": lambda r: rd.httpx.Response(503, request=r),
     }, forbid_acquire=False)
 
     async def acquire(url):
         return _fetched(status=429, text="", content_type="")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/"))
     message = str(exc.value)
@@ -1517,7 +1518,7 @@ def test_reddit_search_listing_never_requests_search_rss(monkeypatch, tool_fns):
     async def acquire(url):
         raise AssertionError("search feeds are refused by Reddit and must not be fetched")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/search/?q=x"))
     assert "RSS skipped (Reddit refuses anonymous search feeds)" in str(exc.value)
@@ -1538,10 +1539,10 @@ def test_reddit_rss_definitive_failure_opens_latch(monkeypatch, tool_fns, respon
             return _fetched(**response)
         return _oembed_fetched()
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     url = "https://www.reddit.com/r/python/comments/abc/title"
     run(tool_fns["fetch_page"](url=url))
-    assert not fp._reddit_rss_available()
+    assert not rd._reddit_rss_available()
     run(tool_fns["fetch_page"](url=url))
     assert sum(u.endswith(".rss") for u in calls) == 1
 
@@ -1555,7 +1556,7 @@ def test_reddit_rss_html_latch_uses_http_status(
 
     def handler(request):
         assert str(request.url) == "https://www.reddit.com/r/python.rss"
-        return fp.httpx.Response(status, html="<html>Not an Atom feed</html>", request=request)
+        return rd.httpx.Response(status, html="<html>Not an Atom feed</html>", request=request)
 
     monkeypatch.setattr(pa, "_assert_url_allowed", allow)
     patch_httpx(handler)
@@ -1563,7 +1564,7 @@ def test_reddit_rss_html_latch_uses_http_status(
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/"))
     assert f"RSS failed ({detail})" in str(exc.value)
-    assert fp._reddit_rss_available() is available
+    assert rd._reddit_rss_available() is available
 
 
 def test_reddit_rss_atom_404_does_not_open_latch(monkeypatch, tool_fns):
@@ -1573,9 +1574,9 @@ def test_reddit_rss_atom_404_does_not_open_latch(monkeypatch, tool_fns):
                             content_type="application/atom+xml")
         return _oembed_fetched()
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
-    assert fp._reddit_rss_available()
+    assert rd._reddit_rss_available()
 
 
 def test_reddit_rss_deleted_post_reports_deleted(monkeypatch, tool_fns):
@@ -1588,7 +1589,7 @@ def test_reddit_rss_deleted_post_reports_deleted(monkeypatch, tool_fns):
         calls.append(url)
         return _fetched(text=rss, content_type="application/atom+xml")
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     assert "deleted or removed" in str(exc.value)
@@ -1608,7 +1609,7 @@ def test_reddit_oembed_deleted_post_reports_deleted(monkeypatch, tool_fns, oembe
             return _fetched(status=429, text="", content_type="")
         return oembed
 
-    monkeypatch.setattr(fp, "_acquire_page", acquire)
+    monkeypatch.setattr(rd, "_acquire_page", acquire)
     with pytest.raises(ToolError) as exc:
         run(tool_fns["fetch_page"](url="https://www.reddit.com/r/python/comments/abc/title"))
     assert "deleted" in str(exc.value)

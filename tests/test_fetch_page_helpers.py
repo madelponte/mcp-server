@@ -3,6 +3,7 @@
 import pytest
 
 import tools.fetch_page as fp
+import tools.reddit as rd
 import tools.serialize as serialize
 from tools.fetch_page import (
     _join_note,
@@ -13,17 +14,19 @@ from tools.fetch_page import (
     _extract_matches,
     QueryMatchTimeoutError,
     _format_match_windows,
+    _provenance,
+    _is_contentless,
+)
+from tools.reddit import (
     _normalize_reddit_url,
     _reddit_oauth_url,
     _reddit_rss_url,
     _reddit_oembed_url,
     _reddit_post_id,
     _reddit_search_query,
-    _is_reddit_url,
+    is_reddit_url,
     _compact_reddit_json,
     _compact_reddit_rss,
-    _provenance,
-    _is_contentless,
 )
 
 
@@ -350,7 +353,7 @@ def test_reddit_oembed_url_uses_post_url_not_json_endpoint():
     "https://WWW.Reddit.com:443/r/x/",
 ])
 def test_is_reddit_url_content_hosts(url):
-    assert _is_reddit_url(url)
+    assert is_reddit_url(url)
 
 
 @pytest.mark.parametrize("url", [
@@ -361,7 +364,7 @@ def test_is_reddit_url_content_hosts(url):
     "https://evil.com/?u=https://www.reddit.com/r/x",
 ])
 def test_is_reddit_url_rejects_non_content_hosts(url):
-    assert not _is_reddit_url(url)
+    assert not is_reddit_url(url)
 
 
 def test_reddit_post_id():
@@ -395,13 +398,13 @@ def test_reddit_search_query_stays_within_brave_limits():
 
 def test_reddit_rss_retired_latch_opens_and_expires(monkeypatch):
     clock = [1000.0]
-    monkeypatch.setattr(fp.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(fp, "_reddit_rss_retired_until", 0.0)
-    assert fp._reddit_rss_available()
-    fp._mark_reddit_rss_retired()
-    assert not fp._reddit_rss_available()
-    clock[0] += fp._REDDIT_RSS_RETIRED_TTL_SECONDS
-    assert fp._reddit_rss_available()
+    monkeypatch.setattr(rd.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(rd, "_reddit_rss_retired_until", 0.0)
+    assert rd._reddit_rss_available()
+    rd._mark_reddit_rss_retired()
+    assert not rd._reddit_rss_available()
+    clock[0] += rd._REDDIT_RSS_RETIRED_TTL_SECONDS
+    assert rd._reddit_rss_available()
 
 
 @pytest.mark.parametrize("fetched, retired", [
@@ -417,7 +420,7 @@ def test_reddit_rss_retired_latch_opens_and_expires(monkeypatch):
     ({"status": 200, "text": "<!doctype html><html></html>"}, True),
 ])
 def test_rss_response_means_retired(fetched, retired):
-    assert fp._rss_response_means_retired(fetched) is retired
+    assert rd._rss_response_means_retired(fetched) is retired
 
 
 @pytest.mark.parametrize("url, expected", [
@@ -427,7 +430,7 @@ def test_rss_response_means_retired(fetched, retired):
     ("https://www.reddit.com/r/python/comments/abc/search/", True),
 ])
 def test_is_reddit_search_url(url, expected):
-    assert fp._is_reddit_search_url(url) is expected
+    assert rd._is_reddit_search_url(url) is expected
 
 
 # --------------------------- archive listing plan ---------------------------
@@ -443,18 +446,18 @@ def listing_cap(monkeypatch):
     "https://old.reddit.com/r/Python/new.rss",
 ])
 def test_archive_plan_subreddit(listing_cap, url):
-    meta, requests = fp._reddit_archive_listing_plan(url)
+    meta, requests = rd._reddit_archive_listing_plan(url)
     assert meta == {"listing": "r/Python"}
     path, params = requests["posts"]
     assert path == "/posts/search"
     assert params == {
         "subreddit": "Python", "sort": "desc", "limit": 7,
-        "fields": fp._ARCHIVE_POST_LISTING_FIELDS,
+        "fields": rd._ARCHIVE_POST_LISTING_FIELDS,
     }
 
 
 def test_archive_plan_subreddit_search_uses_title(listing_cap):
-    meta, requests = fp._reddit_archive_listing_plan(
+    meta, requests = rd._reddit_archive_listing_plan(
         "https://www.reddit.com/r/Python/search/?q=async+io&restrict_sr=1"
     )
     assert meta == {"listing": "r/Python search", "query": "async io", "match": "title"}
@@ -469,14 +472,14 @@ def test_archive_plan_subreddit_search_uses_title(listing_cap):
     ("https://www.reddit.com/user/spez/comments/", {"comments"}),
 ])
 def test_archive_plan_user(listing_cap, url, keys):
-    meta, requests = fp._reddit_archive_listing_plan(url)
+    meta, requests = rd._reddit_archive_listing_plan(url)
     assert meta == {"listing": "u/spez"}
     assert set(requests) == keys
     for path, params in requests.values():
         assert params["author"] == "spez"
         assert params["limit"] == 7
     if "comments" in requests:
-        assert requests["comments"][1]["fields"] == fp._ARCHIVE_COMMENT_LISTING_FIELDS
+        assert requests["comments"][1]["fields"] == rd._ARCHIVE_COMMENT_LISTING_FIELDS
 
 
 @pytest.mark.parametrize("url", [
@@ -490,11 +493,11 @@ def test_archive_plan_user(listing_cap, url, keys):
 ])
 def test_archive_plan_rejects_uncovered_pages(listing_cap, url):
     with pytest.raises(RuntimeError):
-        fp._reddit_archive_listing_plan(url)
+        rd._reddit_archive_listing_plan(url)
 
 
 def test_archive_post_item_builds_permalink_and_drops_self_url():
-    item = fp._archive_post_item({
+    item = rd._archive_post_item({
         "id": "abc", "subreddit": "Python", "title": "T", "author": "a",
         "score": 3, "num_comments": 2, "created_utc": 0,
         "url": "https://www.reddit.com/r/Python/comments/abc/t/",
@@ -505,22 +508,22 @@ def test_archive_post_item_builds_permalink_and_drops_self_url():
     assert item["created"] == "1970-01-01T00:00:00Z"
     assert item["flair"] == "Discussion"
     assert "nsfw" not in item
-    assert len(item["text"]) == fp._ARCHIVE_LISTING_EXCERPT_CHARS
-    link = fp._archive_post_item({"id": "abc", "subreddit": "s", "url": "https://example.com/x"})
+    assert len(item["text"]) == rd._ARCHIVE_LISTING_EXCERPT_CHARS
+    link = rd._archive_post_item({"id": "abc", "subreddit": "s", "url": "https://example.com/x"})
     assert link["url"] == "https://example.com/x"
 
 
 def test_archive_items_mark_placeholder_text():
-    post = fp._archive_post_item({"id": "a", "subreddit": "s", "selftext": " [removed] "})
+    post = rd._archive_post_item({"id": "a", "subreddit": "s", "selftext": " [removed] "})
     assert "text" not in post and post["text_removed"] is True
-    empty = fp._archive_post_item({"id": "a", "subreddit": "s", "selftext": ""})
+    empty = rd._archive_post_item({"id": "a", "subreddit": "s", "selftext": ""})
     assert "text" not in empty and "text_removed" not in empty
-    comment = fp._archive_comment_item({"id": "c", "subreddit": "s", "body": "[deleted]"})
+    comment = rd._archive_comment_item({"id": "c", "subreddit": "s", "body": "[deleted]"})
     assert "text" not in comment and comment["text_removed"] is True
 
 
 def test_reddit_query_text_has_one_heading_per_item():
-    text, lookup, match_segments = fp._reddit_query_text({
+    text, lookup, match_segments = rd.reddit_query_text({
         "post": {"title": "T {#x}", "author": "op", "selftext": "Body\nline 2",
                  "permalink": "/r/s/comments/a/t/"},
         "comments": [
@@ -538,13 +541,13 @@ def test_reddit_query_text_has_one_heading_per_item():
     }
     # Only the title and body text are matchable; headers and bylines are context.
     assert match_segments == ["T { #x}", "Body", "line 2", None, "Reply", None, "No id"]
-    oembed_text, _, oembed_segments = fp._reddit_query_text({"title": "Oembed"})
+    oembed_text, _, oembed_segments = rd.reddit_query_text({"title": "Oembed"})
     assert "Oembed" in oembed_text
     assert oembed_segments is None
 
 
 def test_reddit_query_text_listing_matches_titles_and_text_only():
-    text, lookup, match_segments = fp._reddit_query_text({
+    text, lookup, match_segments = rd.reddit_query_text({
         "items": [
             {"title": "Packaging help", "author": "pythonista", "subreddit": "Python",
              "created": "2026-11-17T00:00:00Z", "score": 3,
@@ -587,7 +590,7 @@ def test_extract_matches_skips_context_only_segments():
 
 
 def test_archive_comment_item_permalink():
-    item = fp._archive_comment_item({
+    item = rd._archive_comment_item({
         "id": "c1", "subreddit": "s", "link_id": "t3_abc", "body": "hi", "author": "a",
     })
     assert item["permalink"] == "https://www.reddit.com/r/s/comments/abc/_/c1/"

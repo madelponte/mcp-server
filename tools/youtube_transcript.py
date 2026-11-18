@@ -72,7 +72,7 @@ def _extract_video_id(url_or_id: str) -> str:
     # Match youtube.com and its subdomains (m./music./www.-stripped) only. A bare
     # `endswith("youtube.com")` would also catch look-alike domains like
     # `notyoutube.com`, so test for an exact or dotted-suffix match (cf.
-    # `_normalize_reddit_url` in fetch_page.py, which guards the same way).
+    # `is_reddit_url` in reddit.py, which guards the same way).
     if (
         host == "youtube.com"
         or host.endswith(".youtube.com")
